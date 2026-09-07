@@ -1,0 +1,863 @@
+/* 侧边栏聊天外观：默认走 VS Code 变量，媒体/dsh-live 产物齐全时叠加 DSH 令牌（head 的
+   %%DSH_THEME_LINK%% 先加载），实现「整个侧栏 DSH 化」。写法一律：
+   var(--dsw-alias-X, var(--vscode-Y, 兜底)) —— 令牌缺失时自动回落 VS Code 观感（开发态）。 */
+
+/* 统一兜底：hidden 属性该藏就藏（很多元素自身 display:flex 会盖过浏览器 UA 的 [hidden]） */
+[hidden] {
+  display: none !important;
+}
+
+:root {
+  color-scheme: light dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  background: var(--dsw-alias-bg-base, var(--vscode-sideBar-background, var(--vscode-editor-background)));
+  color: var(--dsw-alias-label-primary, var(--vscode-sideBar-foreground, var(--vscode-editor-foreground)));
+  font-family: var(--dsw-font-family, var(--vscode-font-family, system-ui, sans-serif));
+  font-size: var(--vscode-font-size, 13px);
+  overflow: hidden;
+}
+/* DSH 令牌暗色 = body[data-ds-dark-theme]（chat.js applyDshTheme 从 vscode-dark 类同步）；
+   原生控件（滚动条/下拉/输入）随暗色走 */
+body[data-ds-dark-theme] {
+  color-scheme: dark;
+}
+
+/* ---------- 行1：顶部 tab 条（模式 + 后端 + 状态合成一条） ---------- */
+.top-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.35)));
+  background: var(--dsw-alias-bg-base, var(--vscode-sideBar-background, var(--vscode-editor-background)));
+}
+
+/* 模式组：内嵌聊天 / Harness。不再是全宽下划线条，而是靠左一撮胶囊。 */
+.mode-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+/* 模式胶囊（DSH Pill 风格） */
+.mode-tab {
+  height: 26px;
+  padding: 0 14px;
+  border: none;
+  border-radius: 999px;
+  background: var(--dsw-alias-bg-layer-2, transparent);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 26px;
+  font-weight: 500;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #9a9a9a));
+  user-select: none;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.mode-tab:hover {
+  background: var(--dsw-alias-interactive-bg-hover, var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.12)));
+  color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
+}
+.mode-tab.active {
+  color: var(--dsw-alias-label-primary, var(--vscode-button-secondaryForeground, var(--vscode-foreground, #ddd)));
+  background: var(--dsw-alias-button-ghost-active-fill, var(--vscode-button-secondaryBackground, rgba(128, 128, 128, 0.25)));
+  box-shadow: inset 0 0 0 1px var(--dsw-alias-button-ghost-active-border, transparent);
+}
+
+/* ---------- 后端组（模拟 / DSH 直播 + 状态）—— 仅 harness 可见 ---------- */
+/* 本组是 top-row 里靠右的分组；左侧竖分隔线把模式/后端两类选择隔开。 */
+.backend-bar {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: 2px;
+  padding-left: 10px;
+  border-left: 1px solid var(--dsw-alias-border-l2, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.35)));
+}
+
+.backend-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.backend-tab {
+  height: 24px;
+  padding: 0 12px;
+  border: none;
+  border-radius: 999px;
+  background: var(--dsw-alias-bg-layer-2, transparent);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 24px;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #9a9a9a));
+  user-select: none;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.backend-tab:hover {
+  background: var(--dsw-alias-interactive-bg-hover, var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.12)));
+  color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
+}
+.backend-tab.active {
+  color: var(--dsw-alias-label-primary, var(--vscode-button-secondaryForeground, var(--vscode-foreground, #ddd)));
+  background: var(--dsw-alias-button-ghost-active-fill, var(--vscode-button-secondaryBackground, rgba(128, 128, 128, 0.25)));
+  box-shadow: inset 0 0 0 1px var(--dsw-alias-button-ghost-active-border, transparent);
+}
+.backend-tab.disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* 连接状态点 + 文案：状态类 offline/connecting/online/error 由 JS 换到本元素上 */
+.backend-status {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin-left: auto;
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+}
+.backend-status::before {
+  content: '';
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: baseline;
+  background: var(--dsw-alias-label-dimmed, #9da5b4); /* offline 灰 */
+}
+.backend-status.connecting::before {
+  background: var(--dsw-alias-state-business-primary, #3794ff); /* 蓝：连接中，脉冲 */
+  animation: toolPulse 1s ease-in-out infinite;
+}
+.backend-status.online::before {
+  background: var(--dsw-alias-state-success-primary, #3fb950); /* 绿：在线 */
+}
+.backend-status.error::before {
+  background: var(--dsw-alias-state-error-primary, #f85149); /* 红：错误 */
+}
+
+/* ---------- 行2：会话控制条（标题 + 历史/新建） ---------- */
+.chat-header {
+  position: relative; /* 让历史下拉面板以此定位 */
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex: none;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.35)));
+  background: var(--dsw-alias-bg-base, var(--vscode-sideBar-background, var(--vscode-editor-background)));
+}
+
+/* 标题区：占满剩余宽度、可收缩省略；点击整个标题进入改名 */
+.chat-title-wrap {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+.chat-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 600;
+  font-size: 13px;
+  line-height: 24px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer; /* 可点击改名 */
+  border-radius: 6px;
+  padding: 0 4px;
+  color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
+}
+.chat-title-wrap:hover .chat-title {
+  text-decoration: underline dotted; /* 悬停提示可编辑 */
+}
+
+/* 未命名的占位态（新对话）→ 弱化显示 */
+.chat-title.untitled {
+  color: var(--dsw-alias-label-tertiary, var(--vscode-descriptionForeground, #999));
+  font-style: italic;
+  font-weight: 400;
+}
+
+.chat-title-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 26px;
+  font-family: inherit;
+  font-size: 12px;
+  padding: 0 8px;
+  border: 1px solid var(--dsw-alias-border-l2, var(--vscode-input-border, transparent));
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-1, var(--vscode-input-background));
+  color: var(--dsw-alias-label-primary, var(--vscode-input-foreground));
+}
+.chat-title-input:focus {
+  outline: none;
+  border-color: var(--dsw-alias-state-business-primary, var(--vscode-focusBorder, #3794ff));
+  box-shadow: 0 0 0 1px var(--dsw-alias-state-business-primary, var(--vscode-focusBorder, #3794ff));
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+/* ghost 胶囊小按钮：历史 / 新建对话 / API 共用 */
+.link-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: none;
+  border: none;
+  color: var(--dsw-alias-label-secondary, var(--vscode-textLink-foreground, #4daafc));
+  cursor: pointer;
+  padding: 2px 10px;
+  font-size: 12px;
+  line-height: 20px;
+  border-radius: 999px;
+  transition: background 0.12s ease;
+}
+.link-button:hover {
+  background: var(--dsw-alias-interactive-bg-hover, var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.12)));
+  color: var(--dsw-alias-label-primary, var(--vscode-textLink-foreground, #4daafc));
+  text-decoration: none;
+}
+.link-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ---------- 历史会话下拉面板 ---------- */
+.history-panel {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 8px;
+  z-index: 30;
+  width: min(260px, 86vw);
+  /* 上限高度：防止条目太多把下拉框无限拉大；超出的条目靠 .history-scroll 内部滚动 */
+  max-height: min(45vh, 340px);
+  overflow: hidden; /* 圆角裁切用；滚动交给列表区 */
+  background: var(--dsw-alias-bg-layer-2, var(--vscode-editorWidget-background, var(--vscode-sideBar-background)));
+  color: var(--dsw-alias-label-primary, var(--vscode-editorWidget-foreground, var(--vscode-sideBar-foreground)));
+  border: 1px solid var(--dsw-alias-border-l2, var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.4)));
+  border-radius: 10px;
+  box-shadow: var(--dsw-shadow-lv2, 0 8px 24px rgba(0, 0, 0, 0.4));
+  padding: 6px;
+  flex-direction: column; /* 搜索框固定，列表区伸缩滚动 */
+  display: none; /* 默认收起 */
+}
+
+.history-panel.open {
+  display: flex;
+}
+
+/* 搜索框：固定在面板顶部，不随列表一起滚走 */
+.history-search {
+  flex: none;
+  margin: 0 2px 6px;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--dsw-alias-border-l2, var(--vscode-input-border, transparent));
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-1, var(--vscode-input-background));
+  color: var(--dsw-alias-label-primary, var(--vscode-input-foreground));
+  font-family: inherit;
+  font-size: 12px;
+}
+.history-search:focus {
+  outline: none;
+  border-color: var(--dsw-alias-state-business-primary, var(--vscode-focusBorder, #3794ff));
+  box-shadow: 0 0 0 1px var(--dsw-alias-state-business-primary, var(--vscode-focusBorder, #3794ff));
+}
+.history-search::placeholder {
+  color: var(--dsw-alias-label-dimmed, var(--vscode-input-placeholderForeground, #999));
+}
+
+/* 列表滚动区：flex 子项必须 min-height:0 才允许收缩出滚动条 */
+.history-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain; /* 滚轮到头就停，不连锁滚动下面的消息区 */
+}
+
+.history-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.history-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 8px;
+}
+
+.history-item:hover {
+  background: var(--dsw-alias-interactive-bg-hover, var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.15)));
+}
+.history-item.active {
+  background: var(--dsw-alias-button-ghost-active-fill, var(--vscode-list-activeSelectionBackground, #094771));
+  box-shadow: inset 0 0 0 1px var(--dsw-alias-button-ghost-active-border, transparent);
+}
+.history-item.active .history-open {
+  color: var(--dsw-alias-label-primary, var(--vscode-list-activeSelectionForeground, #fff));
+}
+
+.history-open {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px 10px;
+  border: none;
+  background: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.history-item .history-open:hover {
+  background: none;
+}
+
+.history-title {
+  font-size: 12px;
+  line-height: 18px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
+}
+.history-item.active .history-title {
+  color: inherit;
+}
+
+.history-time {
+  font-size: 11px;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+}
+.history-item.active .history-time {
+  color: inherit;
+  opacity: 0.85;
+}
+
+.history-delete {
+  flex: none;
+  margin-right: 4px;
+  border: none;
+  background: none;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 20px;
+  padding: 4px 6px;
+  border-radius: 6px;
+}
+.history-delete:hover {
+  background: var(--dsw-alias-interactive-bg-hover, var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.25)));
+  color: var(--dsw-alias-state-error-primary, var(--vscode-errorForeground, #f14c4c));
+}
+
+.history-empty {
+  padding: 14px 10px;
+  text-align: center;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  font-size: 12px;
+}
+
+/* ---------- 消息区 ---------- */
+.messages {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.empty-hint {
+  margin: auto;
+  text-align: center;
+  color: var(--dsw-alias-label-tertiary, var(--vscode-descriptionForeground, rgba(128, 128, 128, 0.9)));
+  line-height: 1.6;
+  font-size: 13px;
+  white-space: pre-line; /* 空态文案按模式用 \n 换行 */
+}
+
+.msg {
+  max-width: 92%;
+  line-height: 1.55;
+  word-wrap: break-word;
+  color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
+}
+
+.msg-user {
+  align-self: flex-end;
+}
+.msg-assistant {
+  align-self: flex-start;
+}
+/* 工具卡占满消息区整行宽，更像一条"执行记录"而非聊天气泡 */
+.msg-tool {
+  align-self: stretch;
+  max-width: 100%;
+}
+
+.bubble {
+  padding: 8px 12px;
+  border-radius: 10px;
+}
+
+.msg-user .bubble {
+  background: var(--dsw-alias-bg-layer-2, var(--vscode-editor-selectionBackground, #264f78));
+  border-bottom-right-radius: 2px;
+  white-space: pre-wrap;
+}
+.msg-assistant .bubble {
+  background: var(--dsw-alias-bg-layer-1, var(--vscode-editor-inactiveSelectionBackground, #3a3d41));
+  border-bottom-left-radius: 2px;
+}
+
+/* ---------- markdown 内容 ---------- */
+.md p {
+  margin: 0 0 8px;
+}
+.md p:last-child {
+  margin-bottom: 0;
+}
+
+.md h1,
+.md h2,
+.md h3,
+.md h4 {
+  margin: 10px 0 6px;
+  line-height: 1.3;
+  color: var(--dsw-alias-label-primary, inherit);
+}
+.md h1 {
+  font-size: 1.3em;
+}
+.md h2 {
+  font-size: 1.15em;
+}
+.md h3 {
+  font-size: 1.05em;
+}
+
+.md ul,
+.md ol {
+  margin: 6px 0;
+  padding-left: 20px;
+}
+.md li {
+  margin: 2px 0;
+}
+
+.md blockquote {
+  margin: 8px 0;
+  padding: 2px 12px;
+  border-left: 3px solid var(--dsw-alias-state-business-primary, var(--vscode-textLink-foreground, #4daafc));
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+}
+
+.md code {
+  font-family: var(--dsw-code-font-family, var(--vscode-editor-font-family, Consolas, monospace));
+  font-size: 0.92em;
+  background: var(--dsw-alias-bg-layer-2, var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.18)));
+  color: var(--dsw-alias-label-primary, inherit);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.md pre {
+  margin: 8px 0;
+  padding: 10px 12px;
+  background: var(--dsw-alias-bg-layer-2, var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.18)));
+  border-radius: 8px;
+  overflow-x: auto;
+}
+.md pre code {
+  background: none;
+  padding: 0;
+}
+
+/* ---------- 工具调用卡（harness/Agent 模式） ---------- */
+/* 左缘色条按状态变化：running=蓝、ok=绿、error=红；正文走 pre，textContent 渲染。 */
+.tool-card {
+  border: 1px solid var(--dsw-alias-border-l1, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.35)));
+  border-left: 3px solid var(--dsw-alias-label-dimmed, var(--vscode-descriptionForeground, #999));
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-1, var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.15)));
+  overflow: hidden;
+  font-size: 12px;
+  color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
+}
+.tool-card.running {
+  border-left-color: var(--dsw-alias-state-business-primary, #3794ff);
+}
+.tool-card.ok {
+  border-left-color: var(--dsw-alias-state-success-primary, #3fb950);
+}
+.tool-card.error {
+  border-left-color: var(--dsw-alias-state-error-primary, #f85149);
+}
+
+.tool-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+}
+.tool-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dsw-alias-label-dimmed, var(--vscode-descriptionForeground, #999));
+}
+.tool-card.running .tool-dot {
+  background: var(--dsw-alias-state-business-primary, #3794ff);
+  animation: toolPulse 1s ease-in-out infinite;
+}
+.tool-card.ok .tool-dot {
+  background: var(--dsw-alias-state-success-primary, #3fb950);
+}
+.tool-card.error .tool-dot {
+  background: var(--dsw-alias-state-error-primary, #f85149);
+}
+@keyframes toolPulse {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+.tool-name {
+  font-family: var(--dsw-code-font-family, var(--vscode-editor-font-family, Consolas, monospace));
+  font-size: 12px;
+  font-weight: 600;
+}
+.tool-spacer {
+  flex: 1;
+}
+.tool-state {
+  flex: none;
+  font-size: 11px;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+}
+.tool-card.running .tool-state {
+  color: var(--dsw-alias-state-business-primary, #3794ff);
+}
+.tool-card.ok .tool-state {
+  color: var(--dsw-alias-state-success-primary, #3fb950);
+}
+.tool-card.error .tool-state {
+  color: var(--dsw-alias-state-error-primary, #f85149);
+}
+
+/* 入参：工具名 + 调用参数，等宽小字，弱化 */
+.tool-input {
+  margin: 0 10px 6px;
+  font-family: var(--dsw-code-font-family, var(--vscode-editor-font-family, Consolas, monospace));
+  font-size: 11px;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* 输出：pre 里的纯文本；error 卡让它偏红提示失败 */
+.tool-output {
+  margin: 0;
+  padding: 6px 10px 8px;
+  border-top: 1px dashed var(--dsw-alias-border-l2, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.3)));
+  font-family: var(--dsw-code-font-family, var(--vscode-editor-font-family, Consolas, monospace));
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 160px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #bdbdbd));
+}
+.tool-card.error .tool-output {
+  color: var(--dsw-alias-state-error-primary, var(--vscode-errorForeground, #f48771));
+}
+
+/* ---------- 流式光标 ---------- */
+.caret {
+  display: inline-block;
+  width: 7px;
+  margin-left: 2px;
+  background: var(--dsw-alias-label-primary, var(--vscode-editor-foreground, #ccc));
+  animation: blink 1s steps(2, start) infinite;
+}
+@keyframes blink {
+  to {
+    visibility: hidden;
+  }
+}
+
+/* ---------- 文件附件 ---------- */
+.attach-bar {
+  max-height: 84px;
+  overflow-y: auto;
+  padding: 2px 0;
+}
+.attach-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+/* 通用附件 chip：待发送可移除 / 气泡里只读 */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 1px 4px 1px 8px;
+  border: 1px solid var(--dsw-alias-border-l2, var(--vscode-input-border, rgba(128, 128, 128, 0.35)));
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-1, var(--vscode-input-background, rgba(128, 128, 128, 0.12)));
+  color: var(--dsw-alias-label-primary, var(--vscode-input-foreground, var(--vscode-foreground)));
+  font-size: 11px;
+  line-height: 1.6;
+}
+.chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 150px;
+}
+.chip-err {
+  flex: none;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-state-error-primary, var(--vscode-errorForeground, #f14c4c));
+  font-style: italic;
+}
+.chip-x {
+  flex: none;
+  border: none;
+  background: none;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0 3px;
+  border-radius: 50%;
+}
+.chip-x:hover {
+  background: var(--dsw-alias-interactive-bg-hover, var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.25)));
+  color: var(--dsw-alias-state-error-primary, var(--vscode-errorForeground, #f14c4c));
+}
+
+/* 消息气泡里的只读附件块（历史 / 已发送的那条） */
+.attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+.chip.readonly {
+  cursor: default;
+}
+
+/* ---------- 输入区（发送/停止/附件 + 文本框） ---------- */
+.composer {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: none;
+  padding: 6px 10px 8px;
+  border-top: 1px solid var(--dsw-alias-border-l1, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.35)));
+  background: var(--dsw-alias-bg-base, var(--vscode-sideBar-background, var(--vscode-editor-background)));
+}
+
+.input {
+  width: 100%;
+  resize: none;
+  padding: 8px 12px;
+  border: 1px solid var(--dsw-alias-border-l2, var(--vscode-input-border, transparent));
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-layer-1, var(--vscode-input-background));
+  color: var(--dsw-alias-label-primary, var(--vscode-input-foreground));
+  font-family: inherit;
+  font-size: inherit;
+  line-height: 1.45;
+}
+.input::placeholder {
+  color: var(--dsw-alias-label-dimmed, var(--vscode-input-placeholderForeground, #999));
+}
+.input:focus {
+  outline: none;
+  border-color: var(--dsw-alias-state-business-primary, var(--vscode-focusBorder, #3794ff));
+  box-shadow: 0 0 0 1px var(--dsw-alias-state-business-primary, var(--vscode-focusBorder, #3794ff));
+}
+.input:disabled {
+  opacity: 0.6;
+}
+
+.composer-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* DSH 胶囊按钮：ghost（透明）为底，primary 为实心 */
+.button {
+  border: none;
+  border-radius: 999px;
+  padding: 0 14px;
+  height: 28px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 28px;
+  transition: background 0.12s ease;
+}
+.button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.button-primary {
+  background: var(--dsw-alias-button-primary-fill, var(--vscode-button-background, #0e639c));
+  color: var(--dsw-alias-label-primary-foreground, var(--vscode-button-foreground, #fff));
+}
+.button-primary:hover:not(:disabled) {
+  background: var(--dsw-alias-button-primary-hover, var(--vscode-button-hoverBackground, #1177bb));
+}
+.button-secondary {
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, var(--vscode-button-secondaryForeground, var(--vscode-foreground, #ddd)));
+}
+.button-secondary:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover, var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.25)));
+}
+
+/* ---------- 底部配置条（仅 live 后端可见）：模型 + API Key ---------- */
+.live-config-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 5px;
+  font-size: 11px;
+  border-top: 1px dashed var(--dsw-alias-border-l2, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.25)));
+}
+.lc-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.lc-label {
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  flex: none;
+}
+
+.lc-select,
+.lc-input {
+  max-width: 180px;
+  height: 26px;
+  border: 1px solid var(--dsw-alias-border-l2, var(--vscode-input-border, transparent));
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-1, var(--vscode-input-background));
+  color: var(--dsw-alias-label-primary, var(--vscode-input-foreground));
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 0 6px;
+}
+.lc-input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.lc-select:disabled,
+.lc-input:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+/* API 按钮靠右，带状态点：未配置红 / 已配置绿 */
+.lc-api {
+  margin-left: auto;
+  flex: none;
+}
+.lc-api::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dsw-alias-state-error-primary, #f85149); /* 红：未配置 */
+  flex: none;
+}
+.lc-api.on::before {
+  background: var(--dsw-alias-state-success-primary, #3fb950); /* 绿：已配置 */
+}
+
+/* ---------- 居中灰色说明行（role:'note'，如「已开启全新 DSH 会话…」） ---------- */
+.msg-note {
+  align-self: center;
+  max-width: 90%;
+  text-align: center;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  font-size: 11px;
+  line-height: 1.5;
+}
+.msg-note::before {
+  content: '— ';
+}
+.msg-note::after {
+  content: ' —';
+}
+
+/* ---------- 真 DSH 对话组件的宿主区（harness + DSH 直播） ---------- */
+.dsh-live-host {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: transparent;
+}
+/* reactLive 时让真组件占满消息槽，DOM 消息体整体退出 */
+body.react-live #messages,
+body.react-live #empty-hint {
+  display: none !important;
+}

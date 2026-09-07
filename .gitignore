@@ -1,0 +1,18 @@
+# 依赖 / 构建产物
+node_modules/
+out/
+*.vsix
+
+# 运行时记录：logs/ 含真实 live 会话帧（对话/工具执行内容），不入库
+logs/
+
+# 本地工具配置（.claude/ 含本机绝对路径授权），不入库
+.claude/
+
+# DSH 编译产物：media/dsh-live/ 来自 DSH 仓库构建（内含 @deepseek-ai 组件实现）。
+# 公开仓不含此目录——clone 后需按 README 从 DSH 仓库重建（否则回退 VS Code 观感、无 react-live）。
+media/dsh-live/
+
+# 无头开发探针（本机验证用，引用本地 dsh-live 产物）
+probe-*.html
+probe-server.mjs

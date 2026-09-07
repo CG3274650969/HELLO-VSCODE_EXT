@@ -1,0 +1,141 @@
+{
+  "name": "hello-vscode-ext",
+  "displayName": "Hello VS Code",
+  "description": "第一个最小可跑的 VS Code 插件：一条打招呼命令 + 读取当前文件",
+  "version": "0.0.1",
+  "publisher": "starmerx-local",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "hello-chat",
+          "title": "Hello Chat",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "hello-chat": [
+        {
+          "type": "webview",
+          "id": "hello.chatView",
+          "name": "聊天",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "hello.sayHello",
+        "title": "打个招呼",
+        "category": "Hello"
+      },
+      {
+        "command": "hello.readActiveFile",
+        "title": "读取当前文件第一行",
+        "category": "Hello"
+      },
+      {
+        "command": "hello.chat.newChat",
+        "title": "开始新对话",
+        "category": "Hello Chat"
+      }
+    ],
+    "configuration": {
+      "title": "Hello Chat · DeepSeek Harness",
+      "properties": {
+        "hello.dsh.nodePath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "启动 DSH JSON-RPC runtime 用的 node 可执行文件（留空会走提示引导，见 README「DSH 直播配置」）。",
+          "scope": "machine"
+        },
+        "hello.dsh.loader": {
+          "type": "string",
+          "default": "tsx/esm",
+          "markdownDescription": "传给 `node --import` 的 tsx 加载器标识（与 DSH 仓库自身的启动脚本一致）。",
+          "scope": "machine"
+        },
+        "hello.dsh.entry": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "DSH jsonrpc-agent 的入口脚本（源码版，需配 tsx 加载；留空会走提示引导）。",
+          "scope": "machine"
+        },
+        "hello.dsh.config": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "runtime 的部署配置（cordis.yml）。运行时插件按此配置加载。",
+          "scope": "machine"
+        },
+        "hello.dsh.runCwd": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "子进程工作目录（保证 tsx / @deepseek-ai/* 插件能解析）。留空回退到打开的工作区根。",
+          "scope": "machine"
+        },
+        "hello.dsh.tsconfig": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "tsx 用的 TSX_TSCONFIG_PATH（留空则不额外设置，由 tsx 自行查找）。",
+          "scope": "machine"
+        },
+        "hello.dsh.credentialsFile": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "未在 VS Code 密钥库配置 DEEPSEEK_API_KEY 时的回退读取文件（留空则只走密钥库）。",
+          "scope": "machine"
+        },
+        "hello.dsh.provider": {
+          "type": "string",
+          "default": "deepseek-official",
+          "markdownDescription": "initialize 时上报的 provider 路由名。",
+          "scope": "machine"
+        },
+        "hello.dsh.model": {
+          "type": "string",
+          "default": "deepseek-v4-flash",
+          "markdownDescription": "默认模型名（在线状态里展示用）。",
+          "scope": "machine"
+        },
+        "hello.dsh.command": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "非空时整段覆盖启动命令（忽略 nodePath/loader/entry/config）。",
+          "scope": "machine"
+        },
+        "hello.dsh.args": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "markdownDescription": "`command` 非空时配合使用的参数列表。",
+          "scope": "machine"
+        },
+        "hello.dsh.debug": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "把子进程 stderr / 被忽略的 JSON-RPC 通知打到输出控制台（不含任何密钥）。",
+          "scope": "machine"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.4.0"
+  }
+}
