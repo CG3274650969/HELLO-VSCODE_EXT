@@ -164,4 +164,7 @@ export type WebviewToExt =
   | { type: 'review-keep'; rel: string } // 保留该文件改动（仅收起，不碰磁盘）
   | { type: 'review-revert'; rel: string } // 用轮前快照还原该文件
   | { type: 'review-keep-all' }
-  | { type: 'review-revert-all' };
+  | { type: 'review-revert-all' }
+  // 「在新对话中分支」：真 DSH ChatView 轮尾动作栏的分支按钮点击（无参数；MVP 固定
+  // fork 整份当前会话 → 新会话保留全部转写并切换过去，记忆沿用源 DSH 会话）。
+  | { type: 'fork-session' };

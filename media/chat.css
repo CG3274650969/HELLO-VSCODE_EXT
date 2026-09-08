@@ -188,24 +188,25 @@ body[data-ds-dark-theme] {
   flex: none;
 }
 
-/* ghost 胶囊小按钮：历史 / 新建对话 / API 共用 */
+/* ghost 胶囊小按钮：历史 / 新建对话 / 审阅条共用。CC 原则：壳上的控件是中性灰，
+   accent 只留给真正的动作/状态。默认灰字、hover 亮底亮字，不再是链接蓝。 */
 .link-button {
   display: inline-flex;
   align-items: center;
   gap: 5px;
   background: none;
   border: none;
-  color: var(--dsw-alias-label-secondary, var(--vscode-textLink-foreground, #4daafc));
+  color: var(--dsw-alias-label-secondary, var(--vscode-button-secondaryForeground, var(--vscode-foreground, #ddd)));
   cursor: pointer;
   padding: 2px 10px;
   font-size: 12px;
   line-height: 20px;
   border-radius: 999px;
-  transition: background 0.12s ease;
+  transition: background 0.12s ease, color 0.12s ease;
 }
 .link-button:hover {
   background: var(--dsw-alias-interactive-bg-hover, var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.12)));
-  color: var(--dsw-alias-label-primary, var(--vscode-textLink-foreground, #4daafc));
+  color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
   text-decoration: none;
 }
 .link-button:disabled {
@@ -354,6 +355,8 @@ body[data-ds-dark-theme] {
 }
 
 /* ---------- 消息区 ---------- */
+/* CC 空气感：内嵌聊天（DOM 态）消息列居中限宽，像一条阅读列；窄侧栏本就 <760 时自然全宽。
+   react-live（harness 真组件）态 #messages 被 display:none，此规则不影响 DSH 组件。 */
 .messages {
   flex: 1;
   min-height: 0;
@@ -362,7 +365,9 @@ body[data-ds-dark-theme] {
   padding: 12px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 14px;
+  max-width: 760px;
+  margin: 0 auto; /* 宽面板下把整条消息列水平居中 */
 }
 
 .empty-hint {
@@ -654,45 +659,168 @@ body[data-ds-dark-theme] {
   cursor: default;
 }
 
-/* ---------- 输入区（发送/停止/附件 + 文本框） ---------- */
+/* ---------- 输入区（CC 桌面式整卡 composer） ---------- */
+/* composer 脚注本身不再画“输入框盒子”：上面叠审阅条/附件条，下面一张整卡输入面。 */
 .composer {
   display: flex;
   flex-direction: column;
   gap: 6px;
   flex: none;
-  padding: 6px 10px 8px;
+  padding: 8px 12px 10px; /* 侧向 12 与消息区文本对齐 */
   border-top: 1px solid var(--dsw-alias-border-l1, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.35)));
   background: var(--dsw-alias-bg-base, var(--vscode-sideBar-background, var(--vscode-editor-background)));
 }
 
+/* 一张圆角输入卡片 = 输入 + 内底工具行同属一个表面（不再“框里套框”）。
+   DSH 输入表面 + 细边框；hover 边框略亮；focus-within 整圈软焦点环。 */
+.composer-card {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--dsw-alias-border-l2, var(--vscode-input-border, rgba(128, 128, 128, 0.35)));
+  border-radius: 12px;
+  background: var(--dsw-specific-input-major, var(--dsw-alias-bg-layer-1, var(--vscode-input-background)));
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+.composer-card:hover {
+  border-color: var(--dsw-alias-border-l3, var(--vscode-input-border, rgba(128, 128, 128, 0.45)));
+}
+.composer-card:focus-within {
+  border-color: var(--dsw-alias-state-business-primary, var(--vscode-focusBorder, #3794ff));
+  box-shadow: 0 0 0 1px var(--dsw-alias-state-business-primary, var(--vscode-focusBorder, #3794ff)),
+    0 0 0 4px color-mix(in srgb, var(--dsw-alias-state-business-primary, #3794ff) 14%, transparent);
+}
+
+/* 输入区透明，边框/底色/焦点环全交给父卡片。高度由 autosizeInput 按计算样式
+   （line-height/padding）驱动，改动不影响其测量。 */
 .input {
+  display: block;
   width: 100%;
   resize: none;
-  padding: 8px 12px;
-  border: 1px solid var(--dsw-alias-border-l2, var(--vscode-input-border, transparent));
-  border-radius: 12px;
-  background: var(--dsw-alias-bg-layer-1, var(--vscode-input-background));
+  overflow-y: hidden; /* 默认隐藏；超上限后由 autosizeInput 切到 auto（框内滚动） */
+  padding: 9px 12px 4px;
+  border: none;
+  background: transparent;
   color: var(--dsw-alias-label-primary, var(--vscode-input-foreground));
   font-family: inherit;
-  font-size: inherit;
-  line-height: 1.45;
+  font-size: 13px;
+  line-height: 1.5;
+  outline: none;
 }
 .input::placeholder {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: var(--dsw-alias-label-dimmed, var(--vscode-input-placeholderForeground, #999));
-}
-.input:focus {
-  outline: none;
-  border-color: var(--dsw-alias-state-business-primary, var(--vscode-focusBorder, #3794ff));
-  box-shadow: 0 0 0 1px var(--dsw-alias-state-business-primary, var(--vscode-focusBorder, #3794ff));
 }
 .input:disabled {
   opacity: 0.6;
 }
 
-.composer-actions {
+/* 卡片内底行：左 = 附件图标 + (harness) 模型/配置簇；右 = 键盘提示 + 圆形发送。无竖分隔线，
+   靠留白分组（CC 原则：壳控件中性灰，accent 只给主动作）。 */
+.composer-toolbar {
   display: flex;
-  justify-content: flex-end;
+  flex-wrap: wrap; /* 极窄时优雅换行，不裁切 */
+  align-items: center;
+  gap: 6px 10px;
+  min-height: 28px;
+  padding: 3px 10px 10px 12px; /* 左 12 与输入文字对齐；右/底 10 让圆形发送避让卡片圆角 */
+}
+
+/* 工具图标按钮（＋附件）：方形轻角、中性灰，hover 才亮底亮字 */
+.tool-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, var(--vscode-button-secondaryForeground, var(--vscode-foreground, #bbb)));
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.tool-icon:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover, var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.16)));
+  color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
+}
+.tool-icon:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* 右侧簇（键盘提示 + 圆形发送 ↑ / 停止 ■）：整簇推最右——margin-left:auto 在这里，
+   所以无论提示是否隐藏，发送钮都稳定贴右（早期把 auto 放在提示上导致一打字就塌左）。 */
+.toolbar-actions {
+  display: inline-flex;
+  align-items: center;
   gap: 8px;
+  margin-left: auto;
+  flex: none;
+}
+/* 键盘提示：仅“空输入待命”时亮起（JS 在 body 上挂 input-empty），输入有字/运行中就隐。 */
+.composer-hint {
+  display: none;
+  flex: none;
+  font-size: 11px;
+  line-height: 26px;
+  color: var(--dsw-alias-label-tertiary, var(--vscode-descriptionForeground, #999));
+  white-space: nowrap;
+  user-select: none;
+}
+body.input-empty:not(.live-busy) .composer-hint {
+  display: inline;
+}
+.circle-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.12s ease, color 0.12s ease, box-shadow 0.12s ease;
+}
+.circle-btn svg {
+  display: block;
+}
+.circle-btn:disabled {
+  cursor: default;
+}
+
+/* 发送钮状态机：默认 = 看得见的灰圆（空输入/被拦都停在灰，绝不近黑、不透明消失）；
+   chat.js 在“真有内容可发”时挂 .can-send → 亮实心蓝；运行/在途换成停止 ■（body.live-busy）。 */
+#send-btn {
+  background: var(--dsw-alias-bg-layer-2, var(--vscode-button-secondaryBackground, rgba(128, 128, 128, 0.2)));
+  color: var(--dsw-alias-label-primary, var(--vscode-button-secondaryForeground, var(--vscode-foreground, #ddd)));
+  opacity: 1;
+}
+#send-btn:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover, var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.3)));
+}
+#send-btn.can-send {
+  background: var(--dsw-alias-button-primary-fill, var(--vscode-button-background, #0e639c));
+  color: var(--dsw-alias-label-primary-foreground, var(--vscode-button-foreground, #fff));
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.28);
+}
+#send-btn.can-send:hover:not(:disabled) {
+  background: var(--dsw-alias-button-primary-hover, var(--vscode-button-hoverBackground, #1177bb));
+}
+body.live-busy #send-btn {
+  display: none; /* 运行中让位给停止钮 */
+}
+#stop-btn {
+  background: var(--dsw-alias-bg-layer-2, var(--vscode-button-secondaryBackground, rgba(128, 128, 128, 0.2)));
+  color: var(--dsw-alias-label-primary, var(--vscode-button-secondaryForeground, var(--vscode-foreground, #ddd)));
+}
+#stop-btn:hover:not(:disabled) {
+  background: var(--dsw-alias-state-error-primary, #f85149);
+  color: #fff;
 }
 
 /* DSH 胶囊按钮：ghost（透明）为底，primary 为实心 */
@@ -726,30 +854,124 @@ body[data-ds-dark-theme] {
   background: var(--dsw-alias-interactive-bg-hover, var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.25)));
 }
 
-/* ---------- 底部配置条（仅 live 后端可见）：模型 + API Key ---------- */
+/* 卡片内嵌的 live 配置簇（仅 harness 可见）：模型胶囊 + DSH/API 状态钮。
+   直接住在 composer-toolbar 里，与附件/发送同层；不再设「模型」前缀标签，靠胶囊自身表达。 */
 .live-config-bar {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding-top: 5px;
-  font-size: 11px;
-  border-top: 1px dashed var(--dsw-alias-border-l2, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.25)));
+  gap: 4px;
+  flex: none;
+  font-size: 12px;
 }
-.lc-field {
+
+/* 模型选择：自定义 DOM 触发钮 + 浮层菜单（弃用原生 <select>——其弹出列表是系统方形控件，
+   无法圆角/随主题配色，这正是此前“方、白底白字”的根源）。全部样式走 DSH 令牌。 */
+.lc-model-wrap {
+  position: relative; /* 菜单 absolute 的定位基准 */
+}
+.lc-model {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  min-width: 0;
+  max-width: 150px;
+  height: 26px;
+  padding: 0 6px 0 12px;
+  border: 1px solid var(--dsw-alias-border-l2, var(--vscode-input-border, transparent));
+  border-radius: 999px;
+  background: var(--dsw-alias-bg-layer-2, var(--vscode-input-background, rgba(128, 128, 128, 0.12)));
+  color: var(--dsw-alias-label-primary, var(--vscode-input-foreground));
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
 }
-.lc-label {
-  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+.lc-model:hover:not(:disabled),
+.lc-model.open {
+  background: var(--dsw-alias-interactive-bg-hover, var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.18)));
+}
+.lc-model:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.lc-model-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lc-chev {
   flex: none;
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  transition: transform 0.12s ease;
+}
+.lc-model.open .lc-chev {
+  transform: rotate(180deg);
 }
 
-.lc-select,
+/* 浮层菜单：anchored 到触发钮上方（composer 在面板底部，向下会出界），
+   圆角 + 令牌底 + lv2 阴影，逐项 hover；当前项右侧打勾。z 高于消息/历史/审阅。 */
+.lc-model-menu {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 6px); /* 向上升起 */
+  z-index: 46;
+  display: none;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 150px;
+  max-width: 230px;
+  padding: 4px;
+  border: 1px solid var(--dsw-alias-border-l2, var(--vscode-dropdown-border, rgba(128, 128, 128, 0.4)));
+  border-radius: 10px;
+  background: var(--vscode-dropdown-listBackground, var(--dsw-alias-bg-overlay, var(--dsw-alias-bg-layer-2, #2b2b2b)));
+  box-shadow: var(--dsw-shadow-lv2, 0 8px 24px rgba(0, 0, 0, 0.4));
+}
+.lc-model-menu.open {
+  display: flex;
+}
+.lc-model-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px 5px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-primary, var(--vscode-dropdown-foreground, var(--vscode-foreground, #ddd)));
+  white-space: nowrap;
+}
+.lc-model-item:hover {
+  background: var(--dsw-alias-interactive-bg-hover, var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.16)));
+}
+.lc-mi-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.lc-mi-check {
+  margin-left: auto;
+  flex: none;
+  color: var(--dsw-alias-state-business-primary, var(--vscode-focusBorder, #3794ff));
+  font-weight: 700;
+}
+.lc-model-sep {
+  height: 1px;
+  margin: 3px 4px;
+  background: var(--dsw-alias-border-l1, var(--vscode-dropdown-border, rgba(128, 128, 128, 0.25)));
+}
+.lc-model-custom {
+  color: var(--dsw-alias-label-secondary, var(--vscode-dropdown-foreground, #999));
+}
+/* 自定义模型输入：临时出现，低调小字段（定宽，避免把卡片底行撑开） */
 .lc-input {
-  max-width: 180px;
-  height: 26px;
+  flex: none;
+  width: 160px;
+  height: 24px;
+  padding: 0 8px;
   border: 1px solid var(--dsw-alias-border-l2, var(--vscode-input-border, transparent));
   border-radius: 8px;
   background: var(--dsw-alias-bg-layer-1, var(--vscode-input-background));
@@ -757,20 +979,13 @@ body[data-ds-dark-theme] {
   font-family: inherit;
   font-size: 12px;
   line-height: 1.5;
-  padding: 0 6px;
 }
-.lc-input {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-.lc-select:disabled,
 .lc-input:disabled {
   opacity: 0.5;
   cursor: default;
 }
-/* 右簇：DSH 按钮推最右（原 .lc-api 的 auto 移给它），API 跟其后。都带状态点：未配置红 / 已配置绿 */
+/* DSH / API 状态点链接按钮：红=未配置 绿=已配置。并入工具行后不再推最右（右侧由 .toolbar-actions 负责） */
 .lc-dsh {
-  margin-left: auto;
   flex: none;
 }
 .lc-dsh::before,
@@ -795,6 +1010,16 @@ body[data-ds-dark-theme] {
 }
 .lc-api.on::before {
   background: var(--dsw-alias-state-success-primary, #3fb950); /* 绿：已配置 */
+}
+/* 状态钮观感：盖掉 .link-button 的链接蓝，改中性文字 + 彩色状态点（灰色工具行里不跳不吵） */
+.lc-dsh,
+.lc-api {
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  padding: 2px 8px;
+}
+.lc-dsh:hover,
+.lc-api:hover {
+  color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
 }
 
 /* ---------- 居中灰色说明行（role:'note'，如「已开启全新 DSH 会话…」） ---------- */
@@ -829,13 +1054,16 @@ body.react-live #empty-hint {
 }
 
 /* ---------- 2.1 本轮改动审阅条 + 面板浮层（Keep/Revert） ---------- */
-/* 审阅条：挂在 composer 内（消息区之下、输入框之上）；react-live 只藏 #messages，故两态都可见 */
+/* 审阅条：挂在 composer 内（消息区之下、输入框之上）；react-live 只藏 #messages，故两态都可见。
+   收敛成一颗软卡片（弱底 + 圆角），不再用虚线横线切分——composer 组只留顶一条发丝线。 */
 .review-bar {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding-top: 4px;
-  border-top: 1px dashed var(--dsw-alias-border-l2, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.25)));
+  padding: 3px 6px 3px 10px;
+  border: 1px solid var(--dsw-alias-border-l2, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.25)));
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-1, var(--vscode-editor-inactiveSelectionBackground, rgba(128, 128, 128, 0.12)));
   font-size: 11px;
 }
 .review-summary {

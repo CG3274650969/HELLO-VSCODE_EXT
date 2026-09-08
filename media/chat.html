@@ -78,25 +78,58 @@
     <div id="attach-bar" class="attach-bar" hidden>
       <div id="attach-list" class="attach-list"></div>
     </div>
-    <textarea id="input" class="input" rows="3"
-              placeholder="输入消息，Enter 发送，Shift+Enter 换行；Ctrl+V 粘贴或拖入文件可加附件…"></textarea>
-    <div class="composer-actions">
-      <button id="attach-btn" class="button button-secondary" title="添加文件附件">＋附件</button>
-      <button id="stop-btn" class="button button-secondary" hidden>停止</button>
-      <button id="send-btn" class="button button-primary">发送</button>
-    </div>
-    <!-- 仅 harness 模式可见的底部配置条（harness 恒为 DSH 直播）：模型下拉(+自定义) + DSH/API 配置（Claude Code 式） -->
-    <div id="live-config-bar" class="live-config-bar" hidden>
-      <label class="lc-field" for="live-model-sel">
-        <span class="lc-label">模型</span>
-        <select id="live-model-sel" class="lc-select" title="切换模型（需停在运行中后生效，会重启 live 子进程）"></select>
-      </label>
-      <input id="live-model-input" class="lc-input" type="text" spellcheck="false" maxlength="120"
-             hidden placeholder="输入模型 id，回车应用">
-      <button id="live-dsh-btn" class="link-button lc-dsh" type="button"
-              title="引导式配置 DSH 运行路径（node / 入口 / 工作目录 / tsconfig / config，保存到用户设置）">配置 DSH</button>
-      <button id="live-api-btn" class="link-button lc-api" type="button"
-              title="配置 DEEPSEEK_API_KEY（保存到 VS Code SecretStorage，回退读取 ~/.dsh/.credentials.yaml）">API</button>
+    <!-- CC 桌面式整卡 composer：输入区与下方工具行并入同一张圆角卡片（输入透明、无自身边框），
+         卡片 hover/focus 整圈出环；内嵌聊天 / harness 共用这一张卡，只是中间簇显隐不同。 -->
+    <div id="composer-card" class="composer-card">
+      <!-- 输入框：默认一行，多行向上自动增高；超过上限后在框内滚动（chat.js autosizeInput 驱动）。
+           透明无边框——卡片供底色，focus 光晕由父卡片 :focus-within 出。 -->
+      <textarea id="input" class="input" rows="1"
+                placeholder="输入消息，Enter 发送"
+                title="Enter 发送 · Shift+Enter 换行 · Ctrl+V 粘贴或拖入文件可加附件"></textarea>
+      <!-- 卡片内底行工具（CC 桌面式）：左 = 附件图标；harness 追加模型/配置簇；右 = 空态键盘提示 + 圆形发送 ↑。
+           空输入时发送是看得见的灰圆（chat.js 挂 .can-send 才亮蓝），运行中切成圆形停止 ■。 -->
+      <div class="composer-toolbar">
+        <button id="attach-btn" class="tool-icon" type="button" title="添加文件附件"
+                aria-label="添加文件附件">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
+          </svg>
+        </button>
+        <div id="live-config-bar" class="live-config-bar" hidden>
+          <!-- 模型选择器：DOM 浮层菜单（CC/DSH 同款）。原生 <select> 的弹出列表是系统方形控件、
+               无法圆角/配色，故弃用；此处按钮触发 .lc-model-menu（chat.js 渲染/开关）。 -->
+          <div class="lc-model-wrap">
+            <button id="live-model-btn" class="lc-model" type="button"
+                    title="切换模型（需停在运行中后生效，会重启 live 子进程）">
+              <span id="live-model-label" class="lc-model-label">选择模型</span>
+              <span class="lc-chev" aria-hidden="true"></span>
+            </button>
+            <div id="live-model-menu" class="lc-model-menu" role="menu" aria-label="模型列表"></div>
+          </div>
+          <input id="live-model-input" class="lc-input" type="text" spellcheck="false" maxlength="120"
+                 hidden placeholder="输入模型 id，回车应用">
+          <button id="live-dsh-btn" class="link-button lc-dsh" type="button"
+                  title="引导式配置 DSH 运行路径（node / 入口 / 工作目录 / tsconfig / config，保存到用户设置）">配置 DSH</button>
+          <button id="live-api-btn" class="link-button lc-api" type="button"
+                  title="配置 DEEPSEEK_API_KEY（保存到 VS Code SecretStorage，回退读取 ~/.dsh/.credentials.yaml）">API</button>
+        </div>
+        <span class="toolbar-actions">
+          <span id="composer-hint" class="composer-hint" aria-hidden="true">Enter 发送 · ⇧ 换行</span>
+          <button id="stop-btn" class="circle-btn" type="button" title="停止" aria-label="停止" hidden>
+            <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+              <rect x="0" y="0" width="10" height="10" rx="1.5" fill="currentColor"></rect>
+            </svg>
+          </button>
+          <button id="send-btn" class="circle-btn" type="button" title="发送" aria-label="发送">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 19V5"></path>
+              <path d="M5 12l7-7 7 7"></path>
+            </svg>
+          </button>
+        </span>
+      </div>
     </div>
   </footer>
 

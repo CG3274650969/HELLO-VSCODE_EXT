@@ -313,6 +313,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'clear':
         this.startNewSession();
         break;
+      case 'fork-session':
+        this._forkSession();
+        break;
       case 'list-sessions':
         this._sendHistory();
         break;
@@ -1572,6 +1575,50 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._actives[this._mode] = target;
     // 打开历史会话后，让消息 id 序号接续既有历史：避免"重启后续聊"产生撞 id
     this._seedMsgSeq();
+    this._postSnapshot();
+    this._sendHistory();
+  }
+
+  /**
+   * 「在新对话中分支」（真 DSH ChatView 轮尾动作栏的分支按钮触发）：把当前 harness
+   * 会话深拷贝出一份新会话（保留全部转写）并切换过去。新会话继续发消息即进入 DSH
+   * 会话的下一轮；因分支与源会话共享同一 DSH 会话映射，模型记忆无缝延续（各 UI 会话
+   * 只展示自己的转写）。用户已在设计时拍板采用该"同记忆"语义。
+   */
+  private _forkSession(): void {
+    if (this._mode !== 'harness') return; // 分支按钮只在 harness 的真 ChatView 里存在
+    if (this._liveRunning || this._abort) {
+      vscode.window.setStatusBarMessage('等本轮结束后再分支', 3000);
+      return;
+    }
+    const src = this._active;
+    if (src.messages.length === 0) return;
+
+    // 深拷贝转写（ChatMessage 是纯 JSON 字段）；克隆副本防与源会话未来互染
+    const messages = JSON.parse(JSON.stringify(src.messages)) as ChatMessage[];
+    const firstUser = messages.find((m) => m.role === 'user');
+    const fork = this._store.create(
+      src.title
+        ? src.title + '（分支）'
+        : firstUser
+          ? titleFromText(firstUser.text)
+          : ''
+    );
+    fork.messages = messages;
+    fork.updatedAt = Date.now();
+
+    this._dropReview(true); // 切会话 → 清掉上一会话的审阅（同 _openSession 惯例）
+    this._store.add(fork); // fork 已有内容 → 立即上历史列表
+    this._persistActiveSession(); // 归档源会话并落盘（fork 此时已在列，一并写入）
+
+    // 记忆延续：分支共享源 DSH 会话 → 后续 _ensureDshSession 直接复用、不插"失忆"note
+    const srcDshId = this._dshSessions.get(src.id);
+    if (srcDshId) {
+      this._dshSessions.set(fork.id, srcDshId);
+    }
+
+    this._actives[this._mode] = fork;
+    this._seedMsgSeq(); // 续接消息 id 尾号，防撞 id
     this._postSnapshot();
     this._sendHistory();
   }

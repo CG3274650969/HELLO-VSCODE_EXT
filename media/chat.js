@@ -42,13 +42,16 @@
 
   // 底部配置条（模型/DSH/API 配置）：仅 harness 模式可见（harness 恒为 DSH 直播）
   var liveConfigBar = document.getElementById('live-config-bar');
-  var liveModelSel = document.getElementById('live-model-sel');
+  var liveModelBtn = document.getElementById('live-model-btn'); // 自定义选择器触发钮
+  var liveModelLabel = document.getElementById('live-model-label');
+  var liveModelMenu = document.getElementById('live-model-menu'); // 浮层菜单
+  var liveModelWrap = document.getElementById('live-model-wrap');
   var liveModelInput = document.getElementById('live-model-input');
   var liveApiBtn = document.getElementById('live-api-btn');
   var liveDshBtn = document.getElementById('live-dsh-btn');
   var liveModels = []; // 扩展下发的可选模型
   var liveModel = ''; // 当前生效模型（扩展为真相）
-  var liveModelOptionsKey = ''; // 下拉是否已按 models 构建过
+  var liveModelList = []; // 菜单展示用的模型列表（预设 + 当前模型兜底）
   var apiConfigured = false; // API key 是否已配
   var dshConfigured = false; // DSH 运行路径（nodePath && entry）是否已配
   var customModelActive = false; // 是否正显示"自定义模型"输入框
@@ -95,6 +98,7 @@
   /** 最近一次 snapshot 的整幅消息（React 挂载晚于消息到达时用于补齐回放前缀） */
   var lastSnapshotMessages = null;
   var ORIG_PLACEHOLDER = inputEl ? inputEl.placeholder : '';
+  var INPUT_MAX_LINES = 6; // 输入框自动增高上限（行），超过后在框内滚动
 
   function isReactLive() {
     return !!liveHost && !liveHost.hidden;
@@ -357,6 +361,33 @@
     inputEl.focus();
   }
 
+  /** 输入框的行高 + 纵向 padding/border（供自动增高换算真实像素；随字号/主题变化现算）。 */
+  function inputMetrics() {
+    var cs = window.getComputedStyle(inputEl);
+    var fs = parseFloat(cs.fontSize) || 13;
+    var lh = parseFloat(cs.lineHeight);
+    if (!lh || isNaN(lh)) lh = Math.round(fs * 1.45);
+    var v = 0;
+    ['paddingTop', 'paddingBottom', 'borderTopWidth', 'borderBottomWidth'].forEach(function (k) {
+      var n = parseFloat(cs[k]);
+      if (n) v += n;
+    });
+    return { lh: lh, pad: v };
+  }
+
+  /** 自动增高：默认一行；内容多行则向上长到 INPUT_MAX_LINES 行；再超就在框内滚动。 */
+  function autosizeInput() {
+    if (!inputEl) return;
+    var m = inputMetrics();
+    var one = m.lh + m.pad;
+    var max = m.lh * INPUT_MAX_LINES + m.pad;
+    inputEl.style.height = 'auto';
+    var full = inputEl.scrollHeight;
+    var h = Math.max(one, Math.min(full, max));
+    inputEl.style.height = h + 'px';
+    inputEl.style.overflowY = full > max ? 'auto' : 'hidden';
+  }
+
   function isEmpty() {
     return byId.size === 0;
   }
@@ -403,18 +434,28 @@
     // live 在连接/等首事件期间没有任何流式气泡，但整轮仍在跑 → 额外看 runBusy
     var busy = hasStreaming() || sending || runBusy;
     inputEl.disabled = busy;
+    // 运行/在途标记：composer 的发送钮据此在「实心(运行) / 幽灵(空输入待命)」间切换
+    document.body.classList.toggle('live-busy', busy);
     // 只有正文或只有附件也能发；但附件里有读取失败的 → 禁止发送（要先移除）
     var blockSend = hasBadAttachment();
     // harness 未配 DSH 运行路径（node/入口）→ 禁发，引导先点底部「配置 DSH」
     var dshBlock = currentMode === 'harness' && !dshConfigured;
     sendBtn.disabled =
       busy || (!inputEl.value.trim() && !hasPending()) || blockSend || dshBlock;
+    // 视觉状态机（CSS #send-btn 默认灰、.can-send 变蓝）：只有真能发才挂 can-send，
+    // 不依赖 disabled 的原生暗化——保证空输入时按钮是清晰的灰而非近黑。
+    sendBtn.classList.toggle(
+      'can-send',
+      !busy && !blockSend && !dshBlock && (!!inputEl.value.trim() || hasPending())
+    );
     sendBtn.title = blockSend
       ? '有附件读取失败，请先移除后再发送'
       : dshBlock
         ? '先点底部「配置 DSH」配好运行路径再发送'
         : '';
     stopBtn.hidden = !(hasStreaming() || runBusy);
+    // 空输入待命标记：CSS 据此亮出卡片底行键盘提示（有字/有附件/运行中就隐）
+    document.body.classList.toggle('input-empty', !inputEl.value.trim() && !hasPending());
     refreshLiveConfigEnabled();
   }
 
@@ -468,13 +509,15 @@
   function refreshLiveConfigVisibility() {
     var show = currentMode === 'harness';
     if (!show && customModelActive) exitCustomModelInput(false); // 藏起来时收掉自定义输入态
+    if (!show) closeModelMenu(); // 切走 harness 时收起模型菜单
     liveConfigBar.hidden = !show;
   }
 
   /** 运行在途（sending/runBusy）→ 模型 / API / DSH 配置一律禁改。 */
   function refreshLiveConfigEnabled() {
     var busy = sending || runBusy;
-    liveModelSel.disabled = busy;
+    liveModelBtn.disabled = busy;
+    if (busy) closeModelMenu(); // 开始运行了就把打开的菜单收起
     liveModelInput.disabled = busy;
     liveApiBtn.disabled = busy;
     liveDshBtn.disabled = busy;
@@ -486,40 +529,93 @@
     if (data.model) liveModel = data.model;
     if (typeof data.apiConfigured === 'boolean') apiConfigured = data.apiConfigured;
     liveApiBtn.classList.toggle('on', apiConfigured);
-    liveApiBtn.textContent = 'API：' + (apiConfigured ? '已配置' : '未配置');
+    // 已配置 → 收敛成点+短标签（CC 的低调状态）；未配置 → 完整「配置 API」引导（配合红点/tooltip）
+    liveApiBtn.textContent = apiConfigured ? 'API' : '配置 API';
     liveApiBtn.title = apiConfigured
       ? 'DEEPSEEK_API_KEY 已配置（SecretStorage 或 ~/.dsh/.credentials.yaml），点击可改'
       : '未检测到 DEEPSEEK_API_KEY，点击配置';
 
     if (typeof data.dshConfigured === 'boolean') dshConfigured = data.dshConfigured;
     liveDshBtn.classList.toggle('on', dshConfigured);
-    liveDshBtn.textContent = 'DSH：' + (dshConfigured ? '已配置' : '未配置');
+    liveDshBtn.textContent = dshConfigured ? 'DSH' : '配置 DSH';
     liveDshBtn.title = dshConfigured
       ? 'DSH 运行路径已配置，点击可重新引导（保存后重启 live 子进程）'
       : '尚未配置 node / 入口，点击打开引导向导';
 
-    // 下拉：预设 + 当前模型（不在预设里则加在最前）+ 「自定义…」
+    // 模型列表：预设 + 当前模型（不在预设里则加在最前）；全量重画菜单与触发钮文案（列表很小）
     var list = liveModels.slice();
     if (liveModel && list.indexOf(liveModel) === -1) list.unshift(liveModel);
-    var key = JSON.stringify(list);
-    if (key !== liveModelOptionsKey) {
-      liveModelOptionsKey = key;
-      liveModelSel.textContent = '';
-      for (var i = 0; i < list.length; i++) {
-        var o = document.createElement('option');
-        o.value = list[i];
-        o.textContent = list[i];
-        liveModelSel.appendChild(o);
-      }
-      var c = document.createElement('option');
-      c.value = '__custom';
-      c.textContent = '自定义…';
-      liveModelSel.appendChild(c);
-    }
-    if (!customModelActive) liveModelSel.value = liveModel;
+    liveModelList = list;
+    renderModelMenu();
     refreshLiveConfigVisibility();
     refreshLiveConfigEnabled();
     toggleEmptyHint(); // dshConfigured 一变 → harness 空态引导文案跟着切
+  }
+
+  // ---------- 自定义模型菜单（取代原生 <select>，CC/DSH 同款 DOM 浮层） ----------
+
+  /** 重建菜单内容并刷新触发钮文案。全量重画，模型数量很小可忽略。 */
+  function renderModelMenu() {
+    if (!liveModelLabel || !liveModelMenu) return;
+    liveModelLabel.textContent = liveModel || '选择模型';
+    liveModelMenu.textContent = '';
+    for (var i = 0; i < liveModelList.length; i++) {
+      (function (m) {
+        var row = document.createElement('div');
+        row.className = 'lc-model-item';
+        row.setAttribute('role', 'menuitem');
+        var name = document.createElement('span');
+        name.className = 'lc-mi-name';
+        name.textContent = m;
+        name.title = m;
+        var check = document.createElement('span');
+        check.className = 'lc-mi-check';
+        check.textContent = '✓';
+        check.hidden = m !== liveModel; // 当前模型右侧打勾
+        row.appendChild(name);
+        row.appendChild(check);
+        row.addEventListener('click', function () {
+          pickModel(m);
+        });
+        liveModelMenu.appendChild(row);
+      })(liveModelList[i]);
+    }
+    var sep = document.createElement('div');
+    sep.className = 'lc-model-sep';
+    liveModelMenu.appendChild(sep);
+    var cus = document.createElement('div');
+    cus.className = 'lc-model-item lc-model-custom';
+    cus.setAttribute('role', 'menuitem');
+    cus.textContent = '自定义模型…';
+    cus.addEventListener('click', function () {
+      closeModelMenu();
+      beginCustomModelInput();
+    });
+    liveModelMenu.appendChild(cus);
+  }
+
+  /** 点触发钮：开/关菜单。禁用态（busy）不动作。 */
+  function toggleModelMenu() {
+    if (liveModelBtn.disabled) return;
+    if (liveModelMenu.classList.contains('open')) {
+      closeModelMenu();
+      return;
+    }
+    renderModelMenu(); // 打开前重画，勾到当前项
+    liveModelMenu.classList.add('open');
+    liveModelBtn.classList.add('open');
+  }
+
+  function closeModelMenu() {
+    liveModelMenu.classList.remove('open');
+    liveModelBtn.classList.remove('open');
+  }
+
+  /** 从菜单选一个预设模型。busy 由 disabled 兜住；点的就是当前模型 → 只收起。 */
+  function pickModel(m) {
+    closeModelMenu();
+    if (m && m !== liveModel) post({ type: 'set-model', model: m });
+    // 触发钮文案等扩展 live-config 回执刷新（所见为准）
   }
 
   /** 选了「自定义…」→ 显示可编辑输入框，预填当前模型。 */
@@ -538,7 +634,7 @@
     customModelActive = false;
     var v = liveModelInput.value.trim();
     liveModelInput.hidden = true;
-    liveModelSel.value = liveModel; // 先回显当前生效模型，等扩展 live-config 回执确认
+    // 触发钮文案由下次 live-config 回执刷新（所见为准），这里不强设
     if (commit && v && v !== liveModel) {
       post({ type: 'set-model', model: v });
     }
@@ -571,6 +667,7 @@
     runBusy = false; // 模式一换，live 轮的锁也复位（扩展侧有运行就已被取消）
     pending = pendings[currentMode] || (pendings[currentMode] = []);
     inputEl.value = drafts[currentMode] || '';
+    autosizeInput(); // 草稿可能是多行：按内容回弹输入框高度
     // 状态点只在 harness 模式可见（chat 模式没有连接概念）
     harnessStatusEl.hidden = mode !== 'harness';
     refreshLiveConfigVisibility(); // 配置条仅 harness 常驻
@@ -1241,7 +1338,33 @@
     }
   }
 
+  /**
+   * 「在新对话中分支」（真 DSH ChatView 轮尾动作栏）：ChatView 以壳模式挂载，宿主回调
+   * forkAt 是空桩 → 这个按钮点了本来什么也不发生。这里在 **capture 阶段**（document 层，
+   * 早于 React 在 host 根上的委托）抢先截获：组件自己标不可用的分支钮（旧消息/非轮尾 →
+   * aria-disabled / data-unavailable）依旧尊重、不截；可用的则阻止继续下传（免得点进空桩）
+   * 并转成扩展侧的 fork-session 动作，由扩展深拷贝当前会话成新会话并切换过去。
+   * 只有真组件画面（react-live）里才有这个按钮 —— DOM 气泡回退态没有 → isReactLive 放行。
+   */
+  function onBranchCapture(e) {
+    if (!isReactLive()) return; // 分支按钮只在真 ChatView 里存在
+    if (!(e.target instanceof Element)) return;
+    var btn = e.target.closest('button');
+    if (!btn) return;
+    var label = btn.getAttribute('aria-label') || '';
+    if (!label.includes('分支')) return; // bundle i18n：t('message.branch') = 在新对话中分支
+    if (btn.hasAttribute('data-unavailable') || btn.getAttribute('aria-disabled') === 'true') {
+      return; // 组件判不可用 → 尊重其语义，不截、不误建会话
+    }
+    if (sending || runBusy) return; // 运行在途本就轮尾未落定，兜底再挡一道
+    e.preventDefault();
+    e.stopPropagation(); // 阻断下传到 React 根的空桩 onBranch
+    post({ type: 'fork-session' });
+  }
+
   function bindEvents() {
+    // 分支按钮捕获（见 onBranchCapture）：必须在 React 自己的委托处理之前跑
+    document.addEventListener('click', onBranchCapture, true);
     // 顶部模式切换：点 tab → 暂存本模式草稿并请扩展切模式
     for (var ti = 0; ti < modeTabs.length; ti++) {
       (function (tab) {
@@ -1251,17 +1374,14 @@
       })(modeTabs[ti]);
     }
 
-    // 底部配置条（仅 harness）：模型下拉 → 换模型（或进「自定义…」）；API 按钮 → 弹密钥录入
-    liveModelSel.addEventListener('change', function () {
-      if (sending || runBusy) {
-        liveModelSel.value = liveModel; // 运行中禁改：弹回当前模型
-        return;
-      }
-      if (liveModelSel.value === '__custom') {
-        beginCustomModelInput();
-      } else if (liveModelSel.value && liveModelSel.value !== liveModel) {
-        post({ type: 'set-model', model: liveModelSel.value });
-      }
+    // 底部配置条（仅 harness）：模型选择器 = 触发钮 + DOM 浮层菜单；点菜单外部任意处收起。
+    liveModelBtn.addEventListener('click', function () {
+      toggleModelMenu();
+    });
+    document.addEventListener('click', function (e) {
+      if (!liveModelMenu.classList.contains('open')) return;
+      if (liveModelWrap.contains(e.target)) return; // 菜单/触发钮内部各自处理
+      closeModelMenu();
     });
     liveModelInput.addEventListener('keydown', function (e) {
       if (e.key === 'Enter') {
@@ -1361,6 +1481,8 @@
     inputEl.addEventListener('keydown', handleKeydown);
     inputEl.addEventListener('input', saveDraft);
     inputEl.addEventListener('input', updateBusy);
+    inputEl.addEventListener('input', autosizeInput); // 自动增高：多行向上长 / 超上限框内滚动
+    window.addEventListener('resize', autosizeInput); // 侧栏宽度变化 → 换行数变 → 重算高度
     messagesEl.addEventListener('scroll', function () {
       atBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 40;
     });
@@ -1385,11 +1507,20 @@
     reviewPanelRevertAll.addEventListener('click', function () {
       post({ type: 'review-revert-all' });
     });
-    // Esc 收起审阅面板（在标题编辑/历史搜索输入框内时不抢 —— 它们自己管 Esc）
+    // Esc 收起浮层：审阅面板优先，否则历史面板。自带 Esc 的输入框（标题/历史搜索/自定义模型）
+    // 各自处理并回焦，全局监听不抢（否则会二次触发）。
     document.addEventListener('keydown', function (e) {
-      if (e.key !== 'Escape' || !reviewPanelOpen) return;
-      if (e.target === chatTitleInput || e.target === historySearch) return;
-      closeReviewPanel();
+      if (e.key !== 'Escape') return;
+      if (e.target === chatTitleInput || e.target === historySearch || e.target === liveModelInput) return;
+      if (liveModelMenu.classList.contains('open')) { // 模型菜单开着 → 先收它
+        closeModelMenu();
+        return;
+      }
+      if (reviewPanelOpen) {
+        closeReviewPanel();
+        return;
+      }
+      if (isHistoryOpen()) closeHistoryPanel();
     });
   }
 
@@ -1468,6 +1599,8 @@
           inputEl.value = '';
           saveDraft();
           clearPending();
+          autosizeInput(); // 已清空 → 输入框收回到一行
+          updateBusy(); // 清空后刷新发送钮/空态提示（input-empty 归位）
         }
         addMessage(data.message);
         toggleEmptyHint();
@@ -1605,6 +1738,7 @@
     renderHarnessStatus({ state: 'offline', busy: false });
     refreshLiveConfigVisibility(); // 配置条：等 backend-status/live-config 回执亮起
     updateBusy();
+    autosizeInput(); // 按当前草稿初始高度归一（多为空 → 一行）
 
     window.addEventListener('message', function (evt) {
       onMessage(evt.data);
