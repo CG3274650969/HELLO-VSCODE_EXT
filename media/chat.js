@@ -53,6 +53,22 @@
   var dshConfigured = false; // DSH 运行路径（nodePath && entry）是否已配
   var customModelActive = false; // 是否正显示"自定义模型"输入框
 
+  // 2.1 本轮 DSH 改动审阅：审阅条（composer 内）+ 面板浮层（body 直系）。react-live 下也可见。
+  var reviewBar = document.getElementById('review-bar');
+  var reviewSummary = document.getElementById('review-summary');
+  var reviewViewBtn = document.getElementById('review-view');
+  var reviewKeepAllBtn = document.getElementById('review-keep-all');
+  var reviewRevertAllBtn = document.getElementById('review-revert-all');
+  var reviewPanel = document.getElementById('review-panel');
+  var reviewPanelSub = document.getElementById('review-panel-sub');
+  var reviewList = document.getElementById('review-list');
+  var reviewPanelClose = document.getElementById('review-panel-close');
+  var reviewPanelKeepAll = document.getElementById('review-panel-keep-all');
+  var reviewPanelRevertAll = document.getElementById('review-panel-revert-all');
+  var reviewChanges = []; // 扩展 review-set 下发的审阅项（扁平 DTO）
+  var reviewPanelOpen = false; // 面板当前是否展开
+  var expandedRel = null; // 当前展开 diff 的文件（同刻只开一行）
+
   // 顶部模式：chat（内嵌聊天）/ harness（Agent）。两种模式各一套草稿与待发附件，互不串。
   var modeTabs = Array.prototype.slice.call(document.querySelectorAll('.mode-tab'));
   var currentMode = 'harness'; // mode-set 到达前的占位，扩展回执后纠正为真正模式（默认 harness）
@@ -172,6 +188,163 @@
     if (!window.MutationObserver) return;
     var mo = new MutationObserver(applyDshTheme);
     mo.observe(document.body, { attributes: true, attributeFilter: ['class'] });
+  }
+
+  // ---------- 2.1 本轮改动审阅 UI（review-set / review-clear 驱动） ----------
+
+  /** 按 reviewChanges 更新审阅条（0 条 → 隐藏条并收起面板）。 */
+  function renderReviewBar() {
+    var n = reviewChanges.length;
+    reviewBar.hidden = n === 0;
+    if (n === 0) {
+      closeReviewPanel();
+      return;
+    }
+    var added = 0;
+    var modified = 0;
+    var deleted = 0;
+    for (var i = 0; i < n; i++) {
+      if (reviewChanges[i].kind === 'added') added++;
+      else if (reviewChanges[i].kind === 'deleted') deleted++;
+      else modified++;
+    }
+    reviewSummary.textContent = '本轮改动 ' + n + ' 个文件（＋' + added + ' 改' + modified + ' −' + deleted + '）';
+    reviewViewBtn.hidden = false;
+    reviewKeepAllBtn.hidden = false;
+    reviewRevertAllBtn.hidden = false;
+  }
+
+  function openReviewPanel() {
+    reviewPanelOpen = true;
+    reviewPanel.classList.add('open');
+    renderReviewList();
+  }
+
+  function closeReviewPanel() {
+    reviewPanelOpen = false;
+    reviewPanel.classList.remove('open');
+    expandedRel = null;
+  }
+
+  /** 重建面板列表（逐条 createElement/textContent，防 XSS）。 */
+  function renderReviewList() {
+    reviewList.textContent = '';
+    if (reviewChanges.length === 0) {
+      var empty = document.createElement('div');
+      empty.className = 'rp-empty';
+      empty.textContent = '没有待处理的改动。';
+      reviewList.appendChild(empty);
+      reviewPanelSub.textContent = '';
+      return;
+    }
+    var added = 0;
+    var modified = 0;
+    var deleted = 0;
+    for (var i = 0; i < reviewChanges.length; i++) {
+      if (reviewChanges[i].kind === 'added') added++;
+      else if (reviewChanges[i].kind === 'deleted') deleted++;
+      else modified++;
+    }
+    reviewPanelSub.textContent = '＋' + added + '  改' + modified + '  −' + deleted;
+    // 展开的那行若已被移出（revert/keep），重置 expandedRel
+    var still = false;
+    if (expandedRel !== null) {
+      for (var e = 0; e < reviewChanges.length; e++) {
+        if (reviewChanges[e].rel === expandedRel) {
+          still = true;
+          break;
+        }
+      }
+      if (!still) expandedRel = null;
+    }
+    for (var k = 0; k < reviewChanges.length; k++) {
+      reviewList.appendChild(buildReviewRow(reviewChanges[k]));
+    }
+  }
+
+  /** 单条改动的行：操作徽 + 相对路径 + 展开 diff / 保留 / 还原。按钮回调闭包捕获 rel。 */
+  function buildReviewRow(ch) {
+    var box = document.createElement('div');
+    box.className = 'rp-file';
+    var isOpen = expandedRel === ch.rel;
+
+    var row = document.createElement('div');
+    row.className = 'rp-file-row';
+
+    var op = document.createElement('span');
+    op.className = 'rp-op ' + ch.kind;
+    op.textContent = ch.kind === 'added' ? 'A' : ch.kind === 'deleted' ? 'D' : 'M';
+    row.appendChild(op);
+
+    var name = document.createElement('span');
+    name.className = 'rp-name';
+    name.textContent = ch.rel;
+    name.title = ch.rel;
+    row.appendChild(name);
+
+    var spacer = document.createElement('span');
+    spacer.className = 'rp-file-spacer';
+    row.appendChild(spacer);
+
+    var toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'link-button rp-toggle';
+    toggle.textContent = isOpen ? '收起' : 'Diff';
+    toggle.disabled = !ch.diff && !ch.diffTruncated;
+    toggle.title = ch.diff ? '展开行级 diff' : (ch.diffTruncated ? 'diff 过大未附内容' : '无可预览内容（二进制/超大）');
+    (function (rel) {
+      toggle.addEventListener('click', function () {
+        expandedRel = expandedRel === rel ? null : rel;
+        renderReviewList();
+      });
+    })(ch.rel);
+    row.appendChild(toggle);
+
+    var keep = document.createElement('button');
+    keep.type = 'button';
+    keep.className = 'link-button rp-keep';
+    keep.textContent = '保留';
+    keep.title = '保留该文件改动，从审阅里移除';
+    (function (rel) {
+      keep.addEventListener('click', function () {
+        post({ type: 'review-keep', rel: rel });
+      });
+    })(ch.rel);
+    row.appendChild(keep);
+
+    var revert = document.createElement('button');
+    revert.type = 'button';
+    revert.className = 'link-button rp-revert';
+    revert.textContent = '还原';
+    revert.disabled = !ch.reversible;
+    revert.title = ch.reversible ? '用轮前快照还原该文件' : '无轮前内容可还原（二进制/超大文件）';
+    (function (rel) {
+      revert.addEventListener('click', function () {
+        post({ type: 'review-revert', rel: rel });
+      });
+    })(ch.rel);
+    row.appendChild(revert);
+
+    box.appendChild(row);
+
+    if (isOpen && ch.diff) {
+      var pre = document.createElement('pre');
+      pre.className = 'rp-diff';
+      for (var d = 0; d < ch.diff.length; d++) {
+        var line = document.createElement('div');
+        line.className = 'diff-line ' + ch.diff[d].kind;
+        line.textContent = ch.diff[d].text;
+        pre.appendChild(line);
+      }
+      box.appendChild(pre);
+      if (ch.diffTruncated) {
+        var note = document.createElement('div');
+        note.className = 'rp-diff-note';
+        note.textContent = '…diff 过长，已截断';
+        box.appendChild(note);
+      }
+    }
+    return box;
   }
 
   // ---------- 通用 ----------
@@ -1191,6 +1364,33 @@
     messagesEl.addEventListener('scroll', function () {
       atBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 40;
     });
+
+    // ---- 2.1 改动审阅：审阅条 / 浮层面板 ----
+    reviewViewBtn.addEventListener('click', function () {
+      if (reviewPanelOpen) closeReviewPanel();
+      else openReviewPanel();
+    });
+    reviewKeepAllBtn.addEventListener('click', function () {
+      post({ type: 'review-keep-all' });
+    });
+    reviewRevertAllBtn.addEventListener('click', function () {
+      post({ type: 'review-revert-all' });
+    });
+    reviewPanelClose.addEventListener('click', function () {
+      closeReviewPanel();
+    });
+    reviewPanelKeepAll.addEventListener('click', function () {
+      post({ type: 'review-keep-all' });
+    });
+    reviewPanelRevertAll.addEventListener('click', function () {
+      post({ type: 'review-revert-all' });
+    });
+    // Esc 收起审阅面板（在标题编辑/历史搜索输入框内时不抢 —— 它们自己管 Esc）
+    document.addEventListener('keydown', function (e) {
+      if (e.key !== 'Escape' || !reviewPanelOpen) return;
+      if (e.target === chatTitleInput || e.target === historySearch) return;
+      closeReviewPanel();
+    });
   }
 
   // ---------- 消息分发（扩展 → webview） ----------
@@ -1364,6 +1564,19 @@
         addNoteMessage(data.message);
         toggleEmptyHint();
         scrollToBottom();
+        break;
+
+      case 'review-set':
+        // 2.1 本轮 DSH 改动 → 刷新审阅条；浮层开着则同步重建列表
+        reviewChanges = data.changes || [];
+        renderReviewBar();
+        if (reviewPanelOpen) renderReviewList();
+        break;
+
+      case 'review-clear':
+        // 新轮开始 / 审阅已清空 → 隐藏审阅条并收起浮层
+        reviewChanges = [];
+        renderReviewBar();
         break;
     }
   }

@@ -10,11 +10,20 @@ import {
   ExtToWebview,
   FileRef,
   Mode,
+  ReviewChange,
   SessionSummary,
   WebviewToExt,
 } from './protocol';
 import { isAbortError, streamMockReply } from './mockAssistant';
 import { SessionStore, StoredSession, titleFromText } from './sessionStore';
+import {
+  applyRevert,
+  compareTrees,
+  FsSnapshot,
+  lineDiff,
+  snapshotTree,
+  TreeChange,
+} from './fileSnapshot';
 import {
   ContentBlock,
   DshEventData,
@@ -49,6 +58,9 @@ const PRESET_MODELS = ['deepseek-v4-flash', 'deepseek-chat', 'deepseek-reasoner'
 
 /** 单条工具输出在转写里最多展示的字符数（超出截断 + 提示） */
 const MAX_TOOL_OUTPUT_CHARS = 4000;
+/** 1.1 选区注入的兜底摘录护栏（正常走 @临时文件，只在写盘失败时用）：行数/字符双上限，防整段大选区刷爆对话。 */
+const SNIPPET_LINE_CAP = 100;
+const SNIPPET_CHAR_CAP = 8000;
 
 /** 把任意值变成工具入参的小字展示文本（对象 → 缩进 JSON；JSON 字符串 → 也解析成缩进 JSON） */
 function prettyValue(v: unknown): string {
@@ -139,6 +151,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** media/dsh-live 构建产物是否齐全（决定 webview 能否进入真 DSH 组件画面） */
   private _hasDshBundle = false;
 
+  // ---------- 2.1 改动审阅（每轮 DSH 结束后对工作区根 Keep/Revert）状态 ----------
+
+  /** 本轮是否正常走完（idle → done）。interrupted/error/abort 恒 false → 收尾清掉审阅 */
+  private _turnNormalDone = false;
+  /** 本轮审阅快照所在的工作区根（undefined = 本轮不审） */
+  private _reviewRootAbs?: string;
+  /** 轮首工作区快照：diff 完成后仍保留供 keep/revert 动作还原用 */
+  private _baseline?: FsSnapshot;
+  /** token：新一轮 / 导航清理时自增，让迟到的异步对比失效（防两轮 diff 交错） */
+  private _reviewSeq = 0;
+  /** 已算出、尚未被 keep/revert 处理的改动（rich 版，动作处理与还原用） */
+  private _pendingReview: TreeChange[] = [];
+
   constructor(
     private readonly _extensionUri: vscode.Uri,
     storageDir: string,
@@ -213,6 +238,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** 「新建对话」：归档当前模式的会话（若有内容）并开一个空的新会话。 */
   startNewSession(): void {
     this._cancelActiveRun();
+    this._dropReview(true); // 新建对话 → 清掉上一轮遗留的审阅
     if (this._active.messages.length > 0) {
       this._store.replace(this._active);
       this._store.persist();
@@ -227,6 +253,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // 杀掉常驻的 DSH 子进程（kill 内部置 dead，缓冲中迟到的行不再分发）
     this._dsh?.kill();
     this._dsh = undefined;
+    this._dropReview(false); // 清掉本轮审阅内存（视图已销毁，不必再发 clear）
     this._disposeViewListeners();
     this._view = undefined;
   }
@@ -248,6 +275,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._sendHistory();
         // webview 每次显示都重建：harness 状态点/运行锁一律以扩展侧为真相重放一遍
         this._postBackendStatus();
+        // 2.1 ready 重放：已算出未处理的本轮审阅补推（新一轮开始时已发 review-clear 隐去）
+        if (this._pendingReview.length > 0 && this._baseline !== undefined && !this._liveRunning) {
+          this._postReviewSet();
+        }
         // harness 默认模式：视图每次就绪都预热到「在线/未配置」可读状态
         //（幂等；未配置时 _getRuntime 在 spawn 前抛错 → 红点显示「DSH 未配置」引导）
         if (this._mode === 'harness' && !this._liveRunning) {
@@ -294,6 +325,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'rename-session':
         this._renameSession(msg.title);
         break;
+      case 'review-keep':
+        this._reviewAction('keep', msg.rel);
+        break;
+      case 'review-revert':
+        this._reviewAction('revert', msg.rel);
+        break;
+      case 'review-keep-all':
+        this._reviewAction('keep-all');
+        break;
+      case 'review-revert-all':
+        this._reviewAction('revert-all');
+        break;
     }
   }
 
@@ -301,6 +344,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _setMode(mode: Mode): void {
     if (mode === this._mode) return; // 点的还是当前模式，无事可做
     this._cancelActiveRun();
+    this._dropReview(true); // 切换模式 → 清掉审阅（harness 独有功能）
     this._persistActiveSession();
     this._mode = mode;
     void this._globalState.update(MODE_KEY, mode);
@@ -333,6 +377,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // 1) 「整行=文件路径」的行自动提升为附件（支持绝对路径 + 相对工作区根目录），
     //    其余内容保留为正文 —— 这样在输入框直接贴一行路径也能加文件。
     const fileRefs = refs.slice();
+    // 1.1：harness 轮发送时若活动编辑器有非空选区，自动把选中文本作为附件带上（内容取自
+    // 编辑器缓冲，dirty 未保存也包含）。先压入 → 下方"整行=路径"提升按 path 去重，同一文件不会再提一份。
+    const selectionRef = this._activeSelectionRef();
+    if (selectionRef && !fileRefs.some((r) => r.path === selectionRef.path)) {
+      fileRefs.push(selectionRef);
+    }
     const keptLines: string[] = [];
     for (const line of rawText.split('\n')) {
       const resolved = this._pathFromLine(line);
@@ -457,6 +507,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     ctrl: AbortController
   ): Promise<void> {
     this._liveRunning = true;
+    this._turnNormalDone = false; // 每轮开头复位；idle → done 时 _finishTurn 再置 true
     this._post({ type: 'run-busy', busy: true });
     this._postBackendStatus();
 
@@ -474,6 +525,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (ctrl.signal.aborted) onAbort();
 
     try {
+      // 0) 2.1：本轮开始前先快照工作区根（一切 await 之前同步取盘）—— 轮末对比出 agent 的改动
+      this._captureBaselineAtTurnStart();
       // 1) 拿本 UI 会话对应的 DSH 会话；首次续聊"旧对话"会插一行"失忆"note
       const dshId = this._ensureDshSession();
 
@@ -481,11 +534,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const parts: string[] = [];
       if (text) parts.push(text);
       for (const a of attachments) {
+        if (a.readError) {
+          // 附件读取失败：不进正文（_sendUser 已整条拒发），防御性跳过
+          continue;
+        }
+        if (a.selection) {
+          // 1.1 选区：原生 DSH 组件「所见即所发」——气泡里显示的＝发给 agent 的全部内容。
+          // 想气泡干净只有 chip，就必须让 agent 通过文件读内容：先把选中文本（编辑器缓冲原文，
+          // dirty 未保存也准）落成一个只读临时文件，只发 `@"临时文件"` 引用（投影成文件 chip）。
+          // 临时文件写盘失败才兜底回退内联摘录（仍保证 agent 拿到内容，代价是气泡会露出代码块）。
+          const tmp = a.path ? this._writeSelectionTmp(a) : undefined;
+          if (tmp) {
+            parts.push(`@"${tmp}"`);
+          } else if (a.path) {
+            parts.push(`@"${a.path}"`);
+            parts.push(this._selectionExcerpt(a));
+          } else {
+            parts.push(this._selectionExcerpt(a));
+          }
+          continue;
+        }
         const loc = a.path ? ` path="${a.path}"` : '';
-        const err = a.readError ? ` error="${a.readError}"` : '';
-        const body = a.readError ? '' : (a.content ?? '');
+        const body = a.content ?? '';
         const tail = a.truncated ? '\n…（内容过长，已截断）' : '';
-        parts.push(`<file name="${a.name}"${loc}${err}>\n${body}${tail}\n</file>`);
+        parts.push(`<file name="${a.name}"${loc}>\n${body}${tail}\n</file>`);
       }
       const blocks: ContentBlock[] = parts.length
         ? [{ type: 'text', text: parts.join('\n\n') }]
@@ -519,6 +591,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._post({ type: 'run-busy', busy: false });
       this._postBackendStatus();
       this._afterTurn();
+      // 2.1：正常走完（done）→ 退栈后异步对比工作区、算 diff 推审阅条；
+      // interrupted / error / abort → 清掉本轮的 baseline（不做审阅）
+      if (this._turnNormalDone) {
+        this._scheduleReviewAfterTurn();
+      } else {
+        this._dropReview(true);
+      }
     }
   }
 
@@ -536,6 +615,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** 本轮收尾（done：正常 idle / interrupted：被停止）。幂等。 */
   private _finishTurn(outcome: 'done' | 'interrupted'): void {
     if (!this._liveRunning) return;
+    if (outcome === 'done') {
+      this._turnNormalDone = true; // 2.1：正常走完 → finally 里排异步改动对比
+    }
     this._liveRunning = false;
     this._finalizeOpenAssistant(outcome);
     if (outcome === 'interrupted') {
@@ -1351,10 +1433,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const out: Attachment[] = [];
     for (const r of refs) {
       const name = r.name || (r.path ? path.basename(r.path) : '（未命名文件）');
+      let att: Attachment;
       if (r.path && r.content === undefined) {
-        out.push(this._readFileAttachment(r.path));
+        att = this._readFileAttachment(r.path);
       } else {
-        const att: Attachment = { name };
+        att = { name };
         if (r.path) att.path = r.path;
         if (r.content !== undefined) {
           att.content = r.content;
@@ -1365,8 +1448,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         } else {
           att.readError = '没有可用的文件内容';
         }
-        out.push(att);
       }
+      if (r.selection) att.selection = true; // 选区标记透传：组包时落成 @临时文件 chip（气泡干净）
+      out.push(att);
     }
     return out;
   }
@@ -1469,6 +1553,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (!target || target.id === this._active.id) return;
 
     this._cancelActiveRun();
+    this._dropReview(true); // 切会话 → 清掉上一会话的审阅
     this._persistActiveSession();
 
     // 新打开的会话不会再续跑任何流：残留的 streaming 一律落成 interrupted
@@ -1500,6 +1585,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._store.persist();
 
     if (isActive) {
+      this._dropReview(true); // 删的是当前会话 → 一并清掉审阅
       this._actives[this._mode] = this._store.create();
       this._postSnapshot();
     }
@@ -1545,6 +1631,271 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._active.updatedAt = Date.now();
     this._store.replace(this._active);
     this._store.persist();
+  }
+
+  // ---------- 1.1 发送自动附选区 ----------
+
+  /** 开关：每次发送现读（不缓存，改了立刻生效，无需 onDidChangeConfiguration）。 */
+  private _autoAttachSelectionOn(): boolean {
+    return vscode.workspace.getConfiguration('hello.chat').get<boolean>('autoAttachSelection', true);
+  }
+
+  /**
+   * 当前活动编辑器的选区附件引用；不满足条件（开关关 / 非 harness / 无工作区 / 非 file /
+   * 无选区 / 空选区文本）返回 undefined。content 直接取编辑器缓冲 → dirty 未保存也带上。
+   */
+  private _activeSelectionRef(): FileRef | undefined {
+    if (!this._autoAttachSelectionOn()) return undefined;
+    if (this._mode !== 'harness') return undefined;
+    if (!vscode.workspace.workspaceFolders) return undefined;
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) return undefined;
+    const doc = editor.document;
+    if (doc.uri.scheme !== 'file') return undefined;
+    const sel = editor.selection;
+    if (sel.isEmpty) return undefined;
+    const content = doc.getText(sel);
+    if (!content) return undefined;
+    // content 取编辑器缓冲（dirty 未保存也含），wire 一并发给 agent —— 它不能替用户读编辑器。
+    return { name: path.basename(doc.fileName), path: doc.fileName, content, selection: true };
+  }
+
+  /** 1.1 选区注入的内联摘录（**仅作临时文件写盘失败时的兜底**）：把选中文本放进独立代码块
+   *  （行/字符双上限截断）。正常路径已改为 @临时文件 chip（气泡干净）；只有临时文件写不出来
+   *  才回退到这里，宁可气泡露出代码块也不让 agent 丢掉内容。 */
+  private _selectionExcerpt(a: Attachment): string {
+    const content = a.content ?? '';
+    const allLines = content.split('\n');
+    const totalLines = allLines.length;
+    const reasons: string[] = [];
+    let snippet = content;
+    if (totalLines > SNIPPET_LINE_CAP) {
+      snippet = allLines.slice(0, SNIPPET_LINE_CAP).join('\n');
+      reasons.push(`选区共 ${totalLines} 行，仅展示前 ${SNIPPET_LINE_CAP} 行`);
+    }
+    if (snippet.length > SNIPPET_CHAR_CAP) {
+      snippet = snippet.slice(0, SNIPPET_CHAR_CAP);
+      reasons.push('内容超长已截断');
+    }
+    if (a.truncated) reasons.push('原文超出单条上限');
+    // 摘录放进代码围栏：优先 ```，内容自身带 ``` 就换 ~~~，再不行就不围栏（防围栏被内容打断）
+    const fence = !snippet.includes('```') ? '```' : !snippet.includes('~~~') ? '~~~' : '';
+    let out = `编辑器选中的代码（共 ${totalLines} 行）：`;
+    out += fence
+      ? `\n${fence}\n${snippet}\n${fence}`
+      : `\n${snippet}`;
+    if (reasons.length > 0) {
+      out += `\n（${reasons.join('；')}）`;
+    }
+    return out;
+  }
+
+  /** 1.1 把选中文本落成只读临时文件（内容 = 编辑器缓冲原文，dirty 未保存也准），返回其绝对路径；
+   *  发给 agent 的 `@"路径"` chip 指向它 —— 气泡里只有 chip + 用户的话，agent 打开文件即可读到
+   *  确切的选中行。文件名 = 原文件名 + `·选区`（chip 上仍看得出是哪个文件）。写盘失败 → undefined，
+   *  调用方回退内联摘录。
+   *
+   * 位置：优先工作区根下的 `.hello-chat/selection-attach`（DSH agent 与工作区同盘、能直接读 d:\…
+   *  路径；该目录已被快照忽略，绝不当成 agent 改动出现在 2.1 审阅里）。放 C:\ globalStorage 会被
+   *  证明读不到 —— agent 曾为读到它把文件复制进工作区，制造出幽灵改动。无工作区才回退 globalStorage。 */
+  private _writeSelectionTmp(a: Attachment): string | undefined {
+    try {
+      const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      const dir = root
+        ? path.join(root, '.hello-chat', 'selection-attach')
+        : path.join(this._storageDir, 'selection-attach');
+      fs.mkdirSync(dir, { recursive: true });
+      this._sweepSelectionTmp(dir); // 顺带清掉过期文件，防堆积
+      const target = path.join(dir, `${a.name}·选区`);
+      fs.writeFileSync(target, a.content ?? '', 'utf8');
+      return target;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** 清掉 selection-attach 目录里超过存活期的临时文件（agent 通常只在当轮读它；留多轮窗口防
+   *  会话续聊引用失效）。目录不存在 / 单文件删除失败都静默忽略。 */
+  private _sweepSelectionTmp(dir: string, maxAgeMs = 6 * 3600 * 1000): void {
+    try {
+      const now = Date.now();
+      for (const f of fs.readdirSync(dir)) {
+        try {
+          const p = path.join(dir, f);
+          if (now - fs.statSync(p).mtimeMs > maxAgeMs) fs.unlinkSync(p);
+        } catch {
+          /* 单个文件 stat/unlink 失败忽略 */
+        }
+      }
+    } catch {
+      /* 目录不存在等忽略 */
+    }
+  }
+
+  // ---------- 2.1 每轮 DSH 改动审阅（快照 / 对比 / 动作） ----------
+
+  /** 开关：每轮结束后生成审阅（现读，默认开）。 */
+  private _reviewChangesOn(): boolean {
+    return vscode.workspace.getConfiguration('hello.chat').get<boolean>('reviewChanges', true);
+  }
+
+  /** 审阅快照根 = 打开的工作区根 folder[0]（agent 改的就是它）。无文件夹 → 本轮不审（绝不快照 homedir）。 */
+  private _reviewRoot(): string | undefined {
+    return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  }
+
+  /** 轮首：清上一轮审阅 + 快照当前工作区根（同步取盘，快照点必须在一切 await 之前）。 */
+  private _captureBaselineAtTurnStart(): void {
+    this._reviewSeq += 1;
+    this._baseline = undefined;
+    this._reviewRootAbs = undefined;
+    this._pendingReview = [];
+    this._post({ type: 'review-clear' }); // 新一轮开始 → 隐去上轮审阅条
+    const root = this._reviewRoot();
+    if (!root || !this._reviewChangesOn()) return;
+    const shot = snapshotTree(root);
+    if ('aborted' in shot) return; // 目录过大/根不可读 → 本轮静默无审阅
+    this._reviewRootAbs = root;
+    this._baseline = shot;
+  }
+
+  /** 清掉本轮审阅内存；doPost 时通知 webview 隐藏审阅条/面板。 */
+  private _dropReview(doPost: boolean): void {
+    this._reviewSeq += 1;
+    this._baseline = undefined;
+    this._reviewRootAbs = undefined;
+    this._pendingReview = [];
+    if (doPost) {
+      this._post({ type: 'review-clear' });
+    }
+  }
+
+  /** 轮 done 后（finally 里）调用：退栈再异步对比，token 失配即静默丢（防新一轮/清理交错）。 */
+  private _scheduleReviewAfterTurn(): void {
+    const mySeq = this._reviewSeq;
+    const before = this._baseline;
+    const root = this._reviewRootAbs;
+    if (!before || !root) return;
+    void (async () => {
+      // 重活不在 _finishTurn/_runLive 的同步路径上做
+      await new Promise<void>((r) => setImmediate(r));
+      if (this._reviewSeq !== mySeq || this._baseline !== before) return;
+      const afterShot = snapshotTree(root);
+      if ('aborted' in afterShot) {
+        this._baseline = undefined;
+        this._reviewRootAbs = undefined;
+        return;
+      }
+      const changes = compareTrees(before, afterShot);
+      if (changes.length === 0) {
+        this._baseline = undefined;
+        this._reviewRootAbs = undefined;
+        return;
+      }
+      this._pendingReview = changes;
+      this._postReviewSet();
+    })();
+  }
+
+  /** 把 pending 改动整理成 webview DTO（行级 diff + 跨文件字节护栏）推给前端。 */
+  private _postReviewSet(): void {
+    const out: ReviewChange[] = [];
+    let budget = 200 * 1024; // 跨文件 diff 文本总护栏，防压垮 postMessage
+    for (const ch of this._pendingReview) {
+      const item: ReviewChange = {
+        kind: ch.kind,
+        rel: ch.rel,
+        name: ch.rel.slice(ch.rel.lastIndexOf('/') + 1),
+        reversible: ch.reversible,
+      };
+      const beforeC = ch.before?.content ?? undefined;
+      const afterC = ch.after?.content ?? undefined;
+      // modified = 新老都预览；added 缺老侧 → 全文作新增；deleted 缺新侧（有内容）→ 全文作删除。
+      // 任一内容为 undefined（二进制/超大/预算耗尽）→ 无 diff，仅列出。
+      const oldText =
+        ch.kind === 'modified' || ch.kind === 'deleted' ? beforeC : undefined;
+      const newText =
+        ch.kind === 'modified' || ch.kind === 'added' ? afterC : undefined;
+      if (oldText !== undefined || newText !== undefined) {
+        const r = lineDiff(oldText ?? '', newText ?? '');
+        let size = 0;
+        for (const l of r.lines) size += l.text.length + 1;
+        if (size > 0 && size <= budget) {
+          item.diff = r.lines;
+          item.diffTruncated = r.truncated;
+          budget -= size;
+        } else if (size > 0) {
+          item.diffTruncated = true; // 超出护栏 → 只列名不预览
+        }
+      }
+      out.push(item);
+    }
+    this._post({ type: 'review-set', changes: out });
+  }
+
+  /** 审阅动作入口（keep/revert 单条 + keep-all/revert-all）。正在跑或没有本轮基线 → 忽略。 */
+  private _reviewAction(action: 'keep' | 'revert' | 'keep-all' | 'revert-all', rel?: string): void {
+    if (this._abort || !this._baseline || !this._reviewRootAbs) return;
+    const root = this._reviewRootAbs;
+
+    if (action === 'keep' || action === 'keep-all') {
+      // keep = 保留磁盘改动，仅从审阅里收起，不碰文件
+      this._pendingReview = rel
+        ? this._pendingReview.filter((c) => c.rel !== rel)
+        : [];
+      if (this._pendingReview.length === 0) this._dropReview(true);
+      else this._postReviewSet();
+      return;
+    }
+
+    const targets = rel
+      ? this._pendingReview.filter((c) => c.rel === rel)
+      : this._pendingReview.slice();
+    if (targets.length === 0) return;
+
+    const ok: TreeChange[] = [];
+    const failed: { rel: string; reason: string }[] = [];
+    for (const ch of targets) {
+      if (!ch.reversible) {
+        failed.push({ rel: ch.rel, reason: '无轮前内容可还原（二进制/超大文件）' });
+        continue;
+      }
+      try {
+        applyRevert(root, ch);
+        ok.push(ch);
+      } catch (err) {
+        failed.push({ rel: ch.rel, reason: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    if (ok.length > 0) {
+      this._pendingReview = this._pendingReview.filter((c) => !ok.includes(c));
+      const summary =
+        ok.length === 1
+          ? `已还原本轮 DSH 改动：${ok[0].rel}`
+          : `已还原本轮 DSH 改动：${ok.length} 个文件成功`;
+      this._pushReviewNote(
+        failed.length > 0 ? `${summary}；${failed.length} 个未还原` : summary
+      );
+    }
+    if (failed.length > 0) {
+      vscode.window.showErrorMessage(
+        `还原失败 ${failed.length} 项：${failed.map((f) => `${f.rel}（${f.reason}）`).join('、')}`
+      );
+    }
+    if (this._pendingReview.length === 0) this._dropReview(true);
+    else this._postReviewSet();
+  }
+
+  /** 把一条 role:'note' 说明入列当前会话并下发（还原反馈；react-live 态仅在转录持久化可见）。 */
+  private _pushReviewNote(text: string): void {
+    const note: ChatMessage = {
+      id: this._nextMsgId(),
+      role: 'note',
+      text,
+      status: 'done',
+    };
+    this._active.messages.push(note);
+    this._post({ type: 'note-message', message: note });
   }
 
   /** 消息 id 带会话前缀，保证跨会话/跨重启仍全局唯一（避免旧流的迟到消息误伤）。 */

@@ -66,6 +66,14 @@
        data-nonce="%%NONCE%%"></div>
 
   <footer class="composer">
+    <!-- 2.1 本轮 DSH 改动审阅条：消息区下方、输入框上方。react-live 只藏 #messages，
+         挂在 composer 内部 → 两种画面都可见。由扩展 review-set / review-clear 驱动。 -->
+    <div id="review-bar" class="review-bar" hidden>
+      <span id="review-summary" class="review-summary"></span>
+      <button id="review-view" class="link-button" type="button">查看</button>
+      <button id="review-keep-all" class="link-button" type="button">全部保留</button>
+      <button id="review-revert-all" class="link-button" type="button">全部还原</button>
+    </div>
     <!-- 待发送的文件附件 chip 条（发送前可逐个移除） -->
     <div id="attach-bar" class="attach-bar" hidden>
       <div id="attach-list" class="attach-list"></div>
@@ -91,6 +99,21 @@
               title="配置 DEEPSEEK_API_KEY（保存到 VS Code SecretStorage，回退读取 ~/.dsh/.credentials.yaml）">API</button>
     </div>
   </footer>
+
+  <!-- 2.1 改动审阅面板浮层：body 直系子元素，absolute 铺满侧栏视口（z-index 高于 history-panel）。
+       绝不放进 #messages（react-live 时被 display:none）。打开/收起走 .open class（同 history-panel）。 -->
+  <div id="review-panel" class="review-panel">
+    <div class="rp-head">
+      <span class="rp-title">本轮 DSH 改动</span>
+      <span id="review-panel-sub" class="rp-sub"></span>
+      <button id="review-panel-close" class="link-button" type="button" title="关闭">✕</button>
+    </div>
+    <div id="review-list" class="rp-scroll"></div>
+    <div class="rp-actions">
+      <button id="review-panel-keep-all" class="button button-secondary" type="button">全部保留</button>
+      <button id="review-panel-revert-all" class="button button-primary" type="button">全部还原</button>
+    </div>
+  </div>
 
   <script nonce="%%NONCE%%" src="%%JS_URI%%"></script>
 </body>
