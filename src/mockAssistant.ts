@@ -61,10 +61,9 @@ export interface MockOptions {
 /**
  * 把一段「已固定文本」切成小块流式产出：每个 yield 是一小段纯文本(= 一条 assistant-delta)。
  *
- * 单独拆出来供 harness 复用——它要流式输出的是预先算好的助手正文，与 chat 模式同一条
- * 渲染管线。mock 的固定文字刻意默认大块 + 极短间隔，让文字几乎一次性出现（仍走 delta
- * 管线，停止按钮/光标逻辑照常可测）。将来接真实模型，模型文本本来一路快推，不受这里
- * 默认值影响。
+ * 与 streamMockReply 共用同一条渲染管线。假回复的固定文字刻意默认大块 + 极短间隔，
+ * 让文字几乎一次性出现（仍走 delta 管线，停止按钮/光标逻辑照常可测）。将来接真实模型，
+ * 模型文本本来一路快推，不受这里默认值影响。
  */
 export async function* streamText(
   text: string,
@@ -152,81 +151,4 @@ export async function* streamMockReply(
 ): AsyncGenerator<string> {
   const reply = pickReply(prompt);
   yield* streamText(reply, opts, signal);
-}
-
-// ---------- harness/Agent 模式：mock 工具调用 ----------
-
-/** 一条 mock 计划步骤：要么「说句话」要么「跑一个工具」。 */
-export type HarnessStep =
-  | { kind: 'say'; text: string }
-  | {
-      kind: 'tool';
-      name: string;
-      input: string;
-      /** 最终结果 */
-      output: string;
-      /** 是否演示失败（error 红卡） */
-      error?: boolean;
-      /** 模拟运行耗时(ms) */
-      delayMs?: number;
-    };
-
-/**
- * 依据用户输入拼出一份 mock 的 Agent 执行计划：
- * 先来一小段"规划"文本 → 跑两个工具 → 一个失败工具 → 最后给结论正文。
- * 返回的步骤序列由 _runHarness 逐条执行，将来接真实 harness（如 deepseek harness）
- * 的事件流时，把这里的产出换成真事件即可，渲染结构不变。
- */
-export function buildHarnessPlan(prompt: string, attachmentNames: string[]): HarnessStep[] {
-  const userNote = prompt.trim();
-  const files =
-    attachmentNames.length > 0
-      ? `其中包含 ${attachmentNames.length} 个附件：${attachmentNames.join('、')}。`
-      : '';
-  return [
-    {
-      kind: 'say',
-      text:
-        userNote
-          ? `收到任务：「${userNote}」。` + (files ? ` ${files}` : '') + ' 我先规划一下再动手。'
-          : '收到任务。我先规划一下再动手。',
-    },
-    {
-      kind: 'tool',
-      name: 'plan',
-      input: JSON.stringify({ objective: userNote, steps: 3 }, null, 2),
-      output: '已拆解为 3 步：1) 收集上下文 2) 定位关键文件 3) 汇总结论。',
-      delayMs: 500,
-    },
-    {
-      kind: 'tool',
-      name: 'bash',
-      input: "ls *.md",
-      output: 'README.md\nCHANGELOG.md\ndocs/guide.md',
-      delayMs: 700,
-    },
-    {
-      kind: 'tool',
-      name: 'glob',
-      input: 'src/**/*.ts',
-      output: 'src/extension.ts\nsrc/protocol.ts\nsrc/chatViewProvider.ts\nsrc/mockAssistant.ts',
-      delayMs: 500,
-    },
-    {
-      kind: 'tool',
-      name: 'read',
-      input: 'src/protocol.ts',
-      output:
-        '// 前后端共享的「单一事实源」…\nexport type Mode = \'chat\' | \'harness\';',
-      error: true,
-      delayMs: 600,
-    },
-    {
-      kind: 'say',
-      text:
-        '执行结束：上面的模拟过程中 `read` 这一步刻意演示了**失败工具卡**。\n\n' +
-        '等接上真正的 harness（例如 deepseek harness 的事件流）后，这里会换成真实的\n' +
-        '`tool_use` / `tool_result` 事件，界面渲染结构不变。',
-    },
-  ];
 }

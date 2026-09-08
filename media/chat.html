@@ -15,28 +15,19 @@
   <title>Hello Chat</title>
 </head>
 <body>
-  <!-- 行1（恒显示）：顶部 tab 条 —— 左侧内嵌聊天/Harness（模式胶囊），右侧仅 harness 可见的
-       模拟/DSH直播胶囊 + 连接状态。一条里装下「模式 + 后端」两段选择（tabs 合并为一行）。 -->
+  <!-- 行1（恒显示）：顶部 tab 条 —— 左侧内嵌聊天/Harness（模式胶囊）；右侧 harness 专属的
+       连接状态点（仅 harness 模式可见，applyMode 切 hidden）。 -->
   <div id="top-row" class="top-row">
     <div id="mode-bar" class="mode-bar" role="tablist" aria-label="工作模式">
-      <button type="button" id="mode-chat" class="mode-tab active" data-mode="chat"
-              role="tab" aria-selected="true">内嵌聊天</button>
-      <button type="button" id="mode-harness" class="mode-tab" data-mode="harness"
-              role="tab" aria-selected="false">Harness</button>
+      <button type="button" id="mode-harness" class="mode-tab active" data-mode="harness"
+              role="tab" aria-selected="true">Harness</button>
+      <button type="button" id="mode-chat" class="mode-tab" data-mode="chat"
+              role="tab" aria-selected="false">内嵌聊天</button>
     </div>
 
-    <!-- Harness 后端开关：模拟（内置演示流）/ DSH 直播（本地 DeepSeek Harness 子进程）。
-         只有 harness 模式可见（JS applyMode 里切 backend-bar.hidden）。扩展侧记住选择、
-         以 backend-status 回传真相。 -->
-    <div id="backend-bar" class="backend-bar" hidden>
-      <div class="backend-tabs" role="tablist" aria-label="Harness 回复后端">
-        <button type="button" id="backend-mock" class="backend-tab active" data-backend="mock"
-                role="tab" aria-selected="true" title="内置演示工具流，不调用外部服务">模拟</button>
-        <button type="button" id="backend-live" class="backend-tab" data-backend="live"
-                role="tab" aria-selected="false" title="连接本地 DeepSeek Harness（DSH）子进程">DSH 直播</button>
-      </div>
-      <span id="backend-status" class="backend-status offline"></span>
-    </div>
+    <!-- Harness 连接状态点（harness 恒为 DSH 直播，无「模拟」开关）：仅 harness 模式可见
+         （JS applyMode 里切 hidden）。状态文字/颜色由扩展 backend-status 回传。 -->
+    <span id="harness-status" class="harness-status offline" hidden></span>
   </div>
 
   <!-- 行2（恒显示）：会话控制条 —— 可点改标题 + 历史/新建。历史面板 absolute 以此 header 为锚。 -->
@@ -67,7 +58,7 @@
     <div id="empty-hint" class="empty-hint"></div>
   </main>
 
-  <!-- 真 DSH 对话组件的挂载节点（仅 harness + DSH 直播时揭示）。占位符由扩展侧替换：
+  <!-- 真 DSH 对话组件的挂载节点（仅 harness 模式揭示；harness 恒为 DSH 直播）。占位符由扩展侧替换：
        data-js/data-css = media/dsh-live 产物的 webview uri；data-nonce = 本次文档的脚本 nonce。
        懒加载桥在 chat.js：首次 reactLive 才注入 link/script（见 syncReactLive）。 -->
   <div id="dsh-live-host" class="dsh-live-host" hidden
@@ -86,7 +77,7 @@
       <button id="stop-btn" class="button button-secondary" hidden>停止</button>
       <button id="send-btn" class="button button-primary">发送</button>
     </div>
-    <!-- 仅 DSH 直播后端可见的底部配置条：模型下拉(+自定义) + API Key 状态/配置（Claude Code 式） -->
+    <!-- 仅 harness 模式可见的底部配置条（harness 恒为 DSH 直播）：模型下拉(+自定义) + DSH/API 配置（Claude Code 式） -->
     <div id="live-config-bar" class="live-config-bar" hidden>
       <label class="lc-field" for="live-model-sel">
         <span class="lc-label">模型</span>
@@ -94,6 +85,8 @@
       </label>
       <input id="live-model-input" class="lc-input" type="text" spellcheck="false" maxlength="120"
              hidden placeholder="输入模型 id，回车应用">
+      <button id="live-dsh-btn" class="link-button lc-dsh" type="button"
+              title="引导式配置 DSH 运行路径（node / 入口 / 工作目录 / tsconfig / config，保存到用户设置）">配置 DSH</button>
       <button id="live-api-btn" class="link-button lc-api" type="button"
               title="配置 DEEPSEEK_API_KEY（保存到 VS Code SecretStorage，回退读取 ~/.dsh/.credentials.yaml）">API</button>
     </div>
