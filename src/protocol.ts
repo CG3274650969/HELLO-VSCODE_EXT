@@ -15,13 +15,10 @@ export const NEW_CHAT_COMMAND = 'hello.chat.newChat';
 
 export type MsgStatus = 'streaming' | 'done' | 'error' | 'interrupted';
 
-/** 顶部模式：内嵌聊天 / harness 直接应用（Agent）。两套会话完全独立。 */
+/** 顶部模式：内嵌聊天 / harness（恒为 DSH 直播）。两套会话完全独立。 */
 export type Mode = 'chat' | 'harness';
 
-/** Harness 模式的回复来源：mock（内置演示流）或 live（连接真实 DSH 子进程）。默认 mock。 */
-export type HarnessBackend = 'mock' | 'live';
-
-/** DSH 子进程的连接状态（仅 live 后端有意义）。 */
+/** DSH 子进程连接状态（harness = DSH 直播时的状态灯）。 */
 export type DshConnState = 'offline' | 'connecting' | 'online' | 'error';
 
 /** 一条消息的角色。多一个 'note'：居中的灰色说明行（如「已开启全新会话」），
@@ -93,8 +90,8 @@ export type ExtToWebview =
   | { type: 'tool-start'; message: ChatMessage }
   /** 工具卡出结果：id 更新 toolState，可选带输出文本 */
   | { type: 'tool-result'; id: string; toolState: 'ok' | 'error'; output?: string }
-  /** harness 后端状态广播：连接中/在线/错误 + 型号 + 忙否，webview 据此亮开关/状态点 */
-  | { type: 'backend-status'; backend: HarnessBackend; state: DshConnState; model?: string; detail?: string; busy: boolean }
+  /** harness（恒为 DSH 直播）连接状态广播：连接中/在线/错误 + 型号 + 忙否，webview 据此亮状态点 */
+  | { type: 'backend-status'; state: DshConnState; model?: string; detail?: string; busy: boolean }
   /** live 运行在途（连接/等首事件期间也没有流式气泡）→ 用它锁住输入与后端开关 */
   | { type: 'run-busy'; busy: boolean }
   /** react-live（harness + DSH 直播 + dsh-live 产物齐全）：转发当前 DSH 会话的
@@ -111,8 +108,8 @@ export type ExtToWebview =
   | { type: 'files-picked'; attachments: Attachment[] }
   /** 发送被扩展拒绝（附件读取失败/过大等）；webview 应恢复输入态，已写内容不丢 */
   | { type: 'user-message-rejected'; reason: string }
-  /** live 配置态广播：当前模型、可选预设、API key 是否已配置（供 composer 下的配置条渲染） */
-  | { type: 'live-config'; model: string; models: string[]; apiConfigured: boolean };
+  /** live 配置态广播：当前模型、可选预设、API key / DSH 运行路径是否已配置（供 composer 下的配置条渲染） */
+  | { type: 'live-config'; model: string; models: string[]; apiConfigured: boolean; dshConfigured: boolean };
 
 /** webview → 扩展 */
 export type WebviewToExt =
@@ -125,8 +122,8 @@ export type WebviewToExt =
   | { type: 'delete-session'; sessionId: string }
   | { type: 'rename-session'; title: string } // 给活动会话重命名
   | { type: 'pick-files' } // +附件按钮 → 弹系统文件选择器
-  | { type: 'set-mode'; mode: Mode } // 顶部模式切换
-  | { type: 'set-backend'; backend: HarnessBackend } // Harness 头部后端开关（模拟 / DSH 直播）
-  // 下方两条来自 composer 下的配置条（仅 live 后端可见）
+  | { type: 'set-mode'; mode: Mode } // 顶部模式切换（内嵌聊天 / Harness）
+  // 下方几条来自 composer 下的配置条（仅 Harness 模式可见；Harness 恒为 DSH 直播）
   | { type: 'set-model'; model: string } // 改模型 → 扩展重启 live 子进程生效
-  | { type: 'configure-key' }; // 点"API" → 扩展弹密码输入框写入 SecretStorage
+  | { type: 'configure-key' } // 点"API" → 扩展弹密码输入框写入 SecretStorage
+  | { type: 'configure-dsh' }; // 点"配置 DSH" → 扩展弹引导向导，写 hello.dsh.*（machine scope）

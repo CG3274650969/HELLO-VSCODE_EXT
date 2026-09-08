@@ -22,10 +22,8 @@
   var historySearch = document.getElementById('history-search');
   var historyQuery = ''; // 搜索框当前关键字
 
-  // Harness 后端开关（模拟 / DSH 直播）：只在 harness 模式可见
-  var backendBar = document.getElementById('backend-bar');
-  var backendStatusEl = document.getElementById('backend-status');
-  var backendTabs = Array.prototype.slice.call(document.querySelectorAll('.backend-tab'));
+  // Harness 连接状态点：仅 harness 模式可见（applyMode 切 hidden）
+  var harnessStatusEl = document.getElementById('harness-status');
 
   var chatTitle = document.getElementById('chat-title');
   var chatTitleInput = document.getElementById('chat-title-input');
@@ -39,25 +37,25 @@
   var pendingSeq = 0;
   var sending = false; // 已发出、在等扩展回执（防连点重复发送）
 
-  // Harness 后端：currentBackend 由扩展 backend-status 回执为真相；
-  // runBusy = live 整轮运行中（连接/等首事件期间没有任何流式气泡 → 用它锁输入/亮停止）
-  var currentBackend = 'mock';
+  // runBusy = DSH 整轮运行中（连接/等首事件期间没有任何流式气泡 → 用它锁输入/亮停止）
   var runBusy = false;
 
-  // live 底部配置条（模型下拉/自定义 + API Key 状态）：仅在 harness + DSH 直播可见
+  // 底部配置条（模型/DSH/API 配置）：仅 harness 模式可见（harness 恒为 DSH 直播）
   var liveConfigBar = document.getElementById('live-config-bar');
   var liveModelSel = document.getElementById('live-model-sel');
   var liveModelInput = document.getElementById('live-model-input');
   var liveApiBtn = document.getElementById('live-api-btn');
+  var liveDshBtn = document.getElementById('live-dsh-btn');
   var liveModels = []; // 扩展下发的可选模型
   var liveModel = ''; // 当前生效模型（扩展为真相）
   var liveModelOptionsKey = ''; // 下拉是否已按 models 构建过
   var apiConfigured = false; // API key 是否已配
+  var dshConfigured = false; // DSH 运行路径（nodePath && entry）是否已配
   var customModelActive = false; // 是否正显示"自定义模型"输入框
 
   // 顶部模式：chat（内嵌聊天）/ harness（Agent）。两种模式各一套草稿与待发附件，互不串。
   var modeTabs = Array.prototype.slice.call(document.querySelectorAll('.mode-tab'));
-  var currentMode = 'chat'; // mode-set 到达前的占位，扩展回执后纠正为真正模式
+  var currentMode = 'harness'; // mode-set 到达前的占位，扩展回执后纠正为真正模式（默认 harness）
   var modeConfirmed = false; // 是否已收到过扩展的 mode-set（收到前 equality 短路不可信）
   var drafts = { chat: '', harness: '' };
   var pendings = { chat: [], harness: [] };
@@ -71,9 +69,9 @@
   var sessions = [];
   var activeId = null;
 
-  // ---------- 真 DSH 对话组件的懒加载桥（harness + DSH 直播专属） ----------
-  // reactLive = harness 模式 + live 后端。条件成立才揭示 #dsh-live-host、注入
-  // media/dsh-live 的单包产物；DOM 消息体同步停用。产物缺失时静默回退 DOM 渲染。
+  // ---------- 真 DSH 对话组件的懒加载桥（harness 专属；harness 恒为 DSH 直播） ----------
+  // reactLive = harness 模式。条件成立才揭示 #dsh-live-host、注入 media/dsh-live 的
+  // 单包产物；DOM 消息体同步停用。产物缺失时静默回退 DOM 渲染。
   var liveHost = document.getElementById('dsh-live-host');
   var reactAssetsInjected = false;
   /** React 单包已执行完（window.__dshLive 就绪）——见 ensureReactAssets 的 onload */
@@ -128,9 +126,9 @@
     }));
   }
 
-  /** 模式/后端一变就重算是否展示真组件；产物缺失时 ensureReactAssets 内已回退。 */
+  /** 模式一变就重算是否展示真组件；产物缺失时 ensureReactAssets 内已回退。 */
   function syncReactLive() {
-    var want = currentMode === 'harness' && currentBackend === 'live' && !!liveHost;
+    var want = currentMode === 'harness' && !!liveHost;
     if (want && !isReactLive()) {
       if (!liveHost.dataset.js || !liveHost.dataset.css) {
         // 产物缺失：ensureReactAssets 已提示；这里不揭示空壳
@@ -208,7 +206,9 @@
       // 空态文案按当前模式给（白色 pre-line，\n 换行）
       emptyHint.textContent =
         currentMode === 'harness'
-          ? '还没有 Agent 会话。\n在下方输入一句话，看工具调用流\n（模拟 / DSH 直播由上方开关选择）。'
+          ? dshConfigured
+            ? '还没有 Agent 会话。\n发一句话，看真实 DSH 工具调用与转录。'
+            : 'Harness 走真实 DSH 直播，需先配置本地运行路径。\n在下方配置条点「配置 DSH」引导完成。'
           : '还没有对话。\n在下方输入，向（假）助手问点什么吧。';
     }
   }
@@ -232,8 +232,15 @@
     inputEl.disabled = busy;
     // 只有正文或只有附件也能发；但附件里有读取失败的 → 禁止发送（要先移除）
     var blockSend = hasBadAttachment();
-    sendBtn.disabled = busy || (!inputEl.value.trim() && !hasPending()) || blockSend;
-    sendBtn.title = blockSend ? '有附件读取失败，请先移除后再发送' : '';
+    // harness 未配 DSH 运行路径（node/入口）→ 禁发，引导先点底部「配置 DSH」
+    var dshBlock = currentMode === 'harness' && !dshConfigured;
+    sendBtn.disabled =
+      busy || (!inputEl.value.trim() && !hasPending()) || blockSend || dshBlock;
+    sendBtn.title = blockSend
+      ? '有附件读取失败，请先移除后再发送'
+      : dshBlock
+        ? '先点底部「配置 DSH」配好运行路径再发送'
+        : '';
     stopBtn.hidden = !(hasStreaming() || runBusy);
     refreshLiveConfigEnabled();
   }
@@ -255,79 +262,49 @@
     }
   }
 
-  // ---------- Harness 后端（模拟 / DSH 直播） ----------
+  // ---------- harness 状态（DSH 直播连接状态点） ----------
 
-  /** 高亮后端分段条里对应来源的 tab。 */
-  function highlightBackend(backend) {
-    for (var i = 0; i < backendTabs.length; i++) {
-      var on = backendTabs[i].dataset.backend === backend;
-      backendTabs[i].classList.toggle('active', on);
-      backendTabs[i].setAttribute('aria-selected', on ? 'true' : 'false');
-    }
-  }
-
-  /** live 整轮运行中（runBusy）后端不可切。 */
-  function refreshBackendEnabled() {
-    for (var i = 0; i < backendTabs.length; i++) {
-      backendTabs[i].classList.toggle('disabled', runBusy);
-    }
-  }
-
-  /** 请求切后端：运行在途（sending / runBusy）不切，避免打断整轮。 */
-  function requestBackend(backend) {
-    if (sending || runBusy) return;
-    if (backend === currentBackend) return;
-    closeHistoryPanel();
-    cancelTitleEdit();
-    post({ type: 'set-backend', backend: backend });
-  }
-
-  /** 把扩展下发的 backend-status 画到开关与状态点上（扩展侧是真相）。 */
-  function renderBackendStatus(data) {
-    currentBackend = data.backend;
-    highlightBackend(currentBackend);
-    refreshBackendEnabled();
-    var state = currentBackend === 'live' ? data.state || 'offline' : 'offline';
-    backendStatusEl.className = 'backend-status ' + state;
+  /** 把扩展下发的 backend-status 画到顶栏 harness 状态点（扩展侧是真相）。 */
+  function renderHarnessStatus(data) {
+    var state = data.state || 'offline';
+    harnessStatusEl.className = 'harness-status ' + state;
     var detail = data.detail || '';
-    if (currentBackend === 'mock') {
-      backendStatusEl.textContent = '本地演示流';
-      backendStatusEl.title = '内置模拟回复，不调用外部服务';
-    } else if (state === 'connecting') {
-      backendStatusEl.textContent = detail || '连接中…';
-      backendStatusEl.title = '';
+    if (state === 'connecting') {
+      harnessStatusEl.textContent = detail || '连接中…';
+      harnessStatusEl.title = '';
     } else if (state === 'online') {
       var model = data.model ? ' · ' + data.model : '';
-      backendStatusEl.textContent = '在线' + model;
-      backendStatusEl.title = detail || 'DSH 子进程已连接';
+      harnessStatusEl.textContent = '在线' + model;
+      harnessStatusEl.title = detail || 'DSH 子进程已连接';
     } else if (state === 'error') {
-      backendStatusEl.textContent = detail || '连接出错';
-      backendStatusEl.title = detail || '';
+      harnessStatusEl.textContent = detail || '连接出错';
+      harnessStatusEl.title = detail || '';
     } else {
-      backendStatusEl.textContent = '未连接';
-      backendStatusEl.title = '';
+      harnessStatusEl.textContent = '未连接';
+      harnessStatusEl.title = '';
     }
-    // 后端一变，底部配置条（模型/API）跟着显示/隐藏
+    // 状态一变，底部配置条跟着刷新（含未配置时的引导空态文案）
     refreshLiveConfigVisibility();
     refreshLiveConfigEnabled();
-    syncReactLive(); // harness + live ⇄ 真 DSH 对话画面；其它组合回 DOM
+    syncReactLive(); // harness ⇄ 真 DSH 对话画面（产物齐全时）
   }
 
   // ---------- live 底部配置条（模型 + API Key） ----------
 
-  /** 配置条是否可见：仅 harness 模式 + DSH 直播后端。 */
+  /** 配置条是否可见：仅 harness 模式（harness 恒为 DSH 直播；未配置也常驻，供引导）。 */
   function refreshLiveConfigVisibility() {
-    var show = currentMode === 'harness' && currentBackend === 'live';
+    var show = currentMode === 'harness';
     if (!show && customModelActive) exitCustomModelInput(false); // 藏起来时收掉自定义输入态
     liveConfigBar.hidden = !show;
   }
 
-  /** 运行在途（sending/runBusy）→ 模型与 API 一律禁改。 */
+  /** 运行在途（sending/runBusy）→ 模型 / API / DSH 配置一律禁改。 */
   function refreshLiveConfigEnabled() {
     var busy = sending || runBusy;
     liveModelSel.disabled = busy;
     liveModelInput.disabled = busy;
     liveApiBtn.disabled = busy;
+    liveDshBtn.disabled = busy;
   }
 
   /** 把扩展下发的 live-config 画到配置条（模型下拉/自定义 + API 灯）。 */
@@ -340,6 +317,13 @@
     liveApiBtn.title = apiConfigured
       ? 'DEEPSEEK_API_KEY 已配置（SecretStorage 或 ~/.dsh/.credentials.yaml），点击可改'
       : '未检测到 DEEPSEEK_API_KEY，点击配置';
+
+    if (typeof data.dshConfigured === 'boolean') dshConfigured = data.dshConfigured;
+    liveDshBtn.classList.toggle('on', dshConfigured);
+    liveDshBtn.textContent = 'DSH：' + (dshConfigured ? '已配置' : '未配置');
+    liveDshBtn.title = dshConfigured
+      ? 'DSH 运行路径已配置，点击可重新引导（保存后重启 live 子进程）'
+      : '尚未配置 node / 入口，点击打开引导向导';
 
     // 下拉：预设 + 当前模型（不在预设里则加在最前）+ 「自定义…」
     var list = liveModels.slice();
@@ -362,6 +346,7 @@
     if (!customModelActive) liveModelSel.value = liveModel;
     refreshLiveConfigVisibility();
     refreshLiveConfigEnabled();
+    toggleEmptyHint(); // dshConfigured 一变 → harness 空态引导文案跟着切
   }
 
   /** 选了「自定义…」→ 显示可编辑输入框，预填当前模型。 */
@@ -413,9 +398,9 @@
     runBusy = false; // 模式一换，live 轮的锁也复位（扩展侧有运行就已被取消）
     pending = pendings[currentMode] || (pendings[currentMode] = []);
     inputEl.value = drafts[currentMode] || '';
-    // 后端条只在 harness 模式可见（chat 模式没有"后端"概念）
-    backendBar.hidden = mode !== 'harness';
-    refreshLiveConfigVisibility(); // 配置条还要额外看后端是否为 DSH 直播
+    // 状态点只在 harness 模式可见（chat 模式没有连接概念）
+    harnessStatusEl.hidden = mode !== 'harness';
+    refreshLiveConfigVisibility(); // 配置条仅 harness 常驻
     renderPending();
     syncReactLive(); // 模式一变先重算真组件显隐，updateBusy 才能据此锁按钮
     updateBusy();
@@ -1093,16 +1078,7 @@
       })(modeTabs[ti]);
     }
 
-    // Harness 后端切换：模拟 / DSH 直播
-    for (var bi = 0; bi < backendTabs.length; bi++) {
-      (function (tab) {
-        tab.addEventListener('click', function () {
-          requestBackend(tab.dataset.backend);
-        });
-      })(backendTabs[bi]);
-    }
-
-    // live 底部配置条：模型下拉 → 换模型（或进「自定义…」）；API 按钮 → 弹密钥录入
+    // 底部配置条（仅 harness）：模型下拉 → 换模型（或进「自定义…」）；API 按钮 → 弹密钥录入
     liveModelSel.addEventListener('change', function () {
       if (sending || runBusy) {
         liveModelSel.value = liveModel; // 运行中禁改：弹回当前模型
@@ -1131,6 +1107,10 @@
     liveApiBtn.addEventListener('click', function () {
       if (sending || runBusy) return;
       post({ type: 'configure-key' });
+    });
+    liveDshBtn.addEventListener('click', function () {
+      if (sending || runBusy) return;
+      post({ type: 'configure-dsh' });
     });
 
     sendBtn.addEventListener('click', send);
@@ -1361,9 +1341,9 @@
       }
 
       case 'backend-status':
-        // 后端开关/状态点的唯一真相（模拟 ⇄ DSH 直播）。busy 一并用来锁输入。
+        // harness 连接状态点的唯一真相。busy 一并用来锁输入。
         runBusy = !!data.busy;
-        renderBackendStatus(data);
+        renderHarnessStatus(data);
         updateBusy();
         break;
 
@@ -1371,12 +1351,11 @@
         // live 整轮在途锁：连接/等首事件期间没有流式气泡也锁输入、亮停止
         runBusy = !!data.busy;
         if (!runBusy) sending = false; // 收尾解锁：即使全程没等来 assistant 事件也不卡输入
-        refreshBackendEnabled();
         updateBusy();
         break;
 
       case 'live-config':
-        // live 底部配置条：模型下拉(含自定义) + API Key 状态
+        // 底部配置条：模型下拉(含自定义) + API/DSH 状态
         renderLiveConfig(data);
         break;
 
@@ -1409,9 +1388,9 @@
       }
     }
     refreshTitleDisplay();
-    // 后端条占位渲染（模拟）：扩展回 backend-status 后会纠正为持久化的真实后端
-    renderBackendStatus({ backend: 'mock', state: 'offline', busy: false });
-    refreshLiveConfigVisibility(); // 配置条同理：等 backend-status/live-config 回执亮起
+    // harness 状态点占位（offline）：扩展回 backend-status 后即纠正为真实连接状态
+    renderHarnessStatus({ state: 'offline', busy: false });
+    refreshLiveConfigVisibility(); // 配置条：等 backend-status/live-config 回执亮起
     updateBusy();
 
     window.addEventListener('message', function (evt) {

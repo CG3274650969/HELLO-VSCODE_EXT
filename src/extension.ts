@@ -11,7 +11,7 @@ export function activate(context: vscode.ExtensionContext) {
   const chatProvider = new ChatViewProvider(
     context.extensionUri,
     context.globalStorageUri.fsPath, // 历史会话持久化目录（含 dsh-sessions/ 子目录）
-    context.globalState, // 记住上次用的顶部模式（chat / harness）与后端来源（mock / live）
+    context.globalState, // 记住上次用的顶部模式（chat / harness）
     context.secrets // live 后端从密钥库取 DEEPSEEK_API_KEY（无则回退读 credentialsFile）
   );
   const registerChatView = vscode.window.registerWebviewViewProvider(VIEW_ID, chatProvider, {
@@ -21,7 +21,11 @@ export function activate(context: vscode.ExtensionContext) {
   const newChat = vscode.commands.registerCommand(NEW_CHAT_COMMAND, () => {
     chatProvider.startNewSession();
   });
-  context.subscriptions.push(registerChatView, newChat, chatProvider);
+  // 命令：配置 DSH 运行路径（引导向导；webview 里的"配置 DSH"按钮走 configure-dsh 消息走同一条 _configureDsh）
+  const configureDsh = vscode.commands.registerCommand('hello.dsh.configure', () => {
+    void chatProvider.configureDsh();
+  });
+  context.subscriptions.push(registerChatView, newChat, configureDsh, chatProvider);
 
   // ---- 命令 1：弹一个招呼 ----
   const sayHello = vscode.commands.registerCommand('hello.sayHello', () => {

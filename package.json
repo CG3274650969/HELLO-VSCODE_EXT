@@ -47,6 +47,11 @@
         "command": "hello.chat.newChat",
         "title": "开始新对话",
         "category": "Hello Chat"
+      },
+      {
+        "command": "hello.dsh.configure",
+        "title": "配置 DSH 运行路径",
+        "category": "Hello Chat"
       }
     ],
     "configuration": {

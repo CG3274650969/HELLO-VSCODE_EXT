@@ -38,7 +38,7 @@ body[data-ds-dark-theme] {
   color-scheme: dark;
 }
 
-/* ---------- 行1：顶部 tab 条（模式 + 后端 + 状态合成一条） ---------- */
+/* ---------- 行1：顶部 tab 条（模式胶囊 + harness 状态点合成一条） ---------- */
 .top-row {
   display: flex;
   align-items: center;
@@ -83,56 +83,10 @@ body[data-ds-dark-theme] {
   box-shadow: inset 0 0 0 1px var(--dsw-alias-button-ghost-active-border, transparent);
 }
 
-/* ---------- 后端组（模拟 / DSH 直播 + 状态）—— 仅 harness 可见 ---------- */
-/* 本组是 top-row 里靠右的分组；左侧竖分隔线把模式/后端两类选择隔开。 */
-.backend-bar {
-  flex: 1 1 auto;
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-left: 2px;
-  padding-left: 10px;
-  border-left: 1px solid var(--dsw-alias-border-l2, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.35)));
-}
-
-.backend-tabs {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  flex: none;
-}
-
-.backend-tab {
-  height: 24px;
-  padding: 0 12px;
-  border: none;
-  border-radius: 999px;
-  background: var(--dsw-alias-bg-layer-2, transparent);
-  cursor: pointer;
-  font-family: inherit;
-  font-size: 12px;
-  line-height: 24px;
-  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #9a9a9a));
-  user-select: none;
-  transition: background 0.12s ease, color 0.12s ease;
-}
-.backend-tab:hover {
-  background: var(--dsw-alias-interactive-bg-hover, var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.12)));
-  color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
-}
-.backend-tab.active {
-  color: var(--dsw-alias-label-primary, var(--vscode-button-secondaryForeground, var(--vscode-foreground, #ddd)));
-  background: var(--dsw-alias-button-ghost-active-fill, var(--vscode-button-secondaryBackground, rgba(128, 128, 128, 0.25)));
-  box-shadow: inset 0 0 0 1px var(--dsw-alias-button-ghost-active-border, transparent);
-}
-.backend-tab.disabled {
-  opacity: 0.45;
-  cursor: default;
-}
-
-/* 连接状态点 + 文案：状态类 offline/connecting/online/error 由 JS 换到本元素上 */
-.backend-status {
+/* ---------- harness 连接状态点 —— 仅 harness 模式可见（applyMode 切 hidden） ---------- */
+/* 靠右直挂在 top-row 里（flex 填空 + 右对齐文案）；状态类 offline/connecting/online/error
+   由 JS 换到本元素上。harness 恒为 DSH 直播，无「模拟」开关。 */
+.harness-status {
   flex: 1 1 auto;
   min-width: 0;
   margin-left: auto;
@@ -142,7 +96,7 @@ body[data-ds-dark-theme] {
   text-overflow: ellipsis;
   color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
 }
-.backend-status::before {
+.harness-status::before {
   content: '';
   display: inline-block;
   width: 8px;
@@ -152,14 +106,14 @@ body[data-ds-dark-theme] {
   vertical-align: baseline;
   background: var(--dsw-alias-label-dimmed, #9da5b4); /* offline 灰 */
 }
-.backend-status.connecting::before {
+.harness-status.connecting::before {
   background: var(--dsw-alias-state-business-primary, #3794ff); /* 蓝：连接中，脉冲 */
   animation: toolPulse 1s ease-in-out infinite;
 }
-.backend-status.online::before {
+.harness-status.online::before {
   background: var(--dsw-alias-state-success-primary, #3fb950); /* 绿：在线 */
 }
-.backend-status.error::before {
+.harness-status.error::before {
   background: var(--dsw-alias-state-error-primary, #f85149); /* 红：错误 */
 }
 
@@ -814,18 +768,30 @@ body[data-ds-dark-theme] {
   opacity: 0.5;
   cursor: default;
 }
-/* API 按钮靠右，带状态点：未配置红 / 已配置绿 */
-.lc-api {
+/* 右簇：DSH 按钮推最右（原 .lc-api 的 auto 移给它），API 跟其后。都带状态点：未配置红 / 已配置绿 */
+.lc-dsh {
   margin-left: auto;
   flex: none;
 }
+.lc-dsh::before,
 .lc-api::before {
   content: '';
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--dsw-alias-state-error-primary, #f85149); /* 红：未配置 */
   flex: none;
+}
+.lc-dsh::before {
+  background: var(--dsw-alias-state-error-primary, #f85149); /* 红：DSH 路径未配置 */
+}
+.lc-dsh.on::before {
+  background: var(--dsw-alias-state-success-primary, #3fb950); /* 绿：已配置 */
+}
+.lc-api {
+  flex: none;
+}
+.lc-api::before {
+  background: var(--dsw-alias-state-error-primary, #f85149); /* 红：API key 未配置 */
 }
 .lc-api.on::before {
   background: var(--dsw-alias-state-success-primary, #3fb950); /* 绿：已配置 */

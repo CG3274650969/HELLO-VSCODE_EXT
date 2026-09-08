@@ -9,19 +9,11 @@ import {
   DshConnState,
   ExtToWebview,
   FileRef,
-  HarnessBackend,
   Mode,
   SessionSummary,
   WebviewToExt,
 } from './protocol';
-import {
-  streamMockReply,
-  streamText,
-  sleep,
-  isAbortError,
-  buildHarnessPlan,
-  HarnessStep,
-} from './mockAssistant';
+import { isAbortError, streamMockReply } from './mockAssistant';
 import { SessionStore, StoredSession, titleFromText } from './sessionStore';
 import {
   ContentBlock,
@@ -41,9 +33,6 @@ const MODE_KEY = 'hello.chat.mode';
 
 /** harness 模式独立的历史文件名（chat 沿用 sessions.json，互不串） */
 const HARNESS_FILE = 'sessions-harness.json';
-
-/** globalState 里记住 harness 后端来源（mock / live） */
-const BACKEND_KEY = 'hello.harness.backend';
 
 /** live 后端配置里 provider/model 的兜底默认（用户可在设置里改） */
 const DEFAULT_DSH_PROVIDER = 'deepseek-official';
@@ -82,8 +71,8 @@ function prettyValue(v: unknown): string {
 /**
  * 侧边栏聊天视图的 Provider。
  *
- * 职责：把 media/chat.html 喂给 webview，转发前后端消息，编排 mock 流式回复，
- * 并管理「多会话（历史）」。
+ * 职责：把 media/chat.html 喂给 webview，转发前后端消息，编排回复
+ *（内嵌聊天 = 假助手流；Harness = 连真实 DSH 子进程），并管理「多会话（历史）」。
  *
  * 两种顶部模式（chat / harness）各自拥有**完全独立**的会话与历史：两个 SessionStore
  * 各用一个 json 文件，两份 active 会话都常驻内存。当前处于哪个模式，由 `_mode` 决定，
@@ -117,11 +106,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** globalStorage 根目录（放 dsh-sessions 用） */
   private readonly _storageDir: string;
 
-  // ---------- live 后端（DSH 子进程）状态 ----------
+  // ---------- live（DSH 子进程）状态：harness 恒为 DSH 直播 ----------
 
-  /** Harness 回复来源：mock（演示流）/ live（DSH 子进程）。默认 mock，globalState 记住。 */
-  private _backend: HarnessBackend = 'mock';
-  /** live 的连接状态（mock 时恒 offline；进程意外退出 → error） */
+  /** DSH 子进程连接状态（进程意外退出 → error） */
   private _backendState: DshConnState = 'offline';
   /** 在线时展示的模型名 */
   private _backendModel?: string;
@@ -133,7 +120,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private readonly _dshSessions = new Map<string, string>();
   /** 每 activation 随机一次：host 重启后绝不撞上旧进程的 DSH 会话 id */
   private readonly _dshHostRand = randomBytes(4).toString('hex');
-  /** live 正在跑一轮（busy / 输入锁定的扩展侧真相；mock 恒 false） */
+  /** live 正在跑一轮（busy / 输入锁定的扩展侧真相） */
   private _liveRunning = false;
   /** live 轮里"当前开着的"助手文字气泡（工具前文字先收尾成独立气泡的依据） */
   private _openAssistant?: ChatMessage;
@@ -160,11 +147,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   ) {
     this._storageDir = storageDir;
     const saved = this._globalState.get<Mode>(MODE_KEY);
-    this._mode = saved === 'harness' ? 'harness' : 'chat';
-
-    const savedBackend = this._globalState.get<HarnessBackend>(BACKEND_KEY);
-    this._backend = savedBackend === 'live' ? 'live' : 'mock';
-    // live 是懒连接：首次发消息 / 切到 harness 时才 spawn 子进程，这里只记住偏好。
+    // 默认 = harness（主线）：只有用户上次明确选过「内嵌聊天」才回 chat；从未选过则进 harness。
+    // harness 恒为 DSH 直播：懒 spawn，但视图每次就绪会预热连接（见 'ready' 处理）。
+    this._mode = saved === 'chat' ? 'chat' : 'harness';
 
     // 两套存储：chat 用老文件（兼容既有历史），harness 用独立文件
     this._stores = {
@@ -189,12 +174,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * react-live：harness 模式 + DSH 直播后端 + media/dsh-live 产物齐全。
+   * react-live：harness 模式（恒为 DSH 直播）+ media/dsh-live 产物齐全。
    * 为真时 webview 揭示真 DSH 对话组件（ChatView）；扩展据此把原始帧转给 webview，
    * 而不是只发 DOM 气泡（DOM 气泡仍照发，让 SessionStore 转写保持完整）。
    */
   private get _reactLive(): boolean {
-    return this._mode === 'harness' && this._backend === 'live' && this._hasDshBundle;
+    return this._mode === 'harness' && this._hasDshBundle;
   }
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
@@ -261,13 +246,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         this._postSnapshot();
         this._sendHistory();
-        // webview 每次显示都重建：后端开关/状态点/运行锁一律以扩展侧为真相重放一遍
+        // webview 每次显示都重建：harness 状态点/运行锁一律以扩展侧为真相重放一遍
         this._postBackendStatus();
+        // harness 默认模式：视图每次就绪都预热到「在线/未配置」可读状态
+        //（幂等；未配置时 _getRuntime 在 spawn 前抛错 → 红点显示「DSH 未配置」引导）
+        if (this._mode === 'harness' && !this._liveRunning) {
+          void this._connectLive();
+        }
         // 尝试解析一次 API key（有则缓存），让配置条的 API 灯如实点亮
         void this._refreshApiKeyStatus();
-        break;
-      case 'set-backend':
-        this._setBackend(msg.backend);
         break;
       case 'set-model': {
         const model = String(msg.model ?? '').trim();
@@ -276,6 +263,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
       case 'configure-key':
         void this._promptAndStoreApiKey();
+        break;
+      case 'configure-dsh':
+        void this._configureDsh();
         break;
       case 'set-mode':
         this._setMode(msg.mode);
@@ -318,8 +308,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._postSnapshot();
     this._sendHistory();
     this._postBackendStatus();
-    // 切进 harness 且是 live 后端 → 预热到"在线"（spawn+initialize），状态点即时可见
-    if (this._mode === 'harness' && this._backend === 'live' && !this._liveRunning) {
+    // 切进 harness（恒为 DSH 直播）→ 预热到"在线"（spawn+initialize），状态点即时可见
+    if (this._mode === 'harness' && !this._liveRunning) {
       void this._connectLive();
     }
   }
@@ -397,9 +387,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._abort = ctrl;
     this._runningMsg = undefined;
 
-    // 5) 按模式走不同的「产出编排」：chat = 一段助手流；harness = 带工具卡的整轮执行
+    // 5) 按模式走不同的「产出编排」：chat = 一段假助手流；harness = 连真实 DSH 整轮执行
     if (this._mode === 'harness') {
-      void this._runHarness(text, attachments, ctrl);
+      void this._runLive(text, attachments, ctrl);
     } else {
       const prompt = this._buildPrompt(text, attachments);
       const assistantMsg: ChatMessage = {
@@ -448,123 +438,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  // ---------- harness 模式：mock 的 Agent/工具调用整轮 ----------
+  // harness 恒为 DSH 直播：整轮执行由 _sendUser 在 harness 分支直接调 _runLive（见下方 live 区），
+  // 不再有 harness 侧的编排壳 / mock 分支。
+
+  // ---------- harness = DSH 直播：连接真实 DSH（DeepSeek Harness）子进程 ----------
 
   /**
-   * 按 buildHarnessPlan 的步骤序列依次执行：助手文本流式出现、工具卡逐张跑。
-   * 全程同一个 AbortController：任一步被中止（stop / 切换）都会立刻把当前消息落成
-   * 终态（assistant→interrupted、tool→error）并结束本轮，不会出现"永远运行中"。
-   */
-  private async _runHarness(
-    text: string,
-    attachments: Attachment[],
-    ctrl: AbortController
-  ): Promise<void> {
-    // 后端分流：mock 走下方原样的演示流；live 走 _runLive（DSH 子进程）。
-    // 两者共享本方法的 try/catch/finally 收尾（输入锁定契约不变）。
-    if (this._backend === 'live') {
-      await this._runLive(text, attachments, ctrl);
-      return;
-    }
-    const names = attachments.map((a) => a.name);
-    // mock 的 prompt 不需要 <file> 包裹，把正文+附件名拼给计划生成器即可
-    const promptParts: string[] = [];
-    if (text) promptParts.push(text);
-    if (names.length > 0) promptParts.push(`附件：${names.join('、')}`);
-    const prompt = promptParts.join('\n\n');
-
-    const steps = buildHarnessPlan(prompt, names);
-    try {
-      for (const step of steps) {
-        if (step.kind === 'say') {
-          await this._streamSay(step.text, ctrl);
-        } else {
-          await this._runToolStep(step, ctrl);
-        }
-      }
-    } catch (err) {
-      // 中止：_streamSay / _runToolStep 已各自把消息落成终态并 post 结果，这里只需收尾。
-      // 非中止的意外错误不该发生（步骤只抛 AbortError），真出现了至少打日志便于排查。
-      if (!isAbortError(err)) {
-        console.error('[harness] 整轮执行异常结束：', err);
-      }
-    } finally {
-      if (this._abort === ctrl) {
-        this._abort = undefined;
-        this._runningMsg = undefined;
-      }
-      this._afterTurn();
-    }
-  }
-
-  /** 把一段助手文本流式推给界面（harness 里的一条 "say" 步骤）。 */
-  private async _streamSay(text: string, ctrl: AbortController): Promise<void> {
-    const msg: ChatMessage = { id: this._nextMsgId(), role: 'assistant', text: '', status: 'streaming' };
-    this._active.messages.push(msg);
-    this._runningMsg = msg;
-    this._post({ type: 'assistant-start', message: msg });
-    try {
-      for await (const chunk of streamText(text, {}, ctrl.signal)) {
-        msg.text += chunk;
-        this._post({ type: 'assistant-delta', id: msg.id, delta: chunk });
-      }
-      msg.status = 'done';
-      this._post({ type: 'assistant-done', id: msg.id });
-    } catch (err) {
-      if (isAbortError(err)) {
-        msg.status = 'interrupted';
-        this._post({ type: 'assistant-done', id: msg.id, interrupted: true });
-      } else {
-        msg.status = 'error';
-        const message = err instanceof Error ? err.message : String(err);
-        this._post({ type: 'assistant-error', id: msg.id, message });
-      }
-      throw err; // 任一步失败都让整轮结束
-    }
-  }
-
-  /** 跑一个工具步骤：发 running 卡 → 等一小段"执行耗时" → 发结果（ok/error）。 */
-  private async _runToolStep(
-    step: Extract<HarnessStep, { kind: 'tool' }>,
-    ctrl: AbortController
-  ): Promise<void> {
-    const toolMsg: ChatMessage = {
-      id: this._nextMsgId(),
-      role: 'tool',
-      text: '',
-      status: 'done',
-      toolName: step.name,
-      toolInput: step.input,
-      toolState: 'running',
-    };
-    this._active.messages.push(toolMsg);
-    this._post({ type: 'tool-start', message: toolMsg });
-
-    try {
-      await sleep(step.delayMs ?? 500, ctrl.signal);
-      toolMsg.toolState = step.error ? 'error' : 'ok';
-      toolMsg.toolOutput = step.output;
-      this._post({
-        type: 'tool-result',
-        id: toolMsg.id,
-        toolState: toolMsg.toolState,
-        output: step.output,
-      });
-    } catch (err) {
-      if (isAbortError(err)) {
-        // 停止/切换：running 卡 → error（不留"转圈"残留）
-        toolMsg.toolState = 'error';
-        this._post({ type: 'tool-result', id: toolMsg.id, toolState: 'error' });
-      }
-      throw err;
-    }
-  }
-
-  // ---------- live 后端：连接真实 DSH（DeepSeek Harness）子进程 ----------
-
-  /**
-   * 真后端整轮执行。由 _runHarness 顶部按 `_backend` 分流调进来；
-   * 外层 try/catch/finally 仍在 _runHarness 兜着（输入锁定契约不变）。
+   * DSH 整轮执行（harness 唯一路径，由 _sendUser 直接调进来）；
+   * 本方法自带 try/catch/finally 收尾（输入锁定契约不变）。
    *
    * DSH 会话内的事件是**异步**推上来的（session.status / session.event），跑完一整轮才回到这里：
    * 提交 prompt 拿到"回执"后，就挂起等 _finishTurn / _surfaceLiveError resolve 掉 `_endTurnResolve`；
@@ -767,26 +648,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return dshId;
   }
 
-  /** Harness 头部后端开关：模拟 / DSH 直播。在途时拒绝切换。 */
-  private _setBackend(backend: HarnessBackend): void {
-    if (backend === this._backend) return;
-    if (this._abort) {
-      vscode.window.showInformationMessage('当前有回复在生成中，先停止或等它结束，再切换后端。');
-      return;
-    }
-    this._backend = backend;
-    void this._globalState.update(BACKEND_KEY, backend);
-    if (backend === 'live') {
-      this._postLiveConfig(); // 先把配置条（模型/预设/API 灯）亮出来
-      void this._connectLive(); // 预热到"在线"（spawn + initialize），状态点即时可见
-    } else {
-      // 切回 mock：杀掉子进程省资源、清掉会话映射（进程内 DSH 记忆随之清空）
-      this._teardownLive();
-      this._postBackendStatus();
-    }
-  }
-
-  /** 杀掉子进程 + 清空 live 相关状态（切回 mock / 重启换模型或 key 时共用）。 */
+  /** 杀掉子进程 + 清空 live 相关状态（重启换模型 / key / 路径、视图销毁时共用）。 */
   private _teardownLive(): void {
     this._dsh?.kill();
     this._dsh = undefined;
@@ -856,20 +718,164 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._restartLiveProcess();
   }
 
-  /** 杀掉当前 live 子进程并按最新模型/key 重连（模型/API 变更后调用）。 */
+  /** 杀掉当前 DSH 子进程并按最新模型/key/路径重连（变更后调用；仅 harness 生效）。 */
   private _restartLiveProcess(): void {
     this._teardownLive();
     this._postBackendStatus();
-    if (this._backend === 'live' && !this._liveRunning) {
+    if (this._mode === 'harness' && !this._liveRunning) {
       void this._connectLive();
     }
   }
 
-  /** 确保 live 子进程在线（幂等：多个调用共享同一个进行中的握手）。 */
+  /** palette 命令转发（hello.dsh.configure）：webview 按钮走的是 _onMessage 的 configure-dsh。 */
+  public configureDsh(): Promise<void> {
+    return this._configureDsh();
+  }
+
+  /**
+   * 「配置 DSH」引导向导：用原生对话框收集 nodePath / entry，并按入口所在 DSH 仓库根推导
+   * runCwd / tsconfig / config，最后 quickpick 确认、用 ConfigurationTarget.Global 写 hello.dsh.*
+   * （machine-scope 设置只能落在用户设置文件，故用 Global target）。取消任一对话框即整段中止、零写入。
+   * credentialsFile 绝不写入（它由 API 按钮 / 密钥库管理）。写盘只发生在用户选「保存并重启 live」那一刻。
+   */
+  private async _configureDsh(): Promise<void> {
+    if (this._abort) {
+      vscode.window.showInformationMessage('当前有回复在生成中，先停止或等它结束，再配置 DSH。');
+      return;
+    }
+
+    // 开始时快照（trimmed）——决定哪些键「真的变了」，也避免向导期间重复读配置的歧义
+    const conf = this._dshConfig();
+    const cur = {
+      nodePath: String(conf.get('nodePath') ?? '').trim(),
+      entry: String(conf.get('entry') ?? '').trim(),
+      runCwd: String(conf.get('runCwd') ?? '').trim(),
+      tsconfig: String(conf.get('tsconfig') ?? '').trim(),
+      config: String(conf.get('config') ?? '').trim(),
+    };
+    let nodePath = cur.nodePath;
+    let entry = cur.entry;
+    let runCwd = cur.runCwd;
+    let tsconfig = cur.tsconfig;
+    let config = cur.config;
+
+    let step: 'node' | 'entry' | 'config' | 'confirm' = 'node';
+    for (;;) {
+      if (step === 'node') {
+        const p = await this._pickDshFile({
+          title: '选择 DSH 运行用的 node 可执行文件',
+          openLabel: '选用该 node',
+          filters: { '可执行文件': ['exe'] },
+          defaultCandidates: [nodePath ? path.dirname(nodePath) : '', 'D:\\DSH\\tools'],
+        });
+        if (p === undefined) return; // Esc = 取消整个向导，尚未写入任何东西
+        nodePath = p;
+        // 首次必选入口；「重选 node」则保留已选的 entry，直接回确认
+        step = entry === '' ? 'entry' : 'confirm';
+        continue;
+      }
+      if (step === 'entry') {
+        const p = await this._pickDshFile({
+          title: '选择 DSH 入口脚本（如 packages/examples/jsonrpc-demo/src/bin.ts）',
+          openLabel: '选用该入口',
+          filters: { '脚本文件': ['ts', 'js'] },
+          defaultCandidates: [
+            entry ? path.dirname(entry) : '',
+            runCwd || cur.runCwd || '',
+            'D:\\DSH\\deepseek-harness',
+          ],
+        });
+        if (p === undefined) return;
+        entry = p;
+        // —— 按入口推导（找不到 node_modules 根 → 全留空，不硬失败，确认弹窗会提示回退工作区根）——
+        const root = this._dshRepoRootFromEntry(entry);
+        runCwd = root || '';
+        const ts = root ? path.join(root, 'tsconfig.json') : '';
+        tsconfig = ts && this._exists(ts) ? ts : '';
+        const yml = root ? path.join(root, 'examples', 'jsonrpc-agent', 'cordis.yml') : '';
+        config = yml && this._exists(yml) ? yml : '';
+        step = 'confirm';
+        continue;
+      }
+      if (step === 'config') {
+        const p = await this._pickDshFile({
+          title: '选择 runtime 部署配置（cordis.yml，可选）',
+          openLabel: '选用该配置',
+          filters: { 'YAML': ['yml', 'yaml'] },
+          defaultCandidates: [config ? path.dirname(config) : '', runCwd || ''],
+        });
+        if (p === undefined) return;
+        config = p;
+        step = 'confirm';
+        continue;
+      }
+
+      // ---- step === 'confirm' ----
+      const pick = await vscode.window.showQuickPick(
+        [
+          { label: 'node', description: nodePath || '(未设置)', enabled: false },
+          { label: '入口', description: entry || '(未设置)', enabled: false },
+          { label: '工作目录', description: runCwd || '(未设置 → 回退工作区根)', enabled: false },
+          { label: 'tsconfig', description: tsconfig || '(未设置)', enabled: false },
+          { label: '配置文件', description: config || '(未设置)', enabled: false },
+          { label: '保存并重启 live', description: '把以上值写入用户设置（hello.dsh.*），随后重启 DSH 子进程' },
+          { label: '重新选择 node 可执行文件', description: '' },
+          { label: '重新选择入口脚本', description: '将按入口所在仓库自动推导其余路径' },
+          { label: '重新选择配置文件', description: '可选，缺省按入口自动推导' },
+          { label: '取消', description: '' },
+        ],
+        { placeHolder: '确认以上最终值（灰字为将写入的内容）', title: 'DSH 运行路径配置' }
+      );
+
+      if (!pick || pick.label === '取消') return;
+      if (pick.label === '保存并重启 live') {
+        const changed: Array<[string, string]> = [];
+        if (nodePath !== cur.nodePath) changed.push(['nodePath', nodePath]);
+        if (entry !== cur.entry) changed.push(['entry', entry]);
+        if (runCwd !== cur.runCwd) changed.push(['runCwd', runCwd]);
+        if (tsconfig !== cur.tsconfig) changed.push(['tsconfig', tsconfig]);
+        if (config !== cur.config) changed.push(['config', config]);
+
+        const w = vscode.workspace.getConfiguration('hello.dsh');
+        for (const [k, v] of changed) {
+          try {
+            await w.update(k, v, vscode.ConfigurationTarget.Global);
+          } catch (err) {
+            vscode.window.showErrorMessage(
+              `写入 hello.dsh.${k} 失败：${err instanceof Error ? err.message : String(err)}`
+            );
+            return; // 写失败即中止，避免半套配置生效后误导性重启
+          }
+        }
+        if (changed.length > 0) {
+          vscode.window.showInformationMessage('DSH 运行路径已保存，正在重启 live 子进程…');
+          this._restartLiveProcess(); // teardown → _postBackendStatus(→_postLiveConfig 灯转绿) → 在线则重连
+        } else {
+          vscode.window.showInformationMessage('配置没有变化，未写入。');
+        }
+        return;
+      }
+      if (pick.label.startsWith('重新选择 node')) {
+        step = 'node';
+        continue;
+      }
+      if (pick.label.startsWith('重新选择入口')) {
+        step = 'entry';
+        continue;
+      }
+      if (pick.label.startsWith('重新选择配置')) {
+        step = 'config';
+        continue;
+      }
+      return; // 兜底：未知动作直接收尾
+    }
+  }
+
+  /** 确保 DSH 子进程在线（幂等：多个调用共享同一个进行中的握手；仅 harness 有效）。 */
   private _connectLive(): Promise<void> {
+    if (this._mode !== 'harness') return Promise.resolve();
     if (this._backendState === 'online') return Promise.resolve();
     if (this._connectPromise) return this._connectPromise;
-    if (this._backend !== 'live') return Promise.resolve();
     const p = this._doConnectLive();
     this._connectPromise = p;
     p.then(
@@ -1072,6 +1078,80 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return vscode.workspace.getConfiguration('hello.dsh');
   }
 
+  /** DSH 运行路径是否已配：nodePath 与 entry 都填了才算（与 _makeSpawnRequest 的 throw 条件同构）。
+   *  注：若用户走 hello.dsh.command 整段覆盖而 nodePath/entry 为空，这里会报「未配置」——可接受边缘，
+   *  因为配置条引导的就是 nodePath/entry 路径本身。 */
+  private _dshConfigured(): boolean {
+    const conf = this._dshConfig();
+    const nodePath = String(conf.get('nodePath') ?? '').trim();
+    const entry = String(conf.get('entry') ?? '').trim();
+    return !!(nodePath && entry);
+  }
+
+  /** 路径存在判断（目录或文件都算）。 */
+  private _exists(p: string): boolean {
+    try {
+      fs.accessSync(p);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** 从入口脚本向上（最多 8 层）定位 DSH 仓库根。
+   *  注意：pnpm 每个包目录都自带 node_modules，不能停在内层包目录 —— 所以收集所有带 node_modules 的祖先，
+   *  优先挑带"仓库根标记"的（node_modules/.pnpm 存在，或含 examples/jsonrpc-agent/cordis.yml），
+   *  都没有再回退最外层那个；全无返回 ''。
+   *  tsx / @deepseek-ai/* 都靠这个根的 node_modules 解析，向导拿它当 runCwd / 推导 tsconfig / config。 */
+  private _dshRepoRootFromEntry(entry: string): string {
+    let dir = path.dirname(entry);
+    let outermost = '';
+    let marked = '';
+    for (let i = 0; i < 8; i++) {
+      if (this._exists(path.join(dir, 'node_modules'))) {
+        outermost = dir;
+        if (
+          !marked &&
+          (this._exists(path.join(dir, 'node_modules', '.pnpm')) ||
+            this._exists(path.join(dir, 'examples', 'jsonrpc-agent', 'cordis.yml')))
+        ) {
+          marked = dir;
+        }
+      }
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    return marked || outermost;
+  }
+
+  /** 原生单选文件选择器：返回 fsPath，取消返回 undefined。
+   *  defaultUri 取第一个「存在」的目录（可为空数组 → 落 os.homedir()），不在各机器硬编码 DSH 位置。 */
+  private async _pickDshFile(opts: {
+    title: string;
+    openLabel: string;
+    filters?: Record<string, string[]>;
+    defaultCandidates: string[];
+  }): Promise<string | undefined> {
+    const dir = opts.defaultCandidates.find((p) => {
+      try {
+        return !!p && fs.statSync(p).isDirectory();
+      } catch {
+        return false;
+      }
+    });
+    const picked = await vscode.window.showOpenDialog({
+      canSelectMany: false,
+      canSelectFiles: true,
+      canSelectFolders: false,
+      title: opts.title,
+      openLabel: opts.openLabel,
+      filters: opts.filters,
+      defaultUri: dir ? vscode.Uri.file(dir) : vscode.Uri.file(os.homedir()),
+    });
+    return picked && picked[0] ? picked[0].fsPath : undefined;
+  }
+
   /** 工具真实工作目录（bash/fs 工具从这里起步）：工作区根，否则用户主目录。 */
   private _dshCwd(): string {
     const folder = vscode.workspace.workspaceFolders?.[0];
@@ -1212,30 +1292,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** 把后端来源 + 连接状态 + busy 广播给 webview（头部开关/状态点的唯一真相）。 */
+  /** 把 DSH 连接状态 + busy 广播给 webview（顶栏 harness 状态点 / busy 锁的唯一真相）。 */
   private _postBackendStatus(): void {
     const busy = this._liveRunning;
-    if (this._backend === 'live') {
-      this._post({
-        type: 'backend-status',
-        backend: 'live',
-        state: this._backendState,
-        model: this._backendModel,
-        detail: this._backendDetail,
-        busy,
-      });
-    } else {
-      this._post({ type: 'backend-status', backend: 'mock', state: 'offline', busy });
-    }
+    this._post({
+      type: 'backend-status',
+      state: this._backendState,
+      model: this._backendModel,
+      detail: this._backendDetail,
+      busy,
+    });
     this._postLiveConfig(); // 顺带刷新配置条（模型/预设/API 灯）
   }
 
-  /** 把 live 配置条的状态广播给 webview：当前模型 + 可选预设 + API key 是否已配。 */
+  /** 把配置条状态广播给 webview：当前模型 + 可选预设 + API key / DSH 路径是否已配。 */
   private _postLiveConfig(): void {
-    if (this._backend !== 'live') return;
     const model = this._dshModel();
     const models = PRESET_MODELS.includes(model) ? PRESET_MODELS : [model, ...PRESET_MODELS];
-    this._post({ type: 'live-config', model, models, apiConfigured: this._apiKeyCache !== undefined && this._apiKeyCache !== '' });
+    this._post({
+      type: 'live-config',
+      model,
+      models,
+      apiConfigured: this._apiKeyCache !== undefined && this._apiKeyCache !== '',
+      dshConfigured: this._dshConfigured(),
+    });
   }
 
   /** 若 key 尚未解析，先试一次（SecretStorage → 回退文件），再重广播配置条（点亮 API 灯）。 */
