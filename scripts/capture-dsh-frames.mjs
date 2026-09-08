@@ -32,6 +32,10 @@ const outFile = process.argv[2]
 //   DSH_CAP_RUNCWD  = 子进程工作目录（保证 tsx / @deepseek-ai/* 能解析）
 //   DSH_CAP_TSCONFIG= tsx 用的 tsconfig
 //   DSH_CAP_CRED    = 回退读取 DEEPSEEK_API_KEY 的 YAML 文件（可选）
+//   DSH_CAP_PROMPT  = 发下去的提示词（缺省用内置 echo 探针；设成破坏性/改文件等
+//                     针对性场景即可逼出 approval/file 系事件，不用改源码）
+//   DSH_CAP_INIT_EXTRA = 合并进 initialize 参数的 JSON（如 {"reasoningEffort":"medium"}
+//                     探"多余参数是被透传、忽略还是报错"——须是合法 JSON）
 const NODE = process.env.DSH_CAP_NODE ?? ''
 const ENTRY = process.env.DSH_CAP_ENTRY ?? ''
 const CONFIG = process.env.DSH_CAP_CONFIG ?? ''
@@ -84,7 +88,24 @@ mkdirSync(sessionRoot, { recursive: true })
 mkdirSync(dirname(outFile), { recursive: true })
 
 const sessionId = `capture-${Date.now()}`
-const promptText = '请用 bash 工具执行命令 `echo DSH-FRAME-CAPTURE-OK`，然后只回复命令的输出内容。不要做别的操作。'
+const EXTRA = initExtra() // spawn 前解析：非法 JSON 先退出，不留孤儿子进程
+const promptText =
+  process.env.DSH_CAP_PROMPT ??
+  '请用 bash 工具执行命令 `echo DSH-FRAME-CAPTURE-OK`，然后只回复命令的输出内容。不要做别的操作。'
+
+/** DSH_CAP_INIT_EXTRA：JSON.parse，失败即退出（不吞非法输入）。 */
+function initExtra() {
+  const raw = process.env.DSH_CAP_INIT_EXTRA
+  if (!raw) return {}
+  try {
+    const o = JSON.parse(raw)
+    if (!o || typeof o !== 'object' || Array.isArray(o)) throw new Error('需 JSON 对象')
+    return o
+  } catch {
+    console.error(`✗ DSH_CAP_INIT_EXTRA 不是合法 JSON 对象：${raw}`)
+    process.exit(2)
+  }
+}
 
 // ---- spawn（同扩展；stdout 全保留给 JSON-RPC） ----
 const child = spawn(NODE, ['--import', LOADER, ENTRY, CONFIG], {
@@ -194,7 +215,8 @@ rl.on('line', (line) => {
 })
 
 // ---- 握手 → 发一轮 → 等收尾 ----
-send('initialize', { cwd: TOOLCWD, provider: PROVIDER, model: MODEL })
+if (Object.keys(EXTRA).length) console.log(`→ initialize 附带额外参数：${Object.keys(EXTRA).join(', ')}`)
+send('initialize', { cwd: TOOLCWD, provider: PROVIDER, model: MODEL, ...EXTRA })
 const watchdog = setTimeout(() => finish('watchdog'), 240_000)
 
 // 等 initialize 回执后发 prompt

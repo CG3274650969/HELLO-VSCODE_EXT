@@ -173,6 +173,8 @@ Harness 才是完成态。
 | `media/chat.{html,js,css}` | 侧栏前端（模式胶囊 + harness 状态点；DSH 令牌 + VS Code 双兜底） |
 | `media/dsh-live/` | **gitignore** —— DSH 单文件前端产物（见上） |
 | `scripts/capture-dsh-frames.mjs` | DSH 运行时抓帧工具（`DSH_CAP_*`） |
+| `scripts/update-dsh.mjs` | 运行时依赖治理：把 DSH 检出锁到 tag、查漂移、跑升级仪式 + 冒烟（见 `docs/runtime-dependency.md`） |
+| `docs/runtime-dependency.md` | 治理决策依据：把 DSH 检出当「版本化运行时依赖」、升级仪式、「何时切官方 npm」观察清单 |
 
 扩展注册的命令：`Hello Chat: 开始新对话`、`Hello Chat: 配置 DSH 运行路径`（另有玩具命令
 `Hello: 打个招呼` / `Hello: 读取当前文件第一行`）。

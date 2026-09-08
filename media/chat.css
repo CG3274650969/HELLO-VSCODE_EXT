@@ -827,3 +827,178 @@ body.react-live #messages,
 body.react-live #empty-hint {
   display: none !important;
 }
+
+/* ---------- 2.1 本轮改动审阅条 + 面板浮层（Keep/Revert） ---------- */
+/* 审阅条：挂在 composer 内（消息区之下、输入框之上）；react-live 只藏 #messages，故两态都可见 */
+.review-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-top: 4px;
+  border-top: 1px dashed var(--dsw-alias-border-l2, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.25)));
+  font-size: 11px;
+}
+.review-summary {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+}
+
+/* 面板浮层：铺满 body（body 已 position:relative + overflow:hidden），盖在历史面板(30)之上 */
+.review-panel {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: none; /* 默认收起；.open 展开 */
+  flex-direction: column;
+  background: var(--dsw-alias-bg-layer-1, var(--vscode-editorWidget-background, var(--vscode-sideBar-background)));
+  color: var(--dsw-alias-label-primary, var(--vscode-editorWidget-foreground, var(--vscode-sideBar-foreground)));
+  border: 1px solid var(--dsw-alias-border-l2, var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.4)));
+}
+.review-panel.open {
+  display: flex;
+}
+
+.rp-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  padding: 8px 10px 6px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.35)));
+}
+.rp-title {
+  font-weight: 600;
+  font-size: 12px;
+}
+.rp-sub {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+}
+#review-panel-close {
+  flex: none;
+}
+
+/* 列表滚动区：flex 子项需 min-height:0 才能收缩出滚动条 */
+.rp-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rp-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex: none;
+  padding: 6px 10px;
+  border-top: 1px solid var(--dsw-alias-border-l1, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.35)));
+}
+
+/* 单条改动行 */
+.rp-file {
+  border: 1px solid var(--dsw-alias-border-l1, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.35)));
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-base, transparent);
+  overflow: hidden;
+}
+.rp-file-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+.rp-file-row:hover {
+  background: var(--dsw-alias-interactive-bg-hover, var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.15)));
+}
+.rp-op {
+  flex: none;
+  width: 18px;
+  text-align: center;
+  font-weight: 700;
+  font-family: var(--dsw-code-font-family, var(--vscode-editor-font-family, Consolas, monospace));
+  font-size: 11px;
+}
+.rp-op.added {
+  color: var(--dsw-alias-state-success-primary, #3fb950);
+}
+.rp-op.modified {
+  color: var(--dsw-alias-state-business-primary, #3794ff);
+}
+.rp-op.deleted {
+  color: var(--dsw-alias-state-error-primary, #f85149);
+}
+.rp-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--dsw-code-font-family, var(--vscode-editor-font-family, Consolas, monospace));
+  font-size: 11px;
+  color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
+}
+.rp-file-spacer {
+  flex: 1;
+}
+.rp-keep,
+.rp-revert,
+.rp-toggle {
+  flex: none;
+}
+
+/* 展开的 diff 区：等宽小字、滚动限高 */
+.rp-diff {
+  margin: 0;
+  padding: 4px 10px 8px;
+  border-top: 1px dashed var(--dsw-alias-border-l2, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.25)));
+  max-height: 200px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  font-size: 11px;
+  line-height: 1.45;
+}
+.diff-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #bdbdbd));
+}
+.diff-line.del {
+  background: rgba(248, 81, 73, 0.16); /* 老内核兜底；新内核用下方 color-mix 随主题 */
+  background: color-mix(in srgb, var(--dsw-alias-state-error-primary, #f85149) 18%, transparent);
+  color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
+}
+.diff-line.add {
+  background: rgba(63, 185, 80, 0.14);
+  background: color-mix(in srgb, var(--dsw-alias-state-success-primary, #3fb950) 18%, transparent);
+  color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
+}
+.diff-line.ctx {
+  opacity: 0.85;
+}
+.rp-diff-note {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--dsw-alias-label-tertiary, var(--vscode-descriptionForeground, #999));
+  padding-top: 4px;
+}
+.rp-empty {
+  padding: 20px 10px;
+  text-align: center;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  font-size: 12px;
+}

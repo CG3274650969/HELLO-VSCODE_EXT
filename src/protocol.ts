@@ -32,6 +32,10 @@ export interface FileRef {
   path?: string;
   /** 已读出的文本内容（拖拽/粘贴时由 webview 先读出） */
   content?: string;
+  /** 1.1 自动附选区注入的引用（非手动附件）：content = 编辑器缓冲里选中的确切文本（dirty 未保存
+   *  也含）。组包时把它落成临时文件、只发 `@"临时文件"` chip → 原生 DSH 气泡保持干净（chip + 用户
+   *  手打的话），agent 打开文件读到精确的选中行。写盘失败才回退内联摘录。 */
+  selection?: boolean;
 }
 
 /** 读取/整理后的附件：带大小截断或读取失败的标记。 */
@@ -69,6 +73,31 @@ export interface SessionSummary {
   id: string;
   title: string;
   updatedAt: number;
+}
+
+// --- 改动审阅（2.1）：每轮 DSH 执行结束后对工作区根的文件改动做 Keep/Revert ---
+
+/** 单个文件在本轮的改动方向 */
+export type FileChangeKind = 'added' | 'modified' | 'deleted';
+
+/** 行级 diff 的一行（扩展已按顺序排好，webview 逐行渲染即可，零前端算法）。 */
+export interface DiffLine {
+  kind: 'ctx' | 'add' | 'del';
+  text: string;
+}
+
+/** 审阅列表里单个文件的改动项。diff 缺省 = 该文件不可预览（二进制/过大）。 */
+export interface ReviewChange {
+  kind: FileChangeKind;
+  /** 工作区根下的相对路径（`/` 分隔）；也是动作消息回指的 key，绝对路径不出进程 */
+  rel: string;
+  /** 仅展示用（basename） */
+  name: string;
+  /** false（二进制/超大）→ webview 应禁用「还原」按钮 */
+  reversible: boolean;
+  diff?: DiffLine[];
+  /** 行数或跨文件总量超护栏，diff 已被裁掉 */
+  diffTruncated?: boolean;
 }
 
 /**
@@ -109,7 +138,11 @@ export type ExtToWebview =
   /** 发送被扩展拒绝（附件读取失败/过大等）；webview 应恢复输入态，已写内容不丢 */
   | { type: 'user-message-rejected'; reason: string }
   /** live 配置态广播：当前模型、可选预设、API key / DSH 运行路径是否已配置（供 composer 下的配置条渲染） */
-  | { type: 'live-config'; model: string; models: string[]; apiConfigured: boolean; dshConfigured: boolean };
+  | { type: 'live-config'; model: string; models: string[]; apiConfigured: boolean; dshConfigured: boolean }
+  /** 2.1：本轮 DSH 改动审阅（一轮 done 后推送整份；新一轮开始时清空/隐藏） */
+  | { type: 'review-set'; changes: ReviewChange[] }
+  /** 2.1：清空并隐藏审阅条与面板（新一轮开始 / 模式切换 / 全部处理完） */
+  | { type: 'review-clear' };
 
 /** webview → 扩展 */
 export type WebviewToExt =
@@ -126,4 +159,9 @@ export type WebviewToExt =
   // 下方几条来自 composer 下的配置条（仅 Harness 模式可见；Harness 恒为 DSH 直播）
   | { type: 'set-model'; model: string } // 改模型 → 扩展重启 live 子进程生效
   | { type: 'configure-key' } // 点"API" → 扩展弹密码输入框写入 SecretStorage
-  | { type: 'configure-dsh' }; // 点"配置 DSH" → 扩展弹引导向导，写 hello.dsh.*（machine scope）
+  | { type: 'configure-dsh' } // 点"配置 DSH" → 扩展弹引导向导，写 hello.dsh.*（machine scope）
+  // 2.1 改动审阅动作：rel 为审阅项的工作区根相对路径；*-all 不带 rel
+  | { type: 'review-keep'; rel: string } // 保留该文件改动（仅收起，不碰磁盘）
+  | { type: 'review-revert'; rel: string } // 用轮前快照还原该文件
+  | { type: 'review-keep-all' }
+  | { type: 'review-revert-all' };

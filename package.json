@@ -54,9 +54,10 @@
         "category": "Hello Chat"
       }
     ],
-    "configuration": {
-      "title": "Hello Chat · DeepSeek Harness",
-      "properties": {
+    "configuration": [
+      {
+        "title": "Hello Chat · DeepSeek Harness",
+        "properties": {
         "hello.dsh.nodePath": {
           "type": "string",
           "default": "",
@@ -130,8 +131,26 @@
           "markdownDescription": "把子进程 stderr / 被忽略的 JSON-RPC 通知打到输出控制台（不含任何密钥）。",
           "scope": "machine"
         }
+        }
+      },
+      {
+        "title": "Hello Chat · 发送与审阅",
+        "properties": {
+          "hello.chat.autoAttachSelection": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "向 Harness 发送时，若活动编辑器有非空选区，自动把选中文本作为附件一并发出（内容取自编辑器缓冲，未保存改动也包含）。关闭后不再自动附带。\n\nWhen sending to the Harness, automatically attach the active editor's non-empty selection as a file attachment (text is read from the editor buffer, so unsaved changes are included).",
+            "scope": "window"
+          },
+          "hello.chat.reviewChanges": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "每轮 Harness 结束后对比工作区根的文件改动并显示审阅条（增/改/删，可展开行级 diff，可单文件或全部保留/还原）。需打开工作区文件夹；二进制/超大文件只列出、不预览也不可还原。\n\nAfter each Harness turn, diff file changes under the workspace root and show a review bar (added/modified/deleted with inline diffs; keep or revert per file or all). Requires an open workspace folder; binary/oversized files are listed but not previewable or revertible.",
+            "scope": "window"
+          }
+        }
       }
-    }
+    ]
   },
   "scripts": {
     "compile": "tsc -p ./",
