@@ -188,6 +188,8 @@ finished path.
 | `media/chat.{html,js,css}` | Side-panel front end (mode pills + harness status dot; DSH theme tokens with VS Code fallbacks) |
 | `media/dsh-live/` | **gitignored** — DSH single-file front-end bundle (see above) |
 | `scripts/capture-dsh-frames.mjs` | Frame-capture tool for the DSH runtime (`DSH_CAP_*`) |
+| `scripts/update-dsh.mjs` | Runtime-dependency governance: lock the DSH checkout to a tag, check drift, run the upgrade ritual + smoke (see `docs/runtime-dependency.md`) |
+| `docs/runtime-dependency.md` | Governance decision for treating the DSH checkout as a versioned runtime dependency, the upgrade ritual, and the “when to switch to official npm” checklist |
 
 Commands contributed by the extension: `Hello Chat: 开始新对话`, `Hello Chat: 配置 DSH 运行路径`
 (plus the toy `Hello: 打个招呼` / `Hello: 读取当前文件第一行`).
