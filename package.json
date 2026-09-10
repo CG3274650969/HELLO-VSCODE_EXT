@@ -1,9 +1,10 @@
 {
   "name": "hello-vscode-ext",
-  "displayName": "Hello VS Code",
-  "description": "第一个最小可跑的 VS Code 插件：一条打招呼命令 + 读取当前文件",
+  "displayName": "AlohaDSH",
+  "description": "把 DeepSeek Harness（DSH）接进 VS Code 侧边栏：流式对话、选区自动附带、每轮文件改动审阅、破坏性命令执行前审批。",
   "version": "0.0.1",
   "publisher": "starmerx-local",
+  "icon": "media/logo.png",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -17,7 +18,7 @@
       "activitybar": [
         {
           "id": "hello-chat",
-          "title": "Hello Chat",
+          "title": "AlohaDSH",
           "icon": "media/icon.svg"
         }
       ]
@@ -36,27 +37,27 @@
       {
         "command": "hello.sayHello",
         "title": "打个招呼",
-        "category": "Hello"
+        "category": "AlohaDSH"
       },
       {
         "command": "hello.readActiveFile",
         "title": "读取当前文件第一行",
-        "category": "Hello"
+        "category": "AlohaDSH"
       },
       {
         "command": "hello.chat.newChat",
         "title": "开始新对话",
-        "category": "Hello Chat"
+        "category": "AlohaDSH"
       },
       {
         "command": "hello.dsh.configure",
         "title": "配置 DSH 运行路径",
-        "category": "Hello Chat"
+        "category": "AlohaDSH"
       }
     ],
     "configuration": [
       {
-        "title": "Hello Chat · DeepSeek Harness",
+        "title": "AlohaDSH · DeepSeek Harness",
         "properties": {
         "hello.dsh.runtimeDir": {
           "type": "string",
@@ -140,7 +141,7 @@
         }
       },
       {
-        "title": "Hello Chat · 发送与审阅",
+        "title": "AlohaDSH · 发送与审阅",
         "properties": {
           "hello.chat.autoAttachSelection": {
             "type": "boolean",

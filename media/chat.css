@@ -49,6 +49,25 @@ body[data-ds-dark-theme] {
   background: var(--dsw-alias-bg-base, var(--vscode-sideBar-background, var(--vscode-editor-background)));
 }
 
+/* 品牌标记（AlohaDSH）：直接用活动栏那个单色 icon.svg —— 不再另存一份彩色小图。
+   图标是近黑 + 透明底，在深色侧栏上会消失，所以按 VS Code 挂在 <body> 上的主题类反相。
+   （曾试过用 mask + currentColor 自动跟随主题：遮罩图一旦加载失败元素会被整块裁掉、
+   连底色都不剩，比反相脆弱得多，已弃用。）
+
+   尺寸：icon.svg 是贴着鲸鱼的横幅（viewBox 21.4:12.56），所以这里的 width 就是鲸鱼的宽，
+   height 必须留 auto —— 写死会跟 viewBox 的比例脱钩、一比就变形。放大只动 width。
+   26px 是照着 .mode-tab 的 26px 高定的：再大也不会把那行顶高。
+   （2026-09-10 试过换成方形徽章并缩到 22px —— 用户否了，实心块在这个位置不好看，已退回横幅版。） */
+.brand-mark {
+  flex: none;
+  width: 26px;
+  height: auto;
+}
+body.vscode-dark .brand-mark,
+body.vscode-high-contrast .brand-mark {
+  filter: invert(1);
+}
+
 /* 模式组：内嵌聊天 / Harness。不再是全宽下划线条，而是靠左一撮胶囊。 */
 .mode-bar {
   display: flex;

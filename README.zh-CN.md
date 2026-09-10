@@ -1,4 +1,6 @@
-# Hello Chat —— VS Code 侧栏的 DeepSeek-Harness（DSH）聊天面板
+# AlohaDSH —— VS Code 侧栏的 DeepSeek-Harness（DSH）聊天面板
+
+<img src="media/logo.png" alt="AlohaDSH" width="128">
 
 [English](README.md) · **简体中文**
 
@@ -18,7 +20,7 @@
 ## 快速上手（你已有 DSH 检出）
 
 1. 在 VS Code 打开本文件夹 → `npm install` → 按 **F5**（运行和调试 → Run Extension）。
-2. 扩展开发窗口 Activity Bar 点 **Hello Chat**。面板默认落在 **Harness** 页签。
+2. 扩展开发窗口 Activity Bar 点 **AlohaDSH**。面板默认落在 **Harness** 页签。
 3. 已配置：顶部状态点变绿 **在线 · \<模型\>**，直接输入即可。未配置：消息区显示引导、发送按钮
    灰 —— 点底部 **配置 DSH** 走向导（先选「便携运行时目录」或「手工 node + 入口」，见第 4 节）。
 4. 需要 API Key：点底部 **API** 按钮 → 存入 VS Code SecretStorage（不回写任何文件）；
@@ -83,7 +85,7 @@ pnpm dsh web
 ### 4. 配置扩展（优先用向导）
 
 推荐路径**无需手写任何设置**：打开面板、确认在 **Harness** 页签，点底部 **配置 DSH**（与
-palette 命令 `Hello Chat: 配置 DSH 运行路径` 同一条路）。**第一个岔路口是「字节从哪来」**：
+palette 命令 `AlohaDSH: 配置 DSH 运行路径` 同一条路）。**第一个岔路口是「字节从哪来」**：
 
 - **便携运行时目录（推荐）** —— 见下方[便携运行时](#便携运行时推荐)。选目录即可：node、入口、
   配置全从它里面的 `runtime.json` 解析。不需要 tsx，不需要 DSH 检出。
@@ -218,8 +220,8 @@ Harness 才是完成态。
 | `scripts/update-dsh.mjs` | 运行时依赖治理：把 DSH 检出锁到 tag、查漂移、跑升级仪式 + 冒烟（见 `docs/runtime-dependency.md`） |
 | `docs/runtime-dependency.md` | 治理决策依据：把 DSH 检出当「版本化运行时依赖」、升级仪式、「何时切官方 npm」观察清单 |
 
-扩展注册的命令：`Hello Chat: 开始新对话`、`Hello Chat: 配置 DSH 运行路径`（另有玩具命令
-`Hello: 打个招呼` / `Hello: 读取当前文件第一行`）。
+扩展注册的命令：`AlohaDSH: 开始新对话`、`AlohaDSH: 配置 DSH 运行路径`（另有玩具命令
+`AlohaDSH: 打个招呼` / `AlohaDSH: 读取当前文件第一行`）。
 
 ## 开发与安全提示
 

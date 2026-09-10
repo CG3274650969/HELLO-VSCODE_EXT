@@ -65,6 +65,7 @@
   （放行/拒绝/兜底/留痕/自检全过）；真机 F5 实测：开 `hello.chat.approval.enabled` + 重载窗口后，让 agent 删
   `D:\metabase\8.31数据处理\test.py`，agent 的 `rm -v "test.py"` **被执行前拦下**、整轮暂停，选「拒绝」后命令未执行，
   模型收到的工具结果是「用户在 Hello Chat 中拒绝了该命令，未执行。」并据此正确回话 —— 正是 C1 要的语义。
+  （引文按当时原文保留：更名 AlohaDSH 后该句已改为「用户在 AlohaDSH 中拒绝了该命令，未执行。」，语义一字未变。）
 - **验收**：开 `hello.chat.approval.enabled` → 发一句让 agent 删工作区文件 → 弹确认条、整轮暂停；选「拒绝」命令未执行、转写留痕。
   （已按此路径实测通过。）
 

@@ -1,4 +1,6 @@
-# Hello Chat — a DeepSeek-Harness (DSH) side panel for VS Code
+# AlohaDSH — a DeepSeek-Harness (DSH) side panel for VS Code
+
+<img src="media/logo.png" alt="AlohaDSH" width="128">
 
 **English** · [简体中文](README.zh-CN.md)
 
@@ -20,7 +22,7 @@ real tool calls, real transcripts, rendered with DSH's own React conversation UI
 ## Quick start (you already have a DSH checkout)
 
 1. Open this folder in VS Code → `npm install` → press **F5** (Run Extension).
-2. In the Extension Development Host, click **Hello Chat** in the Activity Bar. The panel opens on
+2. In the Extension Development Host, click **AlohaDSH** in the Activity Bar. The panel opens on
    the **Harness** tab by default.
 3. If DSH paths are configured, the top status dot turns green **在线 · \<model\>** and you can just
    type. If not, the message area shows a guide and the send button is disabled — click **配置 DSH**
@@ -92,7 +94,7 @@ The extension runs (as a child process):
 
 The recommended path needs **no hand-written settings**: open the panel, make sure you're on the
 **Harness** tab, and click **配置 DSH** in the bottom bar (same path as the palette command
-`Hello Chat: 配置 DSH 运行路径`).
+`AlohaDSH: 配置 DSH 运行路径`).
 
 **First question — where should the runtime bytes come from?**
 
@@ -239,8 +241,8 @@ finished path.
 | `scripts/update-dsh.mjs` | Runtime-dependency governance: lock the DSH checkout to a tag, check drift, run the upgrade ritual + smoke (see `docs/runtime-dependency.md`) |
 | `docs/runtime-dependency.md` | Governance decision for treating the DSH checkout as a versioned runtime dependency, the upgrade ritual, and the “when to switch to official npm” checklist |
 
-Commands contributed by the extension: `Hello Chat: 开始新对话`, `Hello Chat: 配置 DSH 运行路径`
-(plus the toy `Hello: 打个招呼` / `Hello: 读取当前文件第一行`).
+Commands contributed by the extension: `AlohaDSH: 开始新对话`, `AlohaDSH: 配置 DSH 运行路径`
+(plus the toy `AlohaDSH: 打个招呼` / `AlohaDSH: 读取当前文件第一行`).
 
 ## Development & security notes
 

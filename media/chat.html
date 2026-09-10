@@ -12,12 +12,16 @@
        必须排在 chat.css 之前：chat.css 的双兜底变量与 body 默认需要盖在令牌表之上。 -->
   %%DSH_THEME_LINK%%
   <link rel="stylesheet" href="%%CSS_URI%%">
-  <title>Hello Chat</title>
+  <title>AlohaDSH</title>
 </head>
 <body>
   <!-- 行1（恒显示）：顶部 tab 条 —— 左侧内嵌聊天/Harness（模式胶囊）；右侧 harness 专属的
        连接状态点（仅 harness 模式可见，applyMode 切 hidden）。 -->
   <div id="top-row" class="top-row">
+    <!-- 品牌标记：沿用活动栏那个单色 media/icon.svg（不另存一份彩色小图）。URI 由宿主替换
+         %%ICON_URI%%（同 %%CSS_URI%% 的机制）；尺寸与深色主题反相见 chat.css 的 .brand-mark。 -->
+    <img class="brand-mark" src="%%ICON_URI%%" alt="">
+
     <div id="mode-bar" class="mode-bar" role="tablist" aria-label="工作模式">
       <button type="button" id="mode-harness" class="mode-tab active" data-mode="harness"
               role="tab" aria-selected="true">Harness</button>

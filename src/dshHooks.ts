@@ -254,7 +254,7 @@ function quote(s: string): string {
 function derivedBlock(hooksPath: string): string {
   return (
     '\n' +
-    '# --- Hello Chat 事前审批（C1）自动追加：由扩展生成，请勿手工编辑 ---\n' +
+    '# --- AlohaDSH 事前审批（C1）自动追加：由扩展生成，请勿手工编辑 ---\n' +
     '- id: hello-chat-approval-hooks\n' +
     "  name: '@deepseek-ai/dsh-hooks-claude-code'\n" +
     '  config:\n' +
@@ -286,7 +286,7 @@ function isBlockSequenceRoot(text: string): boolean {
  */
 const HOOK_SCRIPT = String.raw`#!/usr/bin/env node
 /**
- * Hello Chat · C1 事前审批 hook（由扩展自动生成，请勿手工编辑）。
+ * AlohaDSH · C1 事前审批 hook（由扩展自动生成，请勿手工编辑）。
  *
  * DSH 的 hooks-claude-code 插件在每次 bash 工具调用**之前**执行本脚本，把载荷
  * （{tool_name, tool_input, tool_use_id}）从 stdin 递进来；脚本向本机的审批服务

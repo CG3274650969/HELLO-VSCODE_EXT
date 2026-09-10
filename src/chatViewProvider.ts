@@ -2445,6 +2445,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const jsUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this._extensionUri, 'media', 'chat.js')
     );
+    // 侧栏头部的品牌标记：拿单色 icon.svg 当遮罩（见 chat.html 的 .brand-mark）。
+    // 走 img-src（CSP 已放行 cspSource），不需要额外改 CSP。
+    const iconUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this._extensionUri, 'media', 'icon.svg')
+    );
 
     // 真 DSH 组件的构建产物（media/dsh-live）。缺失时置空 → webview 侧懒加载桥自动
     // 放弃 React 画面、保持既有 DOM 渲染（开发期未打包 dsh-live 也能正常用）。
@@ -2473,6 +2478,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       .replace(/%%CSP_SOURCE%%/g, webview.cspSource)
       .replace(/%%NONCE%%/g, nonce)
       .replace(/%%CSS_URI%%/g, cssUri.toString())
+      .replace(/%%ICON_URI%%/g, iconUri.toString())
       .replace(/%%JS_URI%%/g, jsUri.toString())
       .replace(/%%DSH_THEME_LINK%%/g, dshThemeLink)
       .replace(/%%DSH_LIVE_JS_URI%%/g, dshLiveJsUri)

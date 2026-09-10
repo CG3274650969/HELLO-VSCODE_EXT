@@ -1,4 +1,4 @@
-# Hello Chat 便携运行时的默认配置。
+# AlohaDSH 便携运行时的默认配置。
 #
 # 底本是 DSH 检出里的 examples/jsonrpc-agent/cordis.yml（本扩展一路跑通的那份），
 # 不是 python/sdk-runtime 里那份精简的 runtime/cordis.yml —— 后者没有 dsh-tool-fs

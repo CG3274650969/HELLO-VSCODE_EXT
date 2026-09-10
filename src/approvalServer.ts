@@ -111,7 +111,7 @@ export class ApprovalServer {
     p.settle(
       allow
         ? { allow: true }
-        : { allow: false, reason: '用户在 Hello Chat 中拒绝了该命令，未执行。' }
+        : { allow: false, reason: '用户在 AlohaDSH 中拒绝了该命令，未执行。' }
     );
     return true;
   }
