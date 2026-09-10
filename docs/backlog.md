@@ -10,7 +10,7 @@
 | 编号 | 标题 | 优先级 | 阻塞/依赖 | 状态 |
 |---|---|---|---|---|
 | C1 | 事前审批（破坏性操作确认条） | P0 | 无（走 hooks 路线，不必改 DSH） | [x] |
-| C2 | DSH 运行时零配置分发 | P0 | 受上游 npm 成熟度限制；可先自建便携包 | [ ] |
+| C2 | DSH 运行时零配置分发 | P0 | 上游 Windows 制品缺失（明文 non-goal）；阶段一自建便携包已就绪 | [~] |
 | C3 | 成本与用量可视化 + 预算拦截 | P0 | 需先核实 runtime 是否透出 usage | [ ] |
 | C4 | 工作区外写护栏与可见性 | P0 | 依赖 C1；部分受 wire 限制 | [ ] |
 | C5 | 会话记忆跨重启（复用 DSH_SESSION_ROOT） | P1 | 需实证「新进程 + 旧 sessionId」可续 | [ ] |
@@ -71,8 +71,34 @@
 ### C2 · DSH 运行时零配置分发
 - **现状**：跑起来要求本地 DSH 检出 + 新版 node + tsx + cordis.yml，靠 `hello.dsh.*` 向导手工配（[package.json](../package.json)）；runtime 锁 `rc.8` tag 靠本地脚本治理（[runtime-dependency.md](runtime-dependency.md)）。
 - **缺口**：终端用户能「装完即用」的可分发包。
-- **补法**：官方 npm 轨成熟前自建——内置便携 node + 预构建 jsonrpc 入口 + 默认 cordis.yml，或一键引导安装（下载/解压/写 machine 设置）。上游成熟后换 npm（见 runtime-dependency 观察清单）。
-- **验收**：全新机器（无 DSH 检出、无 node）按引导走完 → 状态点转绿并发通一轮。
+
+**核实结论（2026-09-10）：Windows 上今天没有任何上游 DSH 制品**，所以"要不要从检出构建"不是设计选择，而是唯一字节来源：
+- `python/sdk-runtime/platforms.json` 只列 `linux-x64` / `linux-arm64` / `macos-arm64`，**无 windows**；
+  单文件 exe 构建脚本的 `Target` 注释原话：*"Windows is a documented non-goal"*。
+- npm 轨未成熟（[runtime-dependency.md](runtime-dependency.md)）→ `npm i` 拿不到可交互 stdio runtime。
+- 上游把 node 载体（`packaged-bin.js`）定位为 dev-only、不进发行物 —— 我们走的正是这条路，**记为已知风险**。
+
+- **阶段一（已完成，`[~]`）**：「**能被指向**」—— 扩展支持指向一个便携运行时目录，去掉 tsx 依赖。
+  - [`scripts/build-runtime.mjs`](../scripts/build-runtime.mjs)：从 DSH 检出产出便携运行时目录。复用 DSH 为
+    Python SDK 定义的零配置契约 —— `pnpm --filter dsh-jsonrpc-agent-pkg deploy --legacy …` 出闭包 →
+    补 legacy hoist 漏掉的依赖 → materialize 符号链接（闭包必须无链接才可搬迁）→ 补便携 node +
+    [`runtime/cordis.default.yml`](../runtime/cordis.default.yml) → 写 `runtime.json` 清单 → 收尾裸冒烟。
+  - [`scripts/smoke-runtime.mjs`](../scripts/smoke-runtime.mjs)：不依赖扩展与 F5 的分离器 —— 裸 spawn 包内
+    node + 入口 + 配置，喂一条 `initialize`（**不需要 API key**），断言收到 id 对得上的 JSON-RPC 回执。
+    **这是整条路线的判定点**：这条不过，后面全白写。
+  - 扩展侧 `hello.dsh.runtimeDir`（machine scope）：非空且 `runtime.json` 合法时**优先于** nodePath/entry/config/runCwd
+    （`hello.dsh.command` 仍最高）；目录不可用**明确报错，不静默回落**。C1 的派生配置照常从运行时自带的
+    `cordis.yml` 派生（`dsh-hooks-claude-code` 已核在闭包依赖集内）。
+  - **我们偏离上游默认的两处**：① 不跑 `pkg`（那是 linux/macos 专有）；② 默认配置用我们自己的 ——
+    上游那份 `runtime/cordis.yml` 太精简，没有 `dsh-tool-fs`（其 `fs-local` 自注写明"自身不暴露模型可见的文件工具"），
+    直接用会让用户**丢掉 `read`/`write`/`edit` 文件工具**。改配置要同步保证每条 `name:` 都在闭包依赖集内。
+  - **实测**（2026-09-10，win32-x64）：deploy 闭包 → 无符号链接收敛（1 轮）→ 裸冒烟
+    `initialize` 回执 `{"serverInfo":{"name":"deepseek-harness-sdk-runtime","version":"0.0.1"}}`，全程无 tsx。
+
+- **阶段二（待做）**：获取入口 —— 下载/解压/校验/写 machine 设置的一键引导；产出 `.zip`（`build-runtime.mjs --zip`
+  已留好出口）；把「目录从哪来」做成可插拔供给方（上游 Windows 制品 / 内网包 / 自建）。上游成熟后换 npm。
+- **验收（阶段二）**：全新机器（无 DSH 检出、无 node）按引导走完 → 状态点转绿并发通一轮，且 `read`/`write`/`edit` 工具齐全。
+  阶段一的验收是「手工指向一个便携运行时目录后上述成立」。
 
 ### C3 · 成本与用量可视化 + 预算拦截
 - **现状**：代码里无任何 token/费用统计；`reasoningEffort` 写死 max，跑一轮烧多少只能看账单。

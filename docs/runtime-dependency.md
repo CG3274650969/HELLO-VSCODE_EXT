@@ -82,6 +82,33 @@ node scripts/update-dsh.mjs <DSH检出根> --to dsh-vX.Y.Z-rc.N
 
 构建产物不入库（gitignore）；缺失时扩展自动回落，详见主 README 的 react-live 一节。
 
+## 分发：便携运行时（Windows 无上游制品）
+
+上面的治理解决的是**我这台机器**怎么稳定跟随 DSH；**终端用户装完即用**是另一件事（backlog C2）。
+2026-09-10 核实：**Windows 上今天没有任何可下载的上游 DSH 制品**，所以"要不要从检出构建"不是设计
+选择，而是唯一字节来源。
+
+| 事实 | 出处 |
+|---|---|
+| `platforms.json` 只列 `linux-x64` / `linux-arm64` / `macos-arm64`，**无 windows** | `python/sdk-runtime/platforms.json` |
+| 单文件 exe 构建脚本 `Target` 注释原文 *"Windows is a documented non-goal"* | `scripts/build-exe-for-python-sdk.ts` |
+| node 载体被定位为 **dev-only，不进发行物** | `python/sdk-runtime/README.md` |
+
+**路线**：复用 DSH **自己为 Python SDK 定义的零配置契约**，不自创分发格式。
+`scripts/build-runtime.mjs` 从检出产出一个**便携运行时目录**（自带 node + 预构建的纯 JS 入口 +
+默认 `cordis.yml` + `runtime.json` 清单）；扩展侧 `hello.dsh.runtimeDir` 指向它即可 —— 不装 tsx、
+不装 DSH 检出。契约细节与偏离上游的两处（不跑 `pkg`；默认配置用我们自己的，补回上游精简版
+丢掉的 `dsh-tool-fs`）见 [backlog C2](backlog.md) 与该脚本头部注释。
+
+**判定点**：`node scripts/smoke-runtime.mjs --runtime <目录>` —— 裸 spawn 包内 node + 入口 + 配置，
+喂一条 `initialize`（**不需要 API key**），断言收到 id 对得上的 JSON-RPC 回执。这条不过，后面全白写。
+
+**升级耦合**：便携运行时的字节仍来自检出，所以**升 tag 后要重建一次运行时目录**，与重建
+`media/dsh-live` 同理。重建同样走 `scripts/build-runtime.mjs`（它会先调 `update-dsh.mjs` 断言锁点）。
+
+**已知风险**：这条路线**没有上游背书**（node 载体被上游划为 dev-only）。兜底是我们自己的构建 +
+冒烟。将来换供给方（上游 Windows 制品 / 内网包）只改"目录从哪来"，扩展侧接口不动。
+
 ## 什么时候切官方 npm：观察清单
 
 三个条件**同时**满足再重新评估；满足几个先验证几个（都只读 npm）：

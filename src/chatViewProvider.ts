@@ -111,6 +111,55 @@ function prettyValue(v: unknown): string {
   }
 }
 
+/** 便携运行时清单（`<runtimeDir>/runtime.json`，由 scripts/build-runtime.mjs 产出）。路径均为相对目录、正斜杠。 */
+interface RuntimeManifest {
+  formatVersion?: number;
+  dshVersion?: string;
+  platform?: string;
+  nodeVersion?: string;
+  node: string;
+  entry: string;
+  config: string;
+}
+
+/**
+ * `hello.dsh.runtimeDir` 的解析结果。
+ * - `undefined`：没配这个设置 → 走既有的手工 nodePath/entry 路径。
+ * - `{ ok: false }`：配了但目录不可用 → **明确报错，不静默回落**。用户指了运行时目录却跑到旧路径上，
+ *   比直接告诉他哪儿坏了更难查。
+ */
+type RuntimeResolution =
+  | { ok: true; dir: string; node: string; entry: string; config: string; manifest: RuntimeManifest }
+  | { ok: false; problem: string };
+
+/**
+ * 读一个便携运行时目录的清单，把三个相对路径解析成绝对路径并逐个验存在。
+ * 不读设置 —— 向导里验的是"用户刚选中的目录"，那时还没写进设置。
+ */
+function readRuntimeDir(dir: string): RuntimeResolution {
+  const manifestPath = path.join(dir, 'runtime.json');
+  let manifest: RuntimeManifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as RuntimeManifest;
+  } catch {
+    return { ok: false, problem: `这个目录里读不到 runtime.json：${manifestPath}` };
+  }
+
+  const resolved: Record<'node' | 'entry' | 'config', string> = { node: '', entry: '', config: '' };
+  for (const key of ['node', 'entry', 'config'] as const) {
+    const rel = String(manifest[key] ?? '').trim();
+    if (!rel) return { ok: false, problem: `runtime.json 缺少 "${key}" 字段：${manifestPath}` };
+    const abs = path.resolve(dir, rel);
+    try {
+      fs.accessSync(abs);
+    } catch {
+      return { ok: false, problem: `runtime.json 里的 ${key} 不存在：${abs}` };
+    }
+    resolved[key] = abs;
+  }
+  return { ok: true, dir, node: resolved.node, entry: resolved.entry, config: resolved.config, manifest };
+}
+
 /**
  * 侧边栏聊天视图的 Provider。
  *
@@ -886,8 +935,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * 「配置 DSH」引导向导：用原生对话框收集 nodePath / entry，并按入口所在 DSH 仓库根推导
-   * runCwd / tsconfig / config，最后 quickpick 确认、用 ConfigurationTarget.Global 写 hello.dsh.*
+   * 「配置 DSH」引导向导。先问一个岔路口：**便携运行时目录**（推荐；字节自带 node 与配置）
+   * 还是**手工 node + 入口**（开发者路径，按入口所在 DSH 仓库根推导 runCwd / tsconfig / config）。
+   * 最后 quickpick 确认、用 ConfigurationTarget.Global 写 hello.dsh.*
    * （machine-scope 设置只能落在用户设置文件，故用 Global target）。取消任一对话框即整段中止、零写入。
    * credentialsFile 绝不写入（它由 API 按钮 / 密钥库管理）。写盘只发生在用户选「保存并重启 live」那一刻。
    */
@@ -900,20 +950,71 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // 开始时快照（trimmed）——决定哪些键「真的变了」，也避免向导期间重复读配置的歧义
     const conf = this._dshConfig();
     const cur = {
+      runtimeDir: String(conf.get('runtimeDir') ?? '').trim(),
       nodePath: String(conf.get('nodePath') ?? '').trim(),
       entry: String(conf.get('entry') ?? '').trim(),
       runCwd: String(conf.get('runCwd') ?? '').trim(),
       tsconfig: String(conf.get('tsconfig') ?? '').trim(),
       config: String(conf.get('config') ?? '').trim(),
     };
+    let runtimeDir = cur.runtimeDir;
     let nodePath = cur.nodePath;
     let entry = cur.entry;
     let runCwd = cur.runCwd;
     let tsconfig = cur.tsconfig;
     let config = cur.config;
 
-    let step: 'node' | 'entry' | 'config' | 'confirm' = 'node';
+    let step: 'kind' | 'runtime' | 'node' | 'entry' | 'config' | 'confirm' = 'kind';
     for (;;) {
+      // ---- 入口第一步：字节从哪来。两条路的配置完全不相交，先问清楚再收路径 ----
+      if (step === 'kind') {
+        const pick = await vscode.window.showQuickPick(
+          [
+            {
+              label: '用一个便携运行时目录（推荐）',
+              description:
+                '目录里带 runtime.json：node、入口、cordis.yml 全在里面，不需要 tsx，也不需要本地 DSH 检出',
+            },
+            {
+              label: '手工指定 node 与入口（开发者路径）',
+              description: cur.runtimeDir
+                ? '会清空 hello.dsh.runtimeDir（当前指向便携运行时），改按 node + 入口启动'
+                : '本地有一份构建好的 DSH 检出，按 node + 入口 + cordis.yml 启动',
+            },
+          ],
+          { placeHolder: 'DSH 运行时要跑哪一份字节？', title: 'DSH 运行路径配置' }
+        );
+        if (!pick) return;
+        if (pick.label.startsWith('用一个便携')) {
+          step = 'runtime';
+        } else {
+          // 手工路径与 runtimeDir 互斥（后者优先级更高）→ 选了手工就等于要清掉它
+          runtimeDir = '';
+          step = 'node';
+        }
+        continue;
+      }
+      if (step === 'runtime') {
+        const picked = await vscode.window.showOpenDialog({
+          canSelectFolders: true,
+          canSelectFiles: false,
+          canSelectMany: false,
+          openLabel: '选用该便携运行时目录',
+          title: '选择便携运行时目录（内含 runtime.json）',
+          defaultUri: runtimeDir && this._exists(runtimeDir) ? vscode.Uri.file(runtimeDir) : undefined,
+        });
+        if (!picked || picked.length === 0) return;
+        const dir = picked[0].fsPath;
+        const check = readRuntimeDir(dir);
+        if (!check.ok) {
+          // 留在这一步重选，不整段退出 —— 选错目录是常事，别让用户从头再来
+          vscode.window.showErrorMessage(`这个目录不能用作便携运行时 —— ${check.problem}`);
+          continue;
+        }
+        runtimeDir = dir;
+        step = 'confirm';
+        continue;
+      }
       if (step === 'node') {
         const p = await this._pickDshFile({
           title: '选择 DSH 运行用的 node 可执行文件',
@@ -964,25 +1065,56 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
 
       // ---- step === 'confirm' ----
-      const pick = await vscode.window.showQuickPick(
-        [
+      // 展示行刻意写成灰字；`enabled` 不是 QuickPickItem 的字段（API 里没有），
+      // 标了也不拦点击 —— 选中会落到末尾的兜底 return。保留只为标明"这行是给人看的"。
+      const rows: Array<vscode.QuickPickItem & { enabled?: boolean }> = [];
+      if (runtimeDir) {
+        // 便携运行时生效时，其余五项都不参与启动 —— 列出来只会让人以为改了有用
+        const portable = readRuntimeDir(runtimeDir);
+        if (portable.ok) {
+          rows.push(
+            { label: '当前生效：便携运行时', description: portable.dir, enabled: false },
+            { label: '  包内 node', description: `${portable.node}（${portable.manifest.nodeVersion ?? '版本未知'}）`, enabled: false },
+            { label: '  入口', description: portable.entry, enabled: false },
+            { label: '  配置文件', description: portable.config, enabled: false }
+          );
+        } else {
+          rows.push({ label: '当前生效：便携运行时（不可用）', description: portable.problem, enabled: false });
+        }
+      } else {
+        rows.push(
           { label: 'node', description: nodePath || '(未设置)', enabled: false },
           { label: '入口', description: entry || '(未设置)', enabled: false },
           { label: '工作目录', description: runCwd || '(未设置 → 回退工作区根)', enabled: false },
           { label: 'tsconfig', description: tsconfig || '(未设置)', enabled: false },
-          { label: '配置文件', description: config || '(未设置)', enabled: false },
-          { label: '保存并重启 live', description: '把以上值写入用户设置（hello.dsh.*），随后重启 DSH 子进程' },
+          { label: '配置文件', description: config || '(未设置)', enabled: false }
+        );
+      }
+      rows.push({ label: '保存并重启 live', description: '把以上值写入用户设置（hello.dsh.*），随后重启 DSH 子进程' });
+      if (runtimeDir) {
+        rows.push(
+          { label: '重新选择运行时目录', description: '' },
+          { label: '改用手工配置', description: '清空 hello.dsh.runtimeDir，回到 node + 入口 的开发者路径' }
+        );
+      } else {
+        rows.push(
+          { label: '改用一个便携运行时目录', description: '推荐：目录自带 node 与配置，不需要 tsx 与 DSH 检出' },
           { label: '重新选择 node 可执行文件', description: '' },
           { label: '重新选择入口脚本', description: '将按入口所在仓库自动推导其余路径' },
-          { label: '重新选择配置文件', description: '可选，缺省按入口自动推导' },
-          { label: '取消', description: '' },
-        ],
-        { placeHolder: '确认以上最终值（灰字为将写入的内容）', title: 'DSH 运行路径配置' }
-      );
+          { label: '重新选择配置文件', description: '可选，缺省按入口自动推导' }
+        );
+      }
+      rows.push({ label: '取消', description: '' });
+
+      const pick = await vscode.window.showQuickPick(rows, {
+        placeHolder: '确认以上最终值（灰字为将写入的内容）',
+        title: 'DSH 运行路径配置',
+      });
 
       if (!pick || pick.label === '取消') return;
       if (pick.label === '保存并重启 live') {
         const changed: Array<[string, string]> = [];
+        if (runtimeDir !== cur.runtimeDir) changed.push(['runtimeDir', runtimeDir]);
         if (nodePath !== cur.nodePath) changed.push(['nodePath', nodePath]);
         if (entry !== cur.entry) changed.push(['entry', entry]);
         if (runCwd !== cur.runCwd) changed.push(['runCwd', runCwd]);
@@ -1007,6 +1139,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           vscode.window.showInformationMessage('配置没有变化，未写入。');
         }
         return;
+      }
+      if (pick.label.startsWith('重新选择运行时')) {
+        step = 'runtime';
+        continue;
+      }
+      if (pick.label === '改用手工配置') {
+        runtimeDir = '';
+        step = 'node';
+        continue;
+      }
+      if (pick.label.startsWith('改用一个便携')) {
+        step = 'runtime';
+        continue;
       }
       if (pick.label.startsWith('重新选择 node')) {
         step = 'node';
@@ -1255,8 +1400,42 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return sec * 1000;
   }
 
+  /**
+   * 解析 `hello.dsh.runtimeDir`：读清单、把三个相对路径解析成绝对路径、逐个验存在。
+   * 每次现读（清单才几百字节）→ 改了设置即时生效，也免去失效缓存的坑。
+   */
+  private _runtime(): RuntimeResolution | undefined {
+    const raw = String(this._dshConfig().get('runtimeDir') ?? '').trim();
+    if (!raw) return undefined;
+    return readRuntimeDir(path.isAbsolute(raw) ? raw : path.resolve(this._dshCwd(), raw));
+  }
+
+  /**
+   * spawn 用的 node：便携运行时自带的优先（版本由清单保证），否则用户手工配的。
+   * 审批 hook 脚本也走这里 —— 否则便携场景下 hook 会落到 PATH 上的旧 node 上。
+   */
+  private _effectiveNodePath(): string {
+    const runtime = this._runtime();
+    if (runtime?.ok) return runtime.node;
+    return String(this._dshConfig().get('nodePath') ?? '').trim();
+  }
+
+  /**
+   * 入口要不要配 tsx loader。显式设了 `hello.dsh.loader` 就用它；否则按入口扩展名判断：
+   * `.ts/.tsx/.mts` 走 tsx/esm（兼容既有手工配置），打包好的 `.js`（便携运行时的
+   * packaged-bin.js）**不加任何 loader**。设置默认值因此是空串 —— 空 = 交给这条规则。
+   */
+  private _dshLoader(entry: string): string {
+    const explicit = String(this._dshConfig().get('loader') ?? '').trim();
+    if (explicit) return explicit;
+    return /\.(ts|tsx|mts)$/i.test(entry) ? 'tsx/esm' : '';
+  }
+
   /** 用户的基础 cordis.yml 绝对路径（相对路径按 runCwd 解析）；空串 = 没配 */
   private _baseConfigPathAbs(): string {
+    const runtime = this._runtime();
+    // 便携运行时：清单里的 config 就是基础配置 —— C1 的派生配置从这里派生出去
+    if (runtime) return runtime.ok ? runtime.config : '';
     const raw = String(this._dshConfig().get('config') ?? '').trim();
     if (!raw) return '';
     return path.isAbsolute(raw) ? raw : path.resolve(this._dshRunCwd(), raw);
@@ -1264,9 +1443,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** spawn 时真正下发的 cordis.yml：审批就绪 → 派生配置；否则用户原配置。 */
   private _effectiveConfigPath(): string {
-    return this._approvalFiles
-      ? this._approvalFiles.cordisPath
-      : String(this._dshConfig().get('config') ?? '').trim();
+    if (this._approvalFiles) return this._approvalFiles.cordisPath;
+    const runtime = this._runtime();
+    if (runtime) return runtime.ok ? runtime.config : '';
+    return String(this._dshConfig().get('config') ?? '').trim();
   }
 
   /**
@@ -1300,9 +1480,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._approvalWarn('hello.dsh.command 整段覆盖了启动命令，配置由该命令自带，审批无法接入。');
       return;
     }
-    const nodePath = String(conf.get('nodePath') ?? '').trim();
+    // 运行时目录坏了就别往下走：派生配置没有底本，再往下只会报出「未配置 hello.dsh.config」这种误导文案
+    const problem = this._dshConfigProblem();
+    if (problem) {
+      this._approvalWarn(`${problem} 审批无法接入。`);
+      return;
+    }
+    // 便携运行时自带的 node 优先 —— 否则便携场景下 hook 会落到 PATH 上的旧 node 上（静默降级）
+    const nodePath = this._effectiveNodePath();
     if (!nodePath) {
-      this._approvalWarn('未配置 hello.dsh.nodePath，hook 脚本没有可用的 node 来跑。');
+      this._approvalWarn('没有可用的 node（既没配便携运行时也没配 hello.dsh.nodePath），hook 脚本跑不起来。');
       return;
     }
 
@@ -1400,14 +1587,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return vscode.workspace.getConfiguration('hello.dsh');
   }
 
-  /** DSH 运行路径是否已配：nodePath 与 entry 都填了才算（与 _makeSpawnRequest 的 throw 条件同构）。
+  /** DSH 运行路径是否已配（与 _makeSpawnRequest 的 throw 条件同构）：
+   *  便携运行时目录合法 → 算配好；否则要求 nodePath 与 entry 都填。
    *  注：若用户走 hello.dsh.command 整段覆盖而 nodePath/entry 为空，这里会报「未配置」——可接受边缘，
-   *  因为配置条引导的就是 nodePath/entry 路径本身。 */
+   *  因为配置条引导的就是这两条路径本身。 */
   private _dshConfigured(): boolean {
+    const runtime = this._runtime();
+    if (runtime) return runtime.ok;
     const conf = this._dshConfig();
     const nodePath = String(conf.get('nodePath') ?? '').trim();
     const entry = String(conf.get('entry') ?? '').trim();
     return !!(nodePath && entry);
+  }
+
+  /** 配置有什么毛病时说给用户听的一句话（配置条/告警用）；没问题则返回空串。 */
+  private _dshConfigProblem(): string {
+    const runtime = this._runtime();
+    return runtime && !runtime.ok ? runtime.problem : '';
   }
 
   /** 路径存在判断（目录或文件都算）。 */
@@ -1480,8 +1676,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return folder ? folder.uri.fsPath : os.homedir();
   }
 
-  /** 子进程 spawn 的 cwd：保证 tsx / @deepseek-ai/* 能解析（默认 DSH 仓库根）。 */
+  /** 子进程 spawn 的 cwd：便携运行时 = 运行时目录本身；否则保证 tsx / @deepseek-ai/* 能解析（默认 DSH 仓库根）。 */
   private _dshRunCwd(): string {
+    const runtime = this._runtime();
+    if (runtime?.ok) return runtime.dir;
     const conf = this._dshConfig();
     return String(conf.get('runCwd') ?? '').trim() || this._dshCwd();
   }
@@ -1512,8 +1710,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const configFile = this._effectiveConfigPath();
     if (configFile) env.DSH_CORDIS_CONFIG = configFile;
 
+    // 便携运行时是打包好的纯 JS，不经过 tsx —— 别给它塞无意义的 tsconfig 环境变量
     const tsconfig = String(conf.get('tsconfig') ?? '').trim();
-    if (tsconfig) env.TSX_TSCONFIG_PATH = tsconfig;
+    if (tsconfig && !this._runtime()?.ok) env.TSX_TSCONFIG_PATH = tsconfig;
 
     // 会话落盘到 globalStorage（绝不落工作区 ./ 造成污染）
     const sessionRoot = path.join(this._storageDir, 'dsh-sessions');
@@ -1531,9 +1730,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * 组装 spawn 请求。支持两种模式：
+   * 组装 spawn 请求。三种模式，优先级从高到低：
    * - `hello.dsh.command` 非空 → 整段覆盖（command + args）；
-   * - 否则按 nodePath + --import loader + entry + config 拼（默认）。
+   * - `hello.dsh.runtimeDir` 指向一个合法的便携运行时 → 包内 node 跑纯 JS 入口（**不加 loader**）；
+   * - 否则按 nodePath + [--import loader] + entry + config 拼（开发者路径）。
    */
   private _makeSpawnRequest(): DshSpawnRequest {
     const conf = this._dshConfig();
@@ -1548,15 +1748,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         env,
       };
     }
+
+    const runtime = this._runtime();
+    if (runtime) {
+      // 指了运行时目录但不可用 → 报错。绝不退回 nodePath：那会让用户以为自己在跑便携包
+      if (!runtime.ok) throw new Error(runtime.problem);
+      return { command: runtime.node, args: [runtime.entry, runtime.config], cwd, env };
+    }
+
     const nodePath = String(conf.get('nodePath') ?? '').trim();
     const entry = String(conf.get('entry') ?? '').trim();
     if (!nodePath || !entry) {
-      throw new Error('DSH 未配置：请设置 hello.dsh.nodePath 与 hello.dsh.entry（或直接设 hello.dsh.command）。');
+      throw new Error('DSH 未配置：请设置 hello.dsh.runtimeDir（便携运行时），或 hello.dsh.nodePath + hello.dsh.entry，或直接设 hello.dsh.command。');
     }
-    const loader = String(conf.get('loader') ?? '').trim() || 'tsx/esm';
+    const loader = this._dshLoader(entry);
     const configFile = this._effectiveConfigPath();
-    const args = ['--import', loader];
-    if (entry) args.push(entry);
+    const args: string[] = [];
+    if (loader) args.push('--import', loader);
+    args.push(entry);
     if (configFile) args.push(configFile);
     return { command: nodePath, args, cwd, env };
   }

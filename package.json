@@ -58,22 +58,28 @@
       {
         "title": "Hello Chat · DeepSeek Harness",
         "properties": {
+        "hello.dsh.runtimeDir": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "**便携运行时目录（推荐）**：指向一个含 `runtime.json` 的目录（由 `scripts/build-runtime.mjs` 产出）。node、入口、cordis.yml 全从清单里解析，包内自带 node，**不需要 tsx、不需要 DSH 检出**。\n\n设了它就**优先于** `nodePath` / `loader` / `entry` / `config` / `runCwd`（`hello.dsh.command` 仍最高，整段覆盖）；目录不可用时会明确报错，**不会**悄悄回退到旧的 nodePath 配置。",
+          "scope": "machine"
+        },
         "hello.dsh.nodePath": {
           "type": "string",
           "default": "",
-          "markdownDescription": "启动 DSH JSON-RPC runtime 用的 node 可执行文件（留空会走提示引导，见 README「DSH 直播配置」）。",
+          "markdownDescription": "启动 DSH JSON-RPC runtime 用的 node 可执行文件。**开发者路径**：需要本地 DSH 检出，配 `entry` / `config` / `runCwd`。若已设 `hello.dsh.runtimeDir`，这一项不生效。（留空会走提示引导，见 README「DSH 直播配置」。）",
           "scope": "machine"
         },
         "hello.dsh.loader": {
           "type": "string",
-          "default": "tsx/esm",
-          "markdownDescription": "传给 `node --import` 的 tsx 加载器标识（与 DSH 仓库自身的启动脚本一致）。",
+          "default": "",
+          "markdownDescription": "传给 `node --import` 的加载器标识。**留空即按入口扩展名自动判断**：`.ts` / `.tsx` / `.mts` 走 `tsx/esm`，打包好的 `.js`（如便携运行时的入口）不加任何加载器。只有在自动判断不合用时才需要显式覆盖。",
           "scope": "machine"
         },
         "hello.dsh.entry": {
           "type": "string",
           "default": "",
-          "markdownDescription": "DSH jsonrpc-agent 的入口脚本（源码版，需配 tsx 加载；留空会走提示引导）。",
+          "markdownDescription": "DSH jsonrpc-agent 的入口脚本。**开发者路径**：源码版 `.ts` 需配 tsx 加载（留空会自动判断）；若已设 `hello.dsh.runtimeDir`，这一项不生效。",
           "scope": "machine"
         },
         "hello.dsh.config": {

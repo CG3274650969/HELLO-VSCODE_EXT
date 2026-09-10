@@ -36,7 +36,8 @@ real tool calls, real transcripts, rendered with DSH's own React conversation UI
 
 - **VS Code** (any recent version).
 - **Node.js** matching DSH's `engines`: `^22.19.0 || >=24.0.0` (a 24.x LTS works; see the bundled
-  example below).
+  example below). Only needed to *build* things — the [portable runtime](#portable-runtime-recommended)
+  ships its own node and needs none on your PATH.
 - **pnpm** ≥ 11 — DSH declares `packageManager: pnpm@11.7.0`. (This extension itself is plain npm.)
 
 ### 1. Get Node.js (bundled example)
@@ -90,15 +91,53 @@ The extension runs (as a child process):
 ### 4. Configure the extension (wizard-first)
 
 The recommended path needs **no hand-written settings**: open the panel, make sure you're on the
-**Harness** tab, and click **配置 DSH** in the bottom bar (same flow as the palette command
-`Hello Chat: 配置 DSH 运行路径`). The wizard asks:
+**Harness** tab, and click **配置 DSH** in the bottom bar (same path as the palette command
+`Hello Chat: 配置 DSH 运行路径`).
 
-1. **node 可执行文件** — pick your `node.exe`.
-2. **入口脚本** — pick `…\deepseek-harness\packages\examples\jsonrpc-demo\src\bin.ts`.
-   From the entry it derives `runCwd` (the DSH repo root it finds), `tsconfig.json` and
-   `examples/jsonrpc-agent/cordis.yml` automatically.
-3. **保存并重启 live** — writes the values into your **user** settings (`hello.dsh.*`,
-   `scope: machine` — never committed) and reconnects the live subprocess.
+**First question — where should the runtime bytes come from?**
+
+- **便携运行时目录（推荐）** — see [Portable runtime](#portable-runtime-recommended) below. Pick the
+  folder; node, entry and config all come from its `runtime.json`. No tsx, no DSH checkout.
+- **手工 node + 入口（developer path）** — pick your `node.exe`, then
+  `…\deepseek-harness\packages\examples\jsonrpc-demo\src\bin.ts`; the wizard derives `runCwd`
+  (the DSH repo root it finds), `tsconfig.json` and `examples/jsonrpc-agent/cordis.yml` for you.
+
+Either way, finish with **保存并重启 live** — it writes the values into your **user** settings
+(`hello.dsh.*`, `scope: machine` — never committed) and reconnects the live subprocess.
+
+#### Portable runtime (recommended)
+
+A *portable runtime* is a self-contained directory: a bundled `node`, a pre-built JSON-RPC entry,
+a default `cordis.yml`, and a `runtime.json` manifest describing them. Point
+`hello.dsh.runtimeDir` at it and the extension needs nothing else — **no tsx, no DSH checkout, no
+`node` on your PATH**.
+
+Windows has no downloadable DSH artifact today (`python/sdk-runtime/platforms.json` lists only
+linux/macos, and the exe builder calls *"Windows is a documented non-goal"*), so you build one once
+from a DSH checkout:
+
+```bash
+# --dsh <DSH checkout root>; --out defaults to dist-runtime/ (gitignored)
+node scripts/build-runtime.mjs --dsh D:\DSH\deepseek-harness \
+     --node D:\DSH\tools\node-v24.19.0-win-x64\node.exe
+```
+
+The script runs `pnpm deploy` against DSH's own SDK-runtime package, repairs the closure (restores
+legacy hoists, materializes every symlink — the tree must be relocatable), copies the portable node
+and [`runtime/cordis.default.yml`](runtime/cordis.default.yml) in, writes `runtime.json`, and
+finishes with a bare smoke test. Then verify a runtime directory at any time, without VS Code:
+
+```bash
+node scripts/smoke-runtime.mjs --runtime dist-runtime   # sends one `initialize`, needs no API key
+```
+
+The bundled `cordis.yml` is **ours**, not upstream's minimal `runtime/cordis.yml` — the upstream one
+omits `dsh-tool-fs` and would leave the agent without `read`/`write`/`edit`.
+
+> ⚠️ **Known risk**: upstream positions the `packaged-bin.js` node carrier as dev-only and excludes
+> it from distributions. This route is therefore not upstream-endorsed; our own build + smoke test is
+> what backs it. Swapping the supplier later (an upstream Windows artifact, an internal package)
+> only changes where the directory comes from.
 
 Then set the API key once: click **API** in the bottom bar to store it in VS Code SecretStorage.
 The key only ever goes into the child process env — never into settings, logs or the transcript.
@@ -119,9 +158,10 @@ All keys live under `hello.dsh` and are `scope: machine` (read from user setting
 
 | Setting | Default | Purpose |
 |---|---|---|
-| `hello.dsh.nodePath` | `""` | `node.exe` used to launch the runtime (must satisfy DSH `engines`). Empty ⇒ treated as unconfigured. |
-| `hello.dsh.loader` | `"tsx/esm"` | tsx loader id passed to `node --import`. |
-| `hello.dsh.entry` | `""` | The jsonrpc-agent entry script (source `.ts`, run under tsx). Empty ⇒ treated as unconfigured. |
+| `hello.dsh.runtimeDir` | `""` | **Portable runtime (recommended).** A directory containing `runtime.json`. Takes precedence over `nodePath`/`loader`/`entry`/`config`/`runCwd`; an unusable directory is reported as an error rather than silently falling back. |
+| `hello.dsh.nodePath` | `""` | *Developer path.* `node.exe` used to launch the runtime (must satisfy DSH `engines`). Ignored when `runtimeDir` is set. |
+| `hello.dsh.loader` | `""` | Loader id passed to `node --import`. **Empty ⇒ inferred from the entry's extension**: `.ts`/`.tsx`/`.mts` ⇒ `tsx/esm`, anything else (a pre-built `.js`) ⇒ no loader at all. |
+| `hello.dsh.entry` | `""` | *Developer path.* The jsonrpc-agent entry script. Ignored when `runtimeDir` is set. |
 | `hello.dsh.config` | `""` | Runtime deploy config (`cordis.yml`) path. |
 | `hello.dsh.runCwd` | `""` | Subprocess working directory so `tsx`/`@deepseek-ai/*` resolve. Falls back to the open workspace root. |
 | `hello.dsh.tsconfig` | `""` | Sets `TSX_TSCONFIG_PATH` for tsx. |
@@ -132,7 +172,15 @@ All keys live under `hello.dsh` and are `scope: machine` (read from user setting
 | `hello.dsh.args` | `[]` | Extra arguments when `command` is used. |
 | `hello.dsh.debug` | `false` | Stream child stderr / ignored JSON-RPC notifications to the Output panel (never secrets). |
 
-A worked example (`settings.json`, **do not commit**):
+A worked example (`settings.json`, **do not commit**) — portable runtime:
+
+```jsonc
+{
+  "hello.dsh.runtimeDir": "D:\\hello-vscode-ext\\dist-runtime"
+}
+```
+
+…or the developer path:
 
 ```jsonc
 {
