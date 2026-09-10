@@ -1053,6 +1053,58 @@ body.react-live #empty-hint {
   display: none !important;
 }
 
+/* ---------- C1 事前审批确认条（破坏性 bash 命令执行前） ---------- */
+/* 同审阅条：挂 composer 内、消息区之上；这里是"拦停"，所以给足空间看清命令原文。 */
+.approval-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--dsw-alias-border-l2, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.25)));
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-1, var(--vscode-editor-inactiveSelectionBackground, rgba(128, 128, 128, 0.12)));
+}
+.approval-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.approval-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
+}
+.approval-tool {
+  font-size: 11px;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+}
+/* 命令原文：等宽 + 限高滚动（长命令也不把侧栏撑爆），换行/折词保证全文可读 */
+.approval-cmd {
+  margin: 0;
+  max-height: 96px;
+  overflow: auto;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.15));
+  color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.approval-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  justify-content: flex-end;
+}
+.approval-hint {
+  margin-right: auto;
+  font-size: 11px;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+}
+
 /* ---------- 2.1 本轮改动审阅条 + 面板浮层（Keep/Revert） ---------- */
 /* 审阅条：挂在 composer 内（消息区之下、输入框之上）；react-live 只藏 #messages，故两态都可见。
    收敛成一颗软卡片（弱底 + 圆角），不再用虚线横线切分——composer 组只留顶一条发丝线。 */

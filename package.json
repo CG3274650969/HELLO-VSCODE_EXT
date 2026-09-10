@@ -147,6 +147,38 @@
             "default": true,
             "markdownDescription": "每轮 Harness 结束后对比工作区根的文件改动并显示审阅条（增/改/删，可展开行级 diff，可单文件或全部保留/还原）。需打开工作区文件夹；二进制/超大文件只列出、不预览也不可还原。\n\nAfter each Harness turn, diff file changes under the workspace root and show a review bar (added/modified/deleted with inline diffs; keep or revert per file or all). Requires an open workspace folder; binary/oversized files are listed but not previewable or revertible.",
             "scope": "window"
+          },
+          "hello.chat.approval.enabled": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "**事前审批**（**默认开启**）：命中下方策略的命令在**执行前**弹确认条，整轮暂停等你点「允许执行 / 拒绝」；拒绝则该命令不会执行，转写里留一条记录。实现方式是在 DSH 组合配置里挂一条 `PreToolUse` hook（派生配置写在扩展存储目录，不改动你的 cordis.yml）。不需要这道护栏就把这里关掉。\n\n改这个开关后需重连（切模型或重载窗口）才生效；`patterns` / `timeoutSec` 改动即时生效。若 `hello.dsh.command` 整段覆盖了启动命令，则此功能不可用（会提示）。\n\n**Pre-execution approval** (on by default): matching commands raise a confirm bar before running and pause the turn until you choose. Requires a reconnect after toggling. Unavailable when `hello.dsh.command` overrides the launch command.",
+            "scope": "window"
+          },
+          "hello.chat.approval.patterns": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": [
+              "\\brm\\b",
+              "\\brmdir\\b",
+              "\\bmkfs(\\.|\\s|$)",
+              "\\bdd\\b[^|]*\\bof=",
+              "\\bdiskpart\\b",
+              "\\bformat\\s+[A-Za-z]:",
+              "\\bgit\\s+push\\b[^|]*--force",
+              "\\bgit\\s+reset\\s+--hard\\b",
+              "\\b(shutdown|reboot|poweroff)\\b",
+              ":\\s*\\(\\s*\\)\\s*\\{"
+            ],
+            "markdownDescription": "命中任意一条（不区分大小写的正则）即弹确认条。默认是一份保守清单：任何 `rm`（含 `rm <文件>`）、`rmdir`、`mkfs`、`dd of=`、`diskpart`、`format X:`、`git push --force`、`git reset --hard`、关机类、fork bomb。改这里即时生效。非法正则会跳过该条（不会变成「拒绝一切」）。\n\nRegular expressions (case-insensitive); a match triggers the confirm bar. Empty/invalid entries are skipped.",
+            "scope": "window"
+          },
+          "hello.chat.approval.timeoutSec": {
+            "type": "number",
+            "default": 540,
+            "minimum": 10,
+            "maximum": 1800,
+            "markdownDescription": "等你确认的秒数；超时按**拒绝**处理（命令不执行）。默认 540 秒，与 hook 超时形成梯度，保证是扩展先放弃而不是进程被砍在半路。\n\nSeconds to wait before denying by timeout (default 540).",
+            "scope": "window"
           }
         }
       }

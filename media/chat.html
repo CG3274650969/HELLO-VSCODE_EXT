@@ -66,6 +66,21 @@
        data-nonce="%%NONCE%%"></div>
 
   <footer class="composer">
+    <!-- C1 事前审批确认条：破坏性 bash 命令执行前拦在这里 —— DSH 的 PreToolUse hook 正
+         阻塞着整轮等这个答复。同 review-bar 挂在 composer 内 → react-live 只藏 #messages，
+         两种画面都看得见。命令原文由 chat.js 用 textContent 落进 <pre>（绝不拼 HTML）。 -->
+    <div id="approval-bar" class="approval-bar" hidden>
+      <div class="approval-head">
+        <span class="approval-title">需要确认</span>
+        <span id="approval-tool" class="approval-tool"></span>
+      </div>
+      <pre id="approval-cmd" class="approval-cmd"></pre>
+      <div class="approval-actions">
+        <span class="approval-hint">Esc 拒绝</span>
+        <button id="approval-deny" class="button button-secondary" type="button">拒绝</button>
+        <button id="approval-allow" class="button button-primary" type="button">允许执行</button>
+      </div>
+    </div>
     <!-- 2.1 本轮 DSH 改动审阅条：消息区下方、输入框上方。react-live 只藏 #messages，
          挂在 composer 内部 → 两种画面都可见。由扩展 review-set / review-clear 驱动。 -->
     <div id="review-bar" class="review-bar" hidden>

@@ -142,7 +142,15 @@ export type ExtToWebview =
   /** 2.1：本轮 DSH 改动审阅（一轮 done 后推送整份；新一轮开始时清空/隐藏） */
   | { type: 'review-set'; changes: ReviewChange[] }
   /** 2.1：清空并隐藏审阅条与面板（新一轮开始 / 模式切换 / 全部处理完） */
-  | { type: 'review-clear' };
+  | { type: 'review-clear' }
+  // --- C1 事前审批：破坏性 bash 命令在执行前弹确认条（DSH hook 阻塞整轮等用户） ---
+  /** 有命令待确认：webview 弹确认条（挂在 composer 内，react-live 下也可见） */
+  | { type: 'approval-request'; id: string; toolName: string; command: string }
+  /** 这条审批有结果了：收起确认条（允许/拒绝/超时/取消） */
+  | { type: 'approval-resolved'; id: string; outcome: ApprovalOutcome };
+
+/** C1 一条审批的最终去向（与 src/approvalServer.ts 的 ApprovalOutcome 同构） */
+export type ApprovalOutcome = 'allowed' | 'rejected' | 'timeout' | 'cancelled';
 
 /** webview → 扩展 */
 export type WebviewToExt =
@@ -167,4 +175,6 @@ export type WebviewToExt =
   | { type: 'review-revert-all' }
   // 「在新对话中分支」：真 DSH ChatView 轮尾动作栏的分支按钮点击（无参数；MVP 固定
   // fork 整份当前会话 → 新会话保留全部转写并切换过去，记忆沿用源 DSH 会话）。
-  | { type: 'fork-session' };
+  | { type: 'fork-session' }
+  /** C1：用户在确认条上拍了板（allow=true 允许执行；对失效的 id 扩展会静默忽略） */
+  | { type: 'approval-answer'; id: string; allow: boolean };

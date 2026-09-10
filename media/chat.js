@@ -70,6 +70,14 @@
   var reviewPanelRevertAll = document.getElementById('review-panel-revert-all');
   var reviewChanges = []; // 扩展 review-set 下发的审阅项（扁平 DTO）
   var reviewPanelOpen = false; // 面板当前是否展开
+
+  // C1 事前审批：待确认的那条（id 非空 = 确认条亮着，整轮正阻塞等这一答）
+  var approvalBar = document.getElementById('approval-bar');
+  var approvalCmd = document.getElementById('approval-cmd');
+  var approvalTool = document.getElementById('approval-tool');
+  var approvalAllowBtn = document.getElementById('approval-allow');
+  var approvalDenyBtn = document.getElementById('approval-deny');
+  var approvalId = null;
   var expandedRel = null; // 当前展开 diff 的文件（同刻只开一行）
 
   // 顶部模式：chat（内嵌聊天）/ harness（Agent）。两种模式各一套草稿与待发附件，互不串。
@@ -192,6 +200,36 @@
     if (!window.MutationObserver) return;
     var mo = new MutationObserver(applyDshTheme);
     mo.observe(document.body, { attributes: true, attributeFilter: ['class'] });
+  }
+
+  // ---------- C1 事前审批确认条（approval-request / approval-resolved 驱动） ----------
+
+  /** 弹确认条。命令原文只用 textContent 落进 <pre>（多行/特殊字符都安全）。 */
+  function renderApproval(data) {
+    approvalId = data.id;
+    approvalTool.textContent = data.toolName ? '（' + data.toolName + '）' : '';
+    approvalCmd.textContent = data.command || '';
+    approvalBar.hidden = false;
+    scrollToBottom();
+  }
+
+  /** 收起确认条并复位（不清 approvalId 的调用方自己负责，见 answerApproval）。 */
+  function clearApproval() {
+    approvalId = null;
+    approvalBar.hidden = true;
+    approvalCmd.textContent = '';
+    approvalTool.textContent = '';
+  }
+
+  /**
+   * 用户在确认条上拍板。先收起再回话：按钮立即失效，避免连点发出两条答复
+   * （扩展侧对失效 id 也会静默忽略，两头都不怕重复）。
+   */
+  function answerApproval(allow) {
+    if (!approvalId) return;
+    var id = approvalId;
+    clearApproval();
+    post({ type: 'approval-answer', id: id, allow: !!allow });
   }
 
   // ---------- 2.1 本轮改动审阅 UI（review-set / review-clear 驱动） ----------
@@ -1487,6 +1525,14 @@
       atBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 40;
     });
 
+    // ---- C1 事前审批确认条 ----
+    approvalAllowBtn.addEventListener('click', function () {
+      answerApproval(true);
+    });
+    approvalDenyBtn.addEventListener('click', function () {
+      answerApproval(false);
+    });
+
     // ---- 2.1 改动审阅：审阅条 / 浮层面板 ----
     reviewViewBtn.addEventListener('click', function () {
       if (reviewPanelOpen) closeReviewPanel();
@@ -1511,6 +1557,10 @@
     // 各自处理并回焦，全局监听不抢（否则会二次触发）。
     document.addEventListener('keydown', function (e) {
       if (e.key !== 'Escape') return;
+      if (approvalId) { // C1：有待确认时 Esc = 拒绝（最紧急，且不受焦点在哪影响）
+        answerApproval(false);
+        return;
+      }
       if (e.target === chatTitleInput || e.target === historySearch || e.target === liveModelInput) return;
       if (liveModelMenu.classList.contains('open')) { // 模型菜单开着 → 先收它
         closeModelMenu();
@@ -1710,6 +1760,16 @@
         // 新轮开始 / 审阅已清空 → 隐藏审阅条并收起浮层
         reviewChanges = [];
         renderReviewBar();
+        break;
+
+      case 'approval-request':
+        // C1：破坏性命令待确认 —— agent 整轮正阻塞在这个答复上
+        renderApproval(data);
+        break;
+
+      case 'approval-resolved':
+        // C1：允许/拒绝/超时/取消 → 收起确认条（id 对不上说明是迟到帧，别误关新的那条）
+        if (approvalId === data.id) clearApproval();
         break;
     }
   }

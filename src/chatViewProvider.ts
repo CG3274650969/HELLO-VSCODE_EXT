@@ -14,6 +14,8 @@ import {
   SessionSummary,
   WebviewToExt,
 } from './protocol';
+import { ApprovalAsk, ApprovalOutcome, ApprovalServer } from './approvalServer';
+import { ApprovalHookFiles, probeShell, testApprovalHook, writeApprovalHookFiles } from './dshHooks';
 import { isAbortError, streamMockReply } from './mockAssistant';
 import { SessionStore, StoredSession, titleFromText } from './sessionStore';
 import {
@@ -55,6 +57,35 @@ const LIVE_MODEL_KEY = 'hello.harness.liveModel';
 
 /** 配置条"模型"下拉的预设型号（选了不在列的可用"自定义…"输入任意 id） */
 const PRESET_MODELS = ['deepseek-v4-flash', 'deepseek-chat', 'deepseek-reasoner'];
+
+/**
+ * C1 事前审批的默认策略（正则，命中即需用户确认）。保守清单：删/格盘/强推/关机这类
+ * 一旦执行就很难看回来的命令。与 package.json 里 hello.chat.approval.patterns 的默认值一致。
+ */
+const DEFAULT_APPROVAL_PATTERNS = [
+  '\\brm\\b', // 任何 rm（rm -rf / rm -f / rm <文件> 都算；`git rm`、`docker rm` 也一并拦）
+  '\\brmdir\\b',
+  '\\bmkfs(\\.|\\s|$)',
+  '\\bdd\\b[^|]*\\bof=',
+  '\\bdiskpart\\b',
+  '\\bformat\\s+[A-Za-z]:',
+  '\\bgit\\s+push\\b[^|]*--force',
+  '\\bgit\\s+reset\\s+--hard\\b',
+  '\\b(shutdown|reboot|poweroff)\\b',
+  ':\\s*\\(\\s*\\)\\s*\\{', // fork bomb
+];
+
+/** 用户等待上限（秒）的默认值；与 hook 超时形成 540 < 560 < 580 的梯度 */
+const DEFAULT_APPROVAL_TIMEOUT_SEC = 540;
+/** 等待上限的可用区间（秒）：下限防误设成 0 变成"永远拒绝"，上限别把侧栏挂太久 */
+const APPROVAL_TIMEOUT_MIN_SEC = 10;
+const APPROVAL_TIMEOUT_MAX_SEC = 1800;
+
+/** 把可能多行的命令压成一行短摘要（确认条/状态栏/留痕用；换行会撑坏单行布局）。 */
+function oneLine(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  return flat.length > max ? flat.slice(0, max) + '…' : flat;
+}
 
 /** 单条工具输出在转写里最多展示的字符数（超出截断 + 提示） */
 const MAX_TOOL_OUTPUT_CHARS = 4000;
@@ -164,6 +195,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** 已算出、尚未被 keep/revert 处理的改动（rich 版，动作处理与还原用） */
   private _pendingReview: TreeChange[] = [];
 
+  // ---------- C1 事前审批（破坏性 bash 命令确认条）状态 ----------
+
+  /** 本机审批服务（引用非空 = 功能在跑） */
+  private _approval?: ApprovalServer;
+  /** 已生成并生效的 hook 三件套（引用非空 = spawn 时改用派生配置） */
+  private _approvalFiles?: ApprovalHookFiles;
+  /** 进行中的准备（幂等：并发调用共享同一个 promise） */
+  private _approvalSetup?: Promise<void>;
+  /** 挂起审批的命令原文（id → 命令），结算时写留痕用 */
+  private readonly _approvalCmds = new Map<string, string>();
+  /** 审批相关告警是否已弹过（每次 activation 最多烦用户一次） */
+  private _approvalWarned = false;
+  /** 与视图无关的订阅（全局配置变更监听），dispose 时统一清 */
+  private readonly _globalDisposables: vscode.Disposable[] = [];
+
   constructor(
     private readonly _extensionUri: vscode.Uri,
     storageDir: string,
@@ -186,6 +232,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       chat: this._stores.chat.create(),
       harness: this._stores.harness.create(),
     };
+
+    // C1：审批开关翻转 → 重建审批服务/派生配置，并重连让子进程带上（策略正则是每次现读，改策略即时生效）
+    this._globalDisposables.push(
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (!e.affectsConfiguration('hello.chat.approval')) return;
+        if (this._abort || this._liveRunning) return; // 跑着的时候不动，下次连接自然带上
+        void this._ensureApproval().then(() => this._restartLiveProcess());
+      })
+    );
   }
 
   /** 当前模式的存储（getter：把"当前模式"映射到对应 workspace） */
@@ -253,8 +308,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // 杀掉常驻的 DSH 子进程（kill 内部置 dead，缓冲中迟到的行不再分发）
     this._dsh?.kill();
     this._dsh = undefined;
+    this._approval?.dispose(); // C1：关掉本机审批服务，挂起的按取消结算
+    this._approval = undefined;
     this._dropReview(false); // 清掉本轮审阅内存（视图已销毁，不必再发 clear）
     this._disposeViewListeners();
+    for (const d of this._globalDisposables) d.dispose();
+    this._globalDisposables.length = 0;
     this._view = undefined;
   }
 
@@ -308,7 +367,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         void this._pickFiles();
         break;
       case 'stop':
+        // C1：本轮被停 → 挂起的审批立刻按取消结算（否则 hook 进程会一直等答复）
+        this._approval?.cancelAll();
         this._abort?.abort();
+        break;
+      case 'approval-answer':
+        // C1：确认条上的允许/拒绝；对已失效的 id 静默忽略（超时/已答过）
+        this._approval?.answer(msg.id, msg.allow);
         break;
       case 'clear':
         this.startNewSession();
@@ -618,6 +683,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** 本轮收尾（done：正常 idle / interrupted：被停止）。幂等。 */
   private _finishTurn(outcome: 'done' | 'interrupted'): void {
     if (!this._liveRunning) return;
+    // C1：本轮收尾时不该还留着待确认（正常路径下 hook 阻塞期间 idle 不会到达，这里是兜底）
+    this._approval?.cancelAll();
     if (outcome === 'done') {
       this._turnNormalDone = true; // 2.1：正常走完 → finally 里排异步改动对比
     }
@@ -737,6 +804,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _teardownLive(): void {
     this._dsh?.kill();
     this._dsh = undefined;
+    this._approval?.cancelAll(); // C1：子进程一杀，hook 连接就断了；先把挂起的收干净
     this._connectPromise = undefined;
     this._dshSessions.clear();
     this._currentDshId = undefined;
@@ -985,6 +1053,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     } catch {
       /* key 解析失败不阻断握手：让子进程侧（llm-deepseek）报更具体的错 */
     }
+    // C1：审批必须在 spawn **之前**就绪 —— _makeSpawnRequest 是同步的，它读的就是
+    // _approvalFiles（派生配置路径）。准备失败会在内部告警并降级，不阻断连接。
+    await this._ensureApproval();
     let runtime: DshRuntime;
     try {
       runtime = this._getRuntime();
@@ -1157,6 +1228,172 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  // ---------- C1 事前审批：本机审批服务 + DSH hook 三件套 ----------
+
+  /** 审批开关（hello.chat.approval.enabled，**默认开** —— 破坏性命令执行前来一道确认） */
+  private _approvalEnabled(): boolean {
+    return (
+      vscode.workspace.getConfiguration('hello.chat').get<boolean>('approval.enabled', true) === true
+    );
+  }
+
+  /** 当前策略正则（每次现读 → 改设置即时生效，不必重连） */
+  private _approvalPatterns(): string[] {
+    const raw = vscode.workspace
+      .getConfiguration('hello.chat')
+      .get<string[]>('approval.patterns', DEFAULT_APPROVAL_PATTERNS);
+    return Array.isArray(raw) ? raw : DEFAULT_APPROVAL_PATTERNS;
+  }
+
+  /** 用户等待上限（毫秒，已按可用区间收敛） */
+  private _approvalTimeoutMs(): number {
+    const raw = vscode.workspace
+      .getConfiguration('hello.chat')
+      .get<number>('approval.timeoutSec', DEFAULT_APPROVAL_TIMEOUT_SEC);
+    const rawSec = Number.isFinite(raw) ? Math.round(raw) : DEFAULT_APPROVAL_TIMEOUT_SEC;
+    const sec = Math.min(Math.max(rawSec, APPROVAL_TIMEOUT_MIN_SEC), APPROVAL_TIMEOUT_MAX_SEC);
+    return sec * 1000;
+  }
+
+  /** 用户的基础 cordis.yml 绝对路径（相对路径按 runCwd 解析）；空串 = 没配 */
+  private _baseConfigPathAbs(): string {
+    const raw = String(this._dshConfig().get('config') ?? '').trim();
+    if (!raw) return '';
+    return path.isAbsolute(raw) ? raw : path.resolve(this._dshRunCwd(), raw);
+  }
+
+  /** spawn 时真正下发的 cordis.yml：审批就绪 → 派生配置；否则用户原配置。 */
+  private _effectiveConfigPath(): string {
+    return this._approvalFiles
+      ? this._approvalFiles.cordisPath
+      : String(this._dshConfig().get('config') ?? '').trim();
+  }
+
+  /**
+   * 确保审批就绪（幂等）。开关关着 → 顺手拆掉服务与派生配置（下次 spawn 回到用户原配置）。
+   * 任何一步失败都只降级 + 告警：审批不生效，但插件照常能用。
+   */
+  private _ensureApproval(): Promise<void> {
+    if (!this._approvalEnabled()) {
+      if (this._approval) {
+        this._approval.dispose();
+        this._approval = undefined;
+      }
+      this._approvalFiles = undefined;
+      return Promise.resolve();
+    }
+    if (this._approval && this._approvalFiles) return Promise.resolve();
+    if (this._approvalSetup) return this._approvalSetup;
+    const p = this._setupApproval();
+    this._approvalSetup = p;
+    const clear = (): void => {
+      if (this._approvalSetup === p) this._approvalSetup = undefined;
+    };
+    p.then(clear, clear);
+    return p;
+  }
+
+  private async _setupApproval(): Promise<void> {
+    const conf = this._dshConfig();
+    // 整段覆盖启动命令时，config 写死在 args 里，我们无从替换 → 明确不启用（并说清原因）
+    if (String(conf.get('command') ?? '').trim()) {
+      this._approvalWarn('hello.dsh.command 整段覆盖了启动命令，配置由该命令自带，审批无法接入。');
+      return;
+    }
+    const nodePath = String(conf.get('nodePath') ?? '').trim();
+    if (!nodePath) {
+      this._approvalWarn('未配置 hello.dsh.nodePath，hook 脚本没有可用的 node 来跑。');
+      return;
+    }
+
+    const server = new ApprovalServer(
+      () => this._approvalPatterns(),
+      () => this._approvalTimeoutMs(),
+      (ask) => this._onApprovalAsk(ask),
+      (id, outcome) => this._onApprovalResolved(id, outcome)
+    );
+    try {
+      await server.start();
+    } catch (err) {
+      this._approvalWarn(`审批服务启动失败：${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+
+    // hook 由 DSH 用 `bash -c` 跑，而 bash 可能是 WSL 也可能是 Git Bash —— 路径形态完全不同，
+    // 必须先探出来（同一台机器上两种都见过）。
+    const runCwd = this._dshRunCwd();
+    const shellKind = await probeShell(runCwd);
+
+    try {
+      const timeoutMs = this._approvalTimeoutMs();
+      const files = writeApprovalHookFiles({
+        storageDir: this._storageDir,
+        nodePath,
+        shellKind,
+        url: server.url,
+        token: server.token,
+        // 三层超时梯度：扩展先放弃并拒绝(540) < 脚本 socket 放弃(560) < DSH 杀 hook(580)
+        scriptTimeoutMs: timeoutMs + 20000,
+        hookTimeoutSec: Math.ceil((timeoutMs + 40000) / 1000),
+        baseConfigPath: this._baseConfigPathAbs(),
+      });
+      this._approval = server;
+      this._approvalFiles = files;
+    } catch (err) {
+      server.dispose();
+      this._approvalWarn(`审批 hook 生成失败：${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+
+    // 自检：这条 hook 命令在**同一个 shell**（DSH 也是 bash -c）里跑得起来吗？
+    // 起不来 = 审批不会生效 —— 这种情况必须让用户知道，而不是看起来配好了。
+    const test = await testApprovalHook(this._approvalFiles.hookCommand, runCwd);
+    if (test.ok) {
+      console.log(`[approval] 事前审批已就绪（shell=${shellKind}，hook 自检通过）`);
+    } else {
+      this._approvalWarn(`审批 hook 自检未通过，审批不会生效：${test.detail}`);
+    }
+  }
+
+  /** 需要用户拍板：推确认条 + 把侧栏亮出来（视图折叠着就看不见确认条，只能干等到超时）。 */
+  private _onApprovalAsk(ask: ApprovalAsk): void {
+    this._approvalCmds.set(ask.id, ask.command);
+    this._post({
+      type: 'approval-request',
+      id: ask.id,
+      toolName: ask.toolName,
+      command: ask.command,
+    });
+    // 视图折叠着就看不到确认条，只能干等到超时 → 主动把它亮出来（失败也不影响流程）
+    vscode.commands.executeCommand('hello.chatView.focus').then(undefined, () => {});
+    vscode.window.setStatusBarMessage(`等待确认：${oneLine(ask.command, 60)}`, 5000);
+  }
+
+  /** 一条审批有了结果：收起确认条 + 往转写补一条留痕（note 随会话持久化/回放）。 */
+  private _onApprovalResolved(id: string, outcome: ApprovalOutcome): void {
+    const command = this._approvalCmds.get(id);
+    this._approvalCmds.delete(id);
+    this._post({ type: 'approval-resolved', id, outcome });
+    if (!command) return;
+    const label =
+      outcome === 'allowed'
+        ? '已允许执行'
+        : outcome === 'rejected'
+          ? '已拒绝，未执行'
+          : outcome === 'timeout'
+            ? '确认超时，已按拒绝处理（未执行）'
+            : '审批已取消（本轮停止或切换），未执行';
+    this._pushNote(`${label}：${oneLine(command, 120)}`);
+  }
+
+  /** 审批相关告警：控制台始终留痕，用户侧每次 activation 只弹一次（不刷屏）。 */
+  private _approvalWarn(text: string): void {
+    console.warn('[approval]', text);
+    if (this._approvalWarned) return;
+    this._approvalWarned = true;
+    void vscode.window.showWarningMessage(`事前审批未生效：${text}`);
+  }
+
   // ----- 配置 / 子进程构建（全部来自 hello.dsh.*，可被用户覆盖） -----
 
   private _dshConfig(): vscode.WorkspaceConfiguration {
@@ -1271,7 +1508,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const conf = this._dshConfig();
     const env: NodeJS.ProcessEnv = { ...process.env };
 
-    const configFile = String(conf.get('config') ?? '').trim();
+    // C1：审批就绪时这里下发的是"派生配置"（用户原文 + hooks 插件块），否则就是用户原配置
+    const configFile = this._effectiveConfigPath();
     if (configFile) env.DSH_CORDIS_CONFIG = configFile;
 
     const tsconfig = String(conf.get('tsconfig') ?? '').trim();
@@ -1316,7 +1554,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       throw new Error('DSH 未配置：请设置 hello.dsh.nodePath 与 hello.dsh.entry（或直接设 hello.dsh.command）。');
     }
     const loader = String(conf.get('loader') ?? '').trim() || 'tsx/esm';
-    const configFile = String(conf.get('config') ?? '').trim();
+    const configFile = this._effectiveConfigPath();
     const args = ['--import', loader];
     if (entry) args.push(entry);
     if (configFile) args.push(configFile);
@@ -1534,6 +1772,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** 安全中止当前正在跑的流/整轮：半截助手消息标 interrupted，running 工具卡落 error。 */
   private _cancelActiveRun(): void {
+    // C1：切会话/切模式/新建对话都会走到这里，挂起的审批一律取消（放到早返回之前，宁可多清）
+    this._approval?.cancelAll();
     const ctrl = this._abort;
     if (!ctrl) return;
     const msg = this._runningMsg;
@@ -1920,9 +2160,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         ok.length === 1
           ? `已还原本轮 DSH 改动：${ok[0].rel}`
           : `已还原本轮 DSH 改动：${ok.length} 个文件成功`;
-      this._pushReviewNote(
-        failed.length > 0 ? `${summary}；${failed.length} 个未还原` : summary
-      );
+      this._pushNote(failed.length > 0 ? `${summary}；${failed.length} 个未还原` : summary);
     }
     if (failed.length > 0) {
       vscode.window.showErrorMessage(
@@ -1933,8 +2171,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     else this._postReviewSet();
   }
 
-  /** 把一条 role:'note' 说明入列当前会话并下发（还原反馈；react-live 态仅在转录持久化可见）。 */
-  private _pushReviewNote(text: string): void {
+  /** 把一条 role:'note' 说明入列当前会话并下发（还原反馈/审批留痕；react-live 态仅在转录持久化可见）。 */
+  private _pushNote(text: string): void {
     const note: ChatMessage = {
       id: this._nextMsgId(),
       role: 'note',
