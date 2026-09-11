@@ -89,15 +89,45 @@ export interface DiffLine {
 /** 审阅列表里单个文件的改动项。diff 缺省 = 该文件不可预览（二进制/过大）。 */
 export interface ReviewChange {
   kind: FileChangeKind;
-  /** 工作区根下的相对路径（`/` 分隔）；也是动作消息回指的 key，绝对路径不出进程 */
+  /** 动作主键：Keep/Revert 回指哪一项。**不能用 rel 当主键** —— C4 之后列表可能跨多个根，
+   *  不同目录下可以有同名 rel（两个 `note.txt`）。 */
+  id: string;
+  /** 所在根的相对路径（`/` 分隔）；工作区内项目即工作区根相对路径，绝对路径不出进程 */
   rel: string;
   /** 仅展示用（basename） */
   name: string;
+  /** C4：该项在工作区**外**时，这里是它的绝对目录（仅供展示；工作区内项缺省）。
+   *  webview 需另起元素渲染，别并入 name —— 长路径的尾巴才是最该看见的部分。 */
+  outside?: string;
   /** false（二进制/超大）→ webview 应禁用「还原」按钮 */
   reversible: boolean;
   diff?: DiffLine[];
   /** 行数或跨文件总量超护栏，diff 已被裁掉 */
   diffTruncated?: boolean;
+}
+
+// --- C3a 用量读数：每轮/每会话 token + 上下文占用率（不算钱，见 docs/backlog.md） ---
+
+/**
+ * 一份用量计数。**口径照 DSH 的 TokenUsage：三项互斥、不可叠加**——
+ * `inputTokens` 是**未命中**输入，缓存命中单列在 `cacheReadTokens`；计价输入 = 两者之和
+ * （DSH 另有 cacheWriteTokens，DeepSeek 不报，故不收）。
+ * 注意 **`outputTokens` 已含 reasoningTokens**（适配器取的就是 completion_tokens），别再叠加。
+ */
+export interface UsageBuckets {
+  inputTokens: number;
+  cacheReadTokens: number;
+  outputTokens: number;
+}
+
+/** 用量读数：扩展算好（含去重与累计），webview 只负责渲染。 */
+export interface UsageReadout {
+  /** 本轮（当前这一轮；无样本时三项皆 0） */
+  turn: UsageBuckets;
+  /** 本会话累计（跨轮、跨重开：随会话一起落盘） */
+  session: UsageBuckets;
+  /** 上下文占用：拿不到上限或缺压力样本时整体缺省 */
+  context?: { usedTokens: number; contextWindow: number };
 }
 
 /**
@@ -108,7 +138,10 @@ export interface ReviewChange {
 export type ExtToWebview =
   /** 本帧当前应处于的模式（回复 ready，或在 set-mode 后确认切换完成） */
   | { type: 'mode-set'; mode: Mode }
-  | { type: 'snapshot'; messages: ChatMessage[]; sessionId?: string; sessionTitle?: string }
+  /** usage 可选：重开/重载会话时用它把读数条恢复出来（旧会话没存过则为缺省） */
+  | { type: 'snapshot'; messages: ChatMessage[]; sessionId?: string; sessionTitle?: string; usage?: UsageReadout }
+  /** C3a：用量读数变化（每个 usage 样本一次 + 轮尾定稿一次），webview 整条重绘 */
+  | { type: 'usage'; usage: UsageReadout }
   | { type: 'history-update'; sessions: SessionSummary[]; activeId?: string }
   | { type: 'user-message'; message: ChatMessage }
   | { type: 'assistant-start'; message: ChatMessage }
@@ -142,7 +175,17 @@ export type ExtToWebview =
   /** 2.1：本轮 DSH 改动审阅（一轮 done 后推送整份；新一轮开始时清空/隐藏） */
   | { type: 'review-set'; changes: ReviewChange[] }
   /** 2.1：清空并隐藏审阅条与面板（新一轮开始 / 模式切换 / 全部处理完） */
-  | { type: 'review-clear' };
+  | { type: 'review-clear' }
+  // --- C1 事前审批：破坏性 bash 命令在执行前弹确认条（DSH hook 阻塞整轮等用户） ---
+  /** 有命令待确认：webview 弹确认条（挂在 composer 内，react-live 下也可见）。
+   *  `command` 是**扩展预格式化好的展示串**：bash 调用是命令原文，C4 的 write/edit 调用是
+   *  目标路径标签（模型给的 `tool_input.content` 绝不转发到前端）。 */
+  | { type: 'approval-request'; id: string; toolName: string; command: string }
+  /** 这条审批有结果了：收起确认条（允许/拒绝/超时/取消） */
+  | { type: 'approval-resolved'; id: string; outcome: ApprovalOutcome };
+
+/** C1 一条审批的最终去向（与 src/approvalServer.ts 的 ApprovalOutcome 同构） */
+export type ApprovalOutcome = 'allowed' | 'rejected' | 'timeout' | 'cancelled';
 
 /** webview → 扩展 */
 export type WebviewToExt =
@@ -160,8 +203,13 @@ export type WebviewToExt =
   | { type: 'set-model'; model: string } // 改模型 → 扩展重启 live 子进程生效
   | { type: 'configure-key' } // 点"API" → 扩展弹密码输入框写入 SecretStorage
   | { type: 'configure-dsh' } // 点"配置 DSH" → 扩展弹引导向导，写 hello.dsh.*（machine scope）
-  // 2.1 改动审阅动作：rel 为审阅项的工作区根相对路径；*-all 不带 rel
-  | { type: 'review-keep'; rel: string } // 保留该文件改动（仅收起，不碰磁盘）
-  | { type: 'review-revert'; rel: string } // 用轮前快照还原该文件
+  // 2.1 改动审阅动作：id 为 ReviewChange.id（跨根唯一）；*-all 不带 id
+  | { type: 'review-keep'; id: string } // 保留该文件改动（仅收起，不碰磁盘）
+  | { type: 'review-revert'; id: string } // 用轮前快照还原该文件
   | { type: 'review-keep-all' }
-  | { type: 'review-revert-all' };
+  | { type: 'review-revert-all' }
+  // 「在新对话中分支」：真 DSH ChatView 轮尾动作栏的分支按钮点击（无参数；MVP 固定
+  // fork 整份当前会话 → 新会话保留全部转写并切换过去，记忆沿用源 DSH 会话）。
+  | { type: 'fork-session' }
+  /** C1：用户在确认条上拍了板（allow=true 允许执行；对失效的 id 扩展会静默忽略） */
+  | { type: 'approval-answer'; id: string; allow: boolean };

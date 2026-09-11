@@ -12,8 +12,12 @@ import {
   Mode,
   ReviewChange,
   SessionSummary,
+  UsageBuckets,
+  UsageReadout,
   WebviewToExt,
 } from './protocol';
+import { ApprovalAsk, ApprovalOutcome, ApprovalServer, matchesAnyPattern } from './approvalServer';
+import { ApprovalHookFiles, probeShell, testApprovalHook, writeApprovalHookFiles } from './dshHooks';
 import { isAbortError, streamMockReply } from './mockAssistant';
 import { SessionStore, StoredSession, titleFromText } from './sessionStore';
 import {
@@ -21,6 +25,7 @@ import {
   compareTrees,
   FsSnapshot,
   lineDiff,
+  snapshotSingleFile,
   snapshotTree,
   TreeChange,
 } from './fileSnapshot';
@@ -31,6 +36,7 @@ import {
   DshRuntime,
   DshSpawnRequest,
   DshStatusFrame,
+  DshTokenUsage,
 } from './dshRuntime';
 
 /** 附件内容上限：超过这个字节数的文件不读；超过这个字符数的内容截断。 */
@@ -56,6 +62,64 @@ const LIVE_MODEL_KEY = 'hello.harness.liveModel';
 /** 配置条"模型"下拉的预设型号（选了不在列的可用"自定义…"输入任意 id） */
 const PRESET_MODELS = ['deepseek-v4-flash', 'deepseek-chat', 'deepseek-reasoner'];
 
+/**
+ * C1 事前审批的默认策略（正则，命中即需用户确认）。保守清单：删/格盘/强推/关机这类
+ * 一旦执行就很难看回来的命令。与 package.json 里 hello.chat.approval.patterns 的默认值一致。
+ */
+const DEFAULT_APPROVAL_PATTERNS = [
+  '\\brm\\b', // 任何 rm（rm -rf / rm -f / rm <文件> 都算；`git rm`、`docker rm` 也一并拦）
+  '\\brmdir\\b',
+  '\\bmkfs(\\.|\\s|$)',
+  '\\bdd\\b[^|]*\\bof=',
+  '\\bdiskpart\\b',
+  '\\bformat\\s+[A-Za-z]:',
+  '\\bgit\\s+push\\b[^|]*--force',
+  '\\bgit\\s+reset\\s+--hard\\b',
+  '\\b(shutdown|reboot|poweroff)\\b',
+  ':\\s*\\(\\s*\\)\\s*\\{', // fork bomb
+];
+
+/**
+ * C4 一个审阅根。`tree` = 工作区整棵树（2.1 老行为）；`file` = 工作区外单个文件，
+ * 快照的 root 是它的父目录、条目 rel 是 basename —— 于是对比/还原与树根完全同构。
+ */
+interface ReviewRoot {
+  kind: 'tree' | 'file';
+  /** 快照的根（tree = 工作区根；file = 目标文件的父目录） */
+  root: string;
+  snap: FsSnapshot;
+  /** 仅 kind==='file'：目标文件的绝对路径，也是它在 map 里的键 */
+  target?: string;
+  /** 仅 kind==='file'：展示给用户的所在目录（就是 root，留个语义名免得读混） */
+  outside?: string;
+}
+
+/** 已算出、等待 keep/revert 的一条：带上它所属的根，还原时才找得回磁盘位置。 */
+interface PendingReview {
+  /** 动作主键（`rv1`、`rv2`…），跨根唯一 */
+  id: string;
+  root: ReviewRoot;
+  change: TreeChange;
+}
+
+/** C4 区外审阅的根数上限：满了就不再新增（**不做淘汰** —— 淘汰会丢已有可还原项）。 */
+const MAX_OUTSIDE_REVIEW_ROOTS = 20;
+
+/** `hello.chat.approval.outsideWorkspace` 的默认值（只 gate「问」，不 gate「看」） */
+const DEFAULT_APPROVAL_OUTSIDE = true;
+
+/** 用户等待上限（秒）的默认值；与 hook 超时形成 540 < 560 < 580 的梯度 */
+const DEFAULT_APPROVAL_TIMEOUT_SEC = 540;
+/** 等待上限的可用区间（秒）：下限防误设成 0 变成"永远拒绝"，上限别把侧栏挂太久 */
+const APPROVAL_TIMEOUT_MIN_SEC = 10;
+const APPROVAL_TIMEOUT_MAX_SEC = 1800;
+
+/** 把可能多行的命令压成一行短摘要（确认条/状态栏/留痕用；换行会撑坏单行布局）。 */
+function oneLine(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  return flat.length > max ? flat.slice(0, max) + '…' : flat;
+}
+
 /** 单条工具输出在转写里最多展示的字符数（超出截断 + 提示） */
 const MAX_TOOL_OUTPUT_CHARS = 4000;
 /** 1.1 选区注入的兜底摘录护栏（正常走 @临时文件，只在写盘失败时用）：行数/字符双上限，防整段大选区刷爆对话。 */
@@ -80,6 +144,64 @@ function prettyValue(v: unknown): string {
   }
 }
 
+/** 便携运行时清单（`<runtimeDir>/runtime.json`，由 scripts/build-runtime.mjs 产出）。路径均为相对目录、正斜杠。 */
+interface RuntimeManifest {
+  formatVersion?: number;
+  dshVersion?: string;
+  platform?: string;
+  nodeVersion?: string;
+  node: string;
+  entry: string;
+  config: string;
+  /** 我们对产物做过的改动清单（build-runtime.mjs 写；手搓/外部运行时通常没有本字段）。
+   *  目前只有一个取值 `resume-first-session` —— 它就是「这个运行时能不能跨进程复用 DSH id」的判据。 */
+  patches?: string[];
+}
+
+/**
+ * 我们给便携运行时打的补丁名（与 scripts/runtime-patch.mjs 的 `PATCH_NAME` 一字不差）。
+ * 构建期有一致性断言盯着这个字面量，改了一边忘了另一边会当场构建失败，而不是静默丢记忆。
+ */
+const DSH_RESUME_PATCH = 'resume-first-session';
+
+/**
+ * `hello.dsh.runtimeDir` 的解析结果。
+ * - `undefined`：没配这个设置 → 走既有的手工 nodePath/entry 路径。
+ * - `{ ok: false }`：配了但目录不可用 → **明确报错，不静默回落**。用户指了运行时目录却跑到旧路径上，
+ *   比直接告诉他哪儿坏了更难查。
+ */
+type RuntimeResolution =
+  | { ok: true; dir: string; node: string; entry: string; config: string; manifest: RuntimeManifest }
+  | { ok: false; problem: string };
+
+/**
+ * 读一个便携运行时目录的清单，把三个相对路径解析成绝对路径并逐个验存在。
+ * 不读设置 —— 向导里验的是"用户刚选中的目录"，那时还没写进设置。
+ */
+function readRuntimeDir(dir: string): RuntimeResolution {
+  const manifestPath = path.join(dir, 'runtime.json');
+  let manifest: RuntimeManifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as RuntimeManifest;
+  } catch {
+    return { ok: false, problem: `这个目录里读不到 runtime.json：${manifestPath}` };
+  }
+
+  const resolved: Record<'node' | 'entry' | 'config', string> = { node: '', entry: '', config: '' };
+  for (const key of ['node', 'entry', 'config'] as const) {
+    const rel = String(manifest[key] ?? '').trim();
+    if (!rel) return { ok: false, problem: `runtime.json 缺少 "${key}" 字段：${manifestPath}` };
+    const abs = path.resolve(dir, rel);
+    try {
+      fs.accessSync(abs);
+    } catch {
+      return { ok: false, problem: `runtime.json 里的 ${key} 不存在：${abs}` };
+    }
+    resolved[key] = abs;
+  }
+  return { ok: true, dir, node: resolved.node, entry: resolved.entry, config: resolved.config, manifest };
+}
+
 /**
  * 侧边栏聊天视图的 Provider。
  *
@@ -101,6 +223,46 @@ function prettyValue(v: unknown): string {
  * 切换/新建/删除会话或模式时，若正在流式生成，会先安全中止（把半截回复标记为
  * interrupted、running 工具卡落成 error）再切换，避免残留"永远生成中"的状态把输入锁死。
  */
+/**
+ * 本轮的用量累计（C3a）。
+ *
+ * **必须按 (turn, step) 去重**：DSH 对同一步会报两次 usage —— `assistant/chunk` 的早样本
+ * （躲过一次失败的请求也能留下计数）与 `assistant/message` 的终样本，两者值**逐字节相同**。
+ * 实测三份抓帧里，天真累加的结果**恰好都是 2 倍**。故这里以 `${turn}:${step}` 为键、
+ * **后到覆盖**（同 DSH 自己 token-meter 投影的语义），再对值求和。
+ */
+interface TurnUsage {
+  /** 去重键 `${turn}:${step}` → 该步的计数（早样本被终样本覆盖） */
+  byStep: Map<string, UsageBuckets>;
+  /** 最近一次样本的 prompt 侧压力（未命中 + 缓存读 + [缓存写]），末次优先 */
+  pressureTokens?: number;
+  /** 已折进 `_active.usage`。折完**仍留着显示** —— 不然"本轮"会在轮尾突然归零，
+   *  而人正是想在这一轮跑完后看它烧了多少。下一条样本到来时换一个新的。 */
+  folded: boolean;
+}
+
+/** 线上字段可能缺省或非数字 → 一律折成非负数。 */
+function asCount(v: unknown): number {
+  return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0;
+}
+
+/** 三项计数互斥，逐项相加即可（outputTokens 已含 reasoningTokens，别再叠加）。 */
+function addBuckets(a: UsageBuckets, b: UsageBuckets): UsageBuckets {
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    cacheReadTokens: a.cacheReadTokens + b.cacheReadTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+  };
+}
+
+function zeroUsage(): UsageBuckets {
+  return { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0 };
+}
+
+function isZeroUsage(b: UsageBuckets): boolean {
+  return b.inputTokens === 0 && b.cacheReadTokens === 0 && b.outputTokens === 0;
+}
+
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _view?: vscode.WebviewView;
   /** 每模式一个存储 / 一个"当前会话" */
@@ -128,9 +290,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _backendDetail?: string;
   /** 常驻 DSH 子进程客户端：懒创建；被杀后置空、下次自动重建 */
   private _dsh?: DshRuntime;
-  /** UI 会话 id → DSH sessionId（`${uiId}::${hostRand}`）；同 activation 内复用 = 真多轮记忆 */
+  /** UI 会话 id → DSH sessionId。**纯缓存**：真相在 `StoredSession.dsh`（跨重启），
+   *  这里只是省掉「每轮都去问一遍运行时能不能续」；重连/重载后可从盘上重新推导。 */
   private readonly _dshSessions = new Map<string, string>();
-  /** 每 activation 随机一次：host 重启后绝不撞上旧进程的 DSH 会话 id */
+  /** 「不能安全续上」时给临时 id 加的盐（见 _dshIdentityReusable）：每 activation 随机一次，
+   *  于是每次激活铸出的 id 都不同，绝不会撞上旧进程留在盘上的会话日志。 */
   private readonly _dshHostRand = randomBytes(4).toString('hex');
   /** live 正在跑一轮（busy / 输入锁定的扩展侧真相） */
   private _liveRunning = false;
@@ -155,14 +319,42 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** 本轮是否正常走完（idle → done）。interrupted/error/abort 恒 false → 收尾清掉审阅 */
   private _turnNormalDone = false;
-  /** 本轮审阅快照所在的工作区根（undefined = 本轮不审） */
-  private _reviewRootAbs?: string;
-  /** 轮首工作区快照：diff 完成后仍保留供 keep/revert 动作还原用 */
-  private _baseline?: FsSnapshot;
-  /** token：新一轮 / 导航清理时自增，让迟到的异步对比失效（防两轮 diff 交错） */
+  /**
+   * 本轮审阅快照的根（C4 起多根）。键 = 根自身的标识：
+   * 工作区根用它的绝对路径，工作区外目标用**该文件的绝对路径**（不是父目录 —— 同目录
+   * 两个目标会撞键）。值为轮首快照，diff 之后仍保留供 keep/revert 还原用。
+   * 空 map = 本轮不审。
+   */
+  private _reviewRoots = new Map<string, ReviewRoot>();
+  /** token：新一轮 / 导航清理时自增，让迟到的异步对比失效（防两轮 diff 交错）。
+   *  配套的 `_reviewRoots` 判代靠**引用相等**：轮首/清理一律换一个新 Map，从不原地 clear。 */
   private _reviewSeq = 0;
-  /** 已算出、尚未被 keep/revert 处理的改动（rich 版，动作处理与还原用） */
-  private _pendingReview: TreeChange[] = [];
+  /** 已算出、尚未被 keep/revert 处理的改动（rich 版 + 动作主键 id，还原时知道回哪个根） */
+  private _pendingReview: PendingReview[] = [];
+  /** 审阅项 id 递增源（`rv1`、`rv2`…），只在对比时分配一次 */
+  private _reviewIdSeq = 0;
+
+  // ---------- C1 事前审批（破坏性 bash 命令确认条）状态 ----------
+
+  /** 本机审批服务（引用非空 = 功能在跑） */
+  private _approval?: ApprovalServer;
+  /** 已生成并生效的 hook 三件套（引用非空 = spawn 时改用派生配置） */
+  private _approvalFiles?: ApprovalHookFiles;
+  /** 进行中的准备（幂等：并发调用共享同一个 promise） */
+  private _approvalSetup?: Promise<void>;
+  /** 挂起审批的命令原文（id → 命令），结算时写留痕用 */
+  private readonly _approvalCmds = new Map<string, string>();
+  /** 审批相关告警是否已弹过（每次 activation 最多烦用户一次） */
+  private _approvalWarned = false;
+  /** 与视图无关的订阅（全局配置变更监听），dispose 时统一清 */
+  private readonly _globalDisposables: vscode.Disposable[] = [];
+
+  // ---------- C3a 用量读数（每轮/每会话 token + 上下文占用率）状态 ----------
+
+  /** 本轮累计；一轮跑着才有值。轮尾折进 `_active.usage` 后置空（单点折叠 → 不可能双计） */
+  private _turnUsage?: TurnUsage;
+  /** 本次请求的上下文窗口（占用率分母），来自 request/context；换子进程要重取 */
+  private _contextWindow?: number;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -186,6 +378,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       chat: this._stores.chat.create(),
       harness: this._stores.harness.create(),
     };
+
+    // C1：审批开关翻转 → 重建审批服务/派生配置，并重连让子进程带上（策略正则是每次现读，改策略即时生效）。
+    // **只认 enabled**：hook 的 matcher 是生成期定的，非得重连才生效；而 patterns /
+    // timeoutSec / C4 的 outsideWorkspace 都是每次现读的，跟着重启一次 DSH 子进程纯属白搭
+    // （还会打断正在跑的会话）。
+    this._globalDisposables.push(
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (!e.affectsConfiguration('hello.chat.approval.enabled')) return;
+        if (this._abort || this._liveRunning) return; // 跑着的时候不动，下次连接自然带上
+        void this._ensureApproval().then(() => this._restartLiveProcess());
+      })
+    );
   }
 
   /** 当前模式的存储（getter：把"当前模式"映射到对应 workspace） */
@@ -239,6 +443,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   startNewSession(): void {
     this._cancelActiveRun();
     this._dropReview(true); // 新建对话 → 清掉上一轮遗留的审阅
+    this._resetTurnUsage(); // C3a：本轮读数不跨会话
     if (this._active.messages.length > 0) {
       this._store.replace(this._active);
       this._store.persist();
@@ -253,8 +458,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // 杀掉常驻的 DSH 子进程（kill 内部置 dead，缓冲中迟到的行不再分发）
     this._dsh?.kill();
     this._dsh = undefined;
+    this._approval?.dispose(); // C1：关掉本机审批服务，挂起的按取消结算
+    this._approval = undefined;
     this._dropReview(false); // 清掉本轮审阅内存（视图已销毁，不必再发 clear）
     this._disposeViewListeners();
+    for (const d of this._globalDisposables) d.dispose();
+    this._globalDisposables.length = 0;
     this._view = undefined;
   }
 
@@ -276,7 +485,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // webview 每次显示都重建：harness 状态点/运行锁一律以扩展侧为真相重放一遍
         this._postBackendStatus();
         // 2.1 ready 重放：已算出未处理的本轮审阅补推（新一轮开始时已发 review-clear 隐去）
-        if (this._pendingReview.length > 0 && this._baseline !== undefined && !this._liveRunning) {
+        if (this._pendingReview.length > 0 && this._reviewRoots.size > 0 && !this._liveRunning) {
           this._postReviewSet();
         }
         // harness 默认模式：视图每次就绪都预热到「在线/未配置」可读状态
@@ -308,10 +517,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         void this._pickFiles();
         break;
       case 'stop':
+        // C1：本轮被停 → 挂起的审批立刻按取消结算（否则 hook 进程会一直等答复）
+        this._approval?.cancelAll();
         this._abort?.abort();
+        break;
+      case 'approval-answer':
+        // C1：确认条上的允许/拒绝；对已失效的 id 静默忽略（超时/已答过）
+        this._approval?.answer(msg.id, msg.allow);
         break;
       case 'clear':
         this.startNewSession();
+        break;
+      case 'fork-session':
+        this._forkSession();
         break;
       case 'list-sessions':
         this._sendHistory();
@@ -326,10 +544,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._renameSession(msg.title);
         break;
       case 'review-keep':
-        this._reviewAction('keep', msg.rel);
+        this._reviewAction('keep', msg.id);
         break;
       case 'review-revert':
-        this._reviewAction('revert', msg.rel);
+        this._reviewAction('revert', msg.id);
         break;
       case 'review-keep-all':
         this._reviewAction('keep-all');
@@ -345,6 +563,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (mode === this._mode) return; // 点的还是当前模式，无事可做
     this._cancelActiveRun();
     this._dropReview(true); // 切换模式 → 清掉审阅（harness 独有功能）
+    this._resetTurnUsage(); // C3a：本轮读数不跨模式
     this._persistActiveSession();
     this._mode = mode;
     void this._globalState.update(MODE_KEY, mode);
@@ -590,6 +809,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._liveRunning = false;
       this._post({ type: 'run-busy', busy: false });
       this._postBackendStatus();
+      // C3a：折账兜底（正路已在 _finishTurn 里同步折过，幂等）。剩下唯一会走到这里的
+      // 是"没经过 _finishTurn 的出错轮"——那些 token 是真的，同样计入。
+      // 必须在 _afterTurn 之前：由它落盘。
+      this._foldTurnUsage();
       this._afterTurn();
       // 2.1：正常走完（done）→ 退栈后异步对比工作区、算 diff 推审阅条；
       // interrupted / error / abort → 清掉本轮的 baseline（不做审阅）
@@ -615,10 +838,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** 本轮收尾（done：正常 idle / interrupted：被停止）。幂等。 */
   private _finishTurn(outcome: 'done' | 'interrupted'): void {
     if (!this._liveRunning) return;
+    // C1：本轮收尾时不该还留着待确认（正常路径下 hook 阻塞期间 idle 不会到达，这里是兜底）
+    this._approval?.cancelAll();
     if (outcome === 'done') {
       this._turnNormalDone = true; // 2.1：正常走完 → finally 里排异步改动对比
     }
     this._liveRunning = false;
+    // C3a：在这里折账，**不能**只靠 _runLive 的 finally —— 那是微任务，而「运行中切会话」
+    // 那条路上（_cancelActiveRun → _actives[_mode] = 新会话 → 落盘）全是同步的，
+    // finally 跑到时 _active 已经换人了，半轮的 token 会记到新会话头上。
+    // 此处是同步的、_active 还是本轮那个。_foldTurnUsage 自带幂等，finally 里那次只作兜底。
+    this._foldTurnUsage();
     this._finalizeOpenAssistant(outcome);
     if (outcome === 'interrupted') {
       // 停止时还挂着的 running 工具卡 → error，不留转圈残留
@@ -701,9 +931,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * C5 这个运行时**允不允许**跨进程复用 DSH 会话 id。
+   *
+   * 只有经 scripts/build-runtime.mjs 打过 resume-first 补丁的便携运行时才允许：DSH 的 wire 上
+   * 没有 resume 方法，把已落盘的 id 硬塞给 `session/prompt` 会在第一次 checkpoint 上以
+   * `id collision` 炸掉（见 docs/backlog.md 的 C5）。补丁把它换成了先 resume、只对确实没有
+   * 磁盘工件的 id 才 create。
+   *
+   * 开发者路径（手配 nodePath/entry）与 `hello.dsh.command` 走的是**用户自己的 DSH**，没有我们的
+   * 补丁 → 那里必须维持「每 activation 新铸」的老行为，否则就是把上面那条炸路递给用户。
+   */
+  private _dshIdentityReusable(): boolean {
+    const rt = this._runtime();
+    return rt?.ok === true && rt.manifest.patches?.includes(DSH_RESUME_PATCH) === true;
+  }
+
+  /**
    * UI 会话 → DSH 会话 id 的（首次）映射，并在"续聊旧历史"时插一行 note。
    * 必须在 _sendUser 把本条 user 消息入列**之后**调用（保证 note 排在其后，
    * 不会劫持 isFirst / 默认标题逻辑）。
+   *
+   * 三条出路：
+   *   ① 能安全续上（运行时带补丁 + 盘上那套身份属于当前工作区）→ 复用旧 id，记忆接上；
+   *   ② 不能续（开发者路径 / 换了工作区 / 旧数据没这个字段）→ 本 activation 内一次性临时 id；
+   *   ③ 本 activation 内已经映射过 → 直接取缓存。
    */
   private _ensureDshSession(): string {
     const uiId = this._active.id;
@@ -712,20 +963,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._currentDshId = existing;
       return existing;
     }
-    const dshId = `${uiId}::${this._dshHostRand}`;
+
+    const cwd = this._dshCwd();
+    const stored = this._active.dsh;
+    const patched = this._dshIdentityReusable();
+    // 续上的前提是两件事同时成立：运行时能 resume，**且**盘上那份身份是当前工作区铸的
+    // （DSH 的会话日志按 cwd 归属，换工作区就对不上）。
+    const resumeId = patched && stored?.cwd === cwd ? stored.id : undefined;
+    const dshId = resumeId ?? `${uiId}::${this._dshHostRand}`;
+
+    // 只有「补丁可用 + 这个会话还没有身份」才把新铸的 id 记账（随 _afterTurn 落盘）。
+    // 另两种**绝不写盘**：
+    //   · 补丁不可用（开发者路径 / hello.dsh.command）—— 硬复用会撞 id collision；
+    //   · 指针属于别的工作区 —— 覆盖它等于把原工作区那份记忆的指针永久丢掉。
+    // 两者都退回「本 activation 内一次性的临时 id」：每次激活互不相同，撞不上旧日志。
+    if (resumeId === undefined && patched && stored === undefined) {
+      this._active.dsh = { id: dshId, cwd };
+    }
+
     this._dshSessions.set(uiId, dshId);
     this._currentDshId = dshId;
-    // 该 UI 会话在**这个 activation**里首次发消息，且此前已有人类历史
-    // （典型：host 重启后继续旧对话）。DSH 会话是全新的，模型不记得之前的内容。
+    // 该 UI 会话在**这个 activation**里首次发消息，且此前已有人类历史（典型：host 重启后继续旧对话）。
+    // 说清楚模型到底记不记得之前的内容 —— 这个 note 是用户唯一能看到的判据，别含糊。
     if (this._hadHistoryBeforeSend) {
-      const note: ChatMessage = {
-        id: this._nextMsgId(),
-        role: 'note',
-        text: '已开启全新 DSH 会话 —— 模型只记得本条消息之后的内容，不再拥有此前对话的记忆。',
-        status: 'done',
-      };
-      this._active.messages.push(note);
-      this._post({ type: 'note-message', message: note });
+      this._pushNote(
+        resumeId !== undefined
+          ? '已恢复此前的 DSH 会话记忆 —— 模型仍记得本条消息之前的对话。'
+          : '已开启全新 DSH 会话 —— 模型只记得本条消息之后的内容，不再拥有此前对话的记忆。'
+      );
     }
     return dshId;
   }
@@ -734,12 +999,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _teardownLive(): void {
     this._dsh?.kill();
     this._dsh = undefined;
+    this._approval?.cancelAll(); // C1：子进程一杀，hook 连接就断了；先把挂起的收干净
     this._connectPromise = undefined;
+    // 只清缓存、不动 _active.dsh：下一次发送会从盘上的身份重新推导 ——
+    // 于是换模型/换 key/换路径之后，会话记忆仍在（C5）。
     this._dshSessions.clear();
     this._currentDshId = undefined;
     this._backendState = 'offline';
     this._backendModel = undefined;
     this._backendDetail = undefined;
+    // C3a：上下文上限是「这次请求」的属性，换子进程后要等新的 request/context 才有
+    this._contextWindow = undefined;
   }
 
   /** 配置条里改模型：记住 → 重启 live 子进程（旧会话记忆清空，下一句插灰 note）。 */
@@ -815,8 +1085,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * 「配置 DSH」引导向导：用原生对话框收集 nodePath / entry，并按入口所在 DSH 仓库根推导
-   * runCwd / tsconfig / config，最后 quickpick 确认、用 ConfigurationTarget.Global 写 hello.dsh.*
+   * 「配置 DSH」引导向导。先问一个岔路口：**便携运行时目录**（推荐；字节自带 node 与配置）
+   * 还是**手工 node + 入口**（开发者路径，按入口所在 DSH 仓库根推导 runCwd / tsconfig / config）。
+   * 最后 quickpick 确认、用 ConfigurationTarget.Global 写 hello.dsh.*
    * （machine-scope 设置只能落在用户设置文件，故用 Global target）。取消任一对话框即整段中止、零写入。
    * credentialsFile 绝不写入（它由 API 按钮 / 密钥库管理）。写盘只发生在用户选「保存并重启 live」那一刻。
    */
@@ -829,20 +1100,71 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // 开始时快照（trimmed）——决定哪些键「真的变了」，也避免向导期间重复读配置的歧义
     const conf = this._dshConfig();
     const cur = {
+      runtimeDir: String(conf.get('runtimeDir') ?? '').trim(),
       nodePath: String(conf.get('nodePath') ?? '').trim(),
       entry: String(conf.get('entry') ?? '').trim(),
       runCwd: String(conf.get('runCwd') ?? '').trim(),
       tsconfig: String(conf.get('tsconfig') ?? '').trim(),
       config: String(conf.get('config') ?? '').trim(),
     };
+    let runtimeDir = cur.runtimeDir;
     let nodePath = cur.nodePath;
     let entry = cur.entry;
     let runCwd = cur.runCwd;
     let tsconfig = cur.tsconfig;
     let config = cur.config;
 
-    let step: 'node' | 'entry' | 'config' | 'confirm' = 'node';
+    let step: 'kind' | 'runtime' | 'node' | 'entry' | 'config' | 'confirm' = 'kind';
     for (;;) {
+      // ---- 入口第一步：字节从哪来。两条路的配置完全不相交，先问清楚再收路径 ----
+      if (step === 'kind') {
+        const pick = await vscode.window.showQuickPick(
+          [
+            {
+              label: '用一个便携运行时目录（推荐）',
+              description:
+                '目录里带 runtime.json：node、入口、cordis.yml 全在里面，不需要 tsx，也不需要本地 DSH 检出',
+            },
+            {
+              label: '手工指定 node 与入口（开发者路径）',
+              description: cur.runtimeDir
+                ? '会清空 hello.dsh.runtimeDir（当前指向便携运行时），改按 node + 入口启动'
+                : '本地有一份构建好的 DSH 检出，按 node + 入口 + cordis.yml 启动',
+            },
+          ],
+          { placeHolder: 'DSH 运行时要跑哪一份字节？', title: 'DSH 运行路径配置' }
+        );
+        if (!pick) return;
+        if (pick.label.startsWith('用一个便携')) {
+          step = 'runtime';
+        } else {
+          // 手工路径与 runtimeDir 互斥（后者优先级更高）→ 选了手工就等于要清掉它
+          runtimeDir = '';
+          step = 'node';
+        }
+        continue;
+      }
+      if (step === 'runtime') {
+        const picked = await vscode.window.showOpenDialog({
+          canSelectFolders: true,
+          canSelectFiles: false,
+          canSelectMany: false,
+          openLabel: '选用该便携运行时目录',
+          title: '选择便携运行时目录（内含 runtime.json）',
+          defaultUri: runtimeDir && this._exists(runtimeDir) ? vscode.Uri.file(runtimeDir) : undefined,
+        });
+        if (!picked || picked.length === 0) return;
+        const dir = picked[0].fsPath;
+        const check = readRuntimeDir(dir);
+        if (!check.ok) {
+          // 留在这一步重选，不整段退出 —— 选错目录是常事，别让用户从头再来
+          vscode.window.showErrorMessage(`这个目录不能用作便携运行时 —— ${check.problem}`);
+          continue;
+        }
+        runtimeDir = dir;
+        step = 'confirm';
+        continue;
+      }
       if (step === 'node') {
         const p = await this._pickDshFile({
           title: '选择 DSH 运行用的 node 可执行文件',
@@ -893,25 +1215,56 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
 
       // ---- step === 'confirm' ----
-      const pick = await vscode.window.showQuickPick(
-        [
+      // 展示行刻意写成灰字；`enabled` 不是 QuickPickItem 的字段（API 里没有），
+      // 标了也不拦点击 —— 选中会落到末尾的兜底 return。保留只为标明"这行是给人看的"。
+      const rows: Array<vscode.QuickPickItem & { enabled?: boolean }> = [];
+      if (runtimeDir) {
+        // 便携运行时生效时，其余五项都不参与启动 —— 列出来只会让人以为改了有用
+        const portable = readRuntimeDir(runtimeDir);
+        if (portable.ok) {
+          rows.push(
+            { label: '当前生效：便携运行时', description: portable.dir, enabled: false },
+            { label: '  包内 node', description: `${portable.node}（${portable.manifest.nodeVersion ?? '版本未知'}）`, enabled: false },
+            { label: '  入口', description: portable.entry, enabled: false },
+            { label: '  配置文件', description: portable.config, enabled: false }
+          );
+        } else {
+          rows.push({ label: '当前生效：便携运行时（不可用）', description: portable.problem, enabled: false });
+        }
+      } else {
+        rows.push(
           { label: 'node', description: nodePath || '(未设置)', enabled: false },
           { label: '入口', description: entry || '(未设置)', enabled: false },
           { label: '工作目录', description: runCwd || '(未设置 → 回退工作区根)', enabled: false },
           { label: 'tsconfig', description: tsconfig || '(未设置)', enabled: false },
-          { label: '配置文件', description: config || '(未设置)', enabled: false },
-          { label: '保存并重启 live', description: '把以上值写入用户设置（hello.dsh.*），随后重启 DSH 子进程' },
+          { label: '配置文件', description: config || '(未设置)', enabled: false }
+        );
+      }
+      rows.push({ label: '保存并重启 live', description: '把以上值写入用户设置（hello.dsh.*），随后重启 DSH 子进程' });
+      if (runtimeDir) {
+        rows.push(
+          { label: '重新选择运行时目录', description: '' },
+          { label: '改用手工配置', description: '清空 hello.dsh.runtimeDir，回到 node + 入口 的开发者路径' }
+        );
+      } else {
+        rows.push(
+          { label: '改用一个便携运行时目录', description: '推荐：目录自带 node 与配置，不需要 tsx 与 DSH 检出' },
           { label: '重新选择 node 可执行文件', description: '' },
           { label: '重新选择入口脚本', description: '将按入口所在仓库自动推导其余路径' },
-          { label: '重新选择配置文件', description: '可选，缺省按入口自动推导' },
-          { label: '取消', description: '' },
-        ],
-        { placeHolder: '确认以上最终值（灰字为将写入的内容）', title: 'DSH 运行路径配置' }
-      );
+          { label: '重新选择配置文件', description: '可选，缺省按入口自动推导' }
+        );
+      }
+      rows.push({ label: '取消', description: '' });
+
+      const pick = await vscode.window.showQuickPick(rows, {
+        placeHolder: '确认以上最终值（灰字为将写入的内容）',
+        title: 'DSH 运行路径配置',
+      });
 
       if (!pick || pick.label === '取消') return;
       if (pick.label === '保存并重启 live') {
         const changed: Array<[string, string]> = [];
+        if (runtimeDir !== cur.runtimeDir) changed.push(['runtimeDir', runtimeDir]);
         if (nodePath !== cur.nodePath) changed.push(['nodePath', nodePath]);
         if (entry !== cur.entry) changed.push(['entry', entry]);
         if (runCwd !== cur.runCwd) changed.push(['runCwd', runCwd]);
@@ -936,6 +1289,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           vscode.window.showInformationMessage('配置没有变化，未写入。');
         }
         return;
+      }
+      if (pick.label.startsWith('重新选择运行时')) {
+        step = 'runtime';
+        continue;
+      }
+      if (pick.label === '改用手工配置') {
+        runtimeDir = '';
+        step = 'node';
+        continue;
+      }
+      if (pick.label.startsWith('改用一个便携')) {
+        step = 'runtime';
+        continue;
       }
       if (pick.label.startsWith('重新选择 node')) {
         step = 'node';
@@ -982,6 +1348,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     } catch {
       /* key 解析失败不阻断握手：让子进程侧（llm-deepseek）报更具体的错 */
     }
+    // C1：审批必须在 spawn **之前**就绪 —— _makeSpawnRequest 是同步的，它读的就是
+    // _approvalFiles（派生配置路径）。准备失败会在内部告警并降级，不阻断连接。
+    await this._ensureApproval();
     let runtime: DshRuntime;
     try {
       runtime = this._getRuntime();
@@ -1037,6 +1406,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     switch (ev.type) {
       case 'assistant/chunk': {
         const chunk = d.chunk;
+        // C3a：usage 早样本。必须先于下面那行 text-delta 早退处理 —— 它也是 chunk.type，
+        // 否则每步的计数会在这里被静默丢掉。
+        if (chunk && chunk.type === 'usage') {
+          this._onUsageSample(d, chunk.usage);
+          return;
+        }
         if (!chunk || chunk.type !== 'text-delta') return;
         const delta = typeof chunk.text === 'string' ? chunk.text : '';
         if (!delta) return;
@@ -1046,6 +1421,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const m = this._openAssistant as ChatMessage;
         m.text += delta;
         this._post({ type: 'assistant-delta', id: m.id, delta });
+        return;
+      }
+      case 'assistant/message': {
+        // C3a：同一步的终样本，值与上面那条 usage chunk 逐字节相同 → 覆盖式并入，不重复计。
+        if (d.usage) this._onUsageSample(d, d.usage);
+        return;
+      }
+      case 'request/context': {
+        // C3a：本次请求的路由与上下文窗口（占用率的分母）。每会话一条、会话开头就到，
+        // 所以占用率不用等首轮跑完。换子进程会重新发（见 _teardownLive 的清理）。
+        if (typeof d.contextWindow === 'number' && d.contextWindow > 0) {
+          this._contextWindow = d.contextWindow;
+          this._postUsage();
+        }
         return;
       }
       case 'tool/call': {
@@ -1119,10 +1508,96 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return;
       }
       default:
-        // turn/start、user/message、assistant/message、agent/inbox/*、
-        // reasoning-delta、tool-call-delta、subagent.* 一律忽略
+        // turn/start、user/message、agent/inbox/*、reasoning-delta、
+        // tool-call-delta、subagent.* 一律忽略
+        // （assistant/message 与 request/context 原在此列，C3a 起各自成 case 了）
         return;
     }
+  }
+
+  // ---------- C3a 用量读数 ----------
+
+  /**
+   * 并入一条 usage 样本。
+   *
+   * **覆盖而非累加**：同一步的 chunk 早样本会被 message 终样本覆盖 —— 两者值相同，
+   * 累加就是双计（实测三份抓帧都是恰好 2 倍）。
+   */
+  private _onUsageSample(d: DshEventData, usage: DshTokenUsage | undefined): void {
+    if (!usage) return;
+    // 新的这一轮（或上一轮已折叠）→ 换一个干净的累计器
+    if (!this._turnUsage || this._turnUsage.folded) {
+      this._turnUsage = { byStep: new Map(), folded: false };
+    }
+    const turn = this._turnUsage;
+    turn.byStep.set(`${String(d.turn ?? '')}:${String(d.step ?? '')}`, {
+      inputTokens: asCount(usage.inputTokens),
+      cacheReadTokens: asCount(usage.cacheReadTokens),
+      outputTokens: asCount(usage.outputTokens),
+    });
+    // prompt 侧压力 = 本次请求的输入规模（含缓存读写），末次样本优先
+    turn.pressureTokens =
+      asCount(usage.inputTokens) + asCount(usage.cacheReadTokens) + asCount(usage.cacheWriteTokens);
+    this._postUsage();
+  }
+
+  /** 把本轮计数折进会话累计，**只此一处**（单点折叠 → 不可能双计）。轮尾调用。 */
+  private _foldTurnUsage(): void {
+    const turn = this._turnUsage;
+    if (!turn || turn.folded) return;
+    let sum = zeroUsage();
+    for (const b of turn.byStep.values()) sum = addBuckets(sum, b);
+    this._active.usage = addBuckets(this._active.usage ?? zeroUsage(), sum);
+    turn.folded = true;
+    this._postUsage();
+  }
+
+  /**
+   * 组装读数：本轮 / 本会话累计（含尚未折叠的当前轮）/ 上下文占用。
+   *
+   * **什么数据都没有时返回 undefined** —— 调用方据此把细条藏起来，而不是显示一排 0。
+   * 三种情形都靠它兜住：重开一个从没跑过的旧会话、刚从别的会话切过来、切到「内嵌聊天」。
+   */
+  private _usageReadout(): UsageReadout | undefined {
+    if (this._mode !== 'harness') return undefined;
+    const turn = this._turnUsage;
+    let turnSum = zeroUsage();
+    if (turn) {
+      for (const b of turn.byStep.values()) turnSum = addBuckets(turnSum, b);
+    }
+    // 未折叠的当前轮还没进 _active.usage，这里补上 —— 否则轮尾折叠那一刻读数会跳变。
+    // 落盘的数据过一遍 asCount：手改坏了 sessions-harness.json 也别让读数显示 NaN。
+    const stored = this._active.usage;
+    const session = addBuckets(
+      stored
+        ? {
+            inputTokens: asCount(stored.inputTokens),
+            cacheReadTokens: asCount(stored.cacheReadTokens),
+            outputTokens: asCount(stored.outputTokens),
+          }
+        : zeroUsage(),
+      turn && !turn.folded ? turnSum : zeroUsage()
+    );
+    const used = turn?.pressureTokens;
+    const contextWindow = this._contextWindow;
+    if (used === undefined && contextWindow === undefined && isZeroUsage(turnSum) && isZeroUsage(session)) {
+      return undefined;
+    }
+    const readout: UsageReadout = { turn: turnSum, session };
+    if (used !== undefined && contextWindow !== undefined) {
+      readout.context = { usedTokens: used, contextWindow };
+    }
+    return readout;
+  }
+
+  private _postUsage(): void {
+    const usage = this._usageReadout();
+    if (usage) this._post({ type: 'usage', usage });
+  }
+
+  /** 换会话 / 换模式 / 新建时清掉本轮读数。**会话累计在 `_active.usage` 上，不动**。 */
+  private _resetTurnUsage(): void {
+    this._turnUsage = undefined;
   }
 
   /**
@@ -1154,20 +1629,365 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  // ---------- C1 事前审批：本机审批服务 + DSH hook 三件套 ----------
+
+  /** 审批开关（hello.chat.approval.enabled，**默认开** —— 破坏性命令执行前来一道确认） */
+  private _approvalEnabled(): boolean {
+    return (
+      vscode.workspace.getConfiguration('hello.chat').get<boolean>('approval.enabled', true) === true
+    );
+  }
+
+  /** 当前策略正则（每次现读 → 改设置即时生效，不必重连） */
+  private _approvalPatterns(): string[] {
+    const raw = vscode.workspace
+      .getConfiguration('hello.chat')
+      .get<string[]>('approval.patterns', DEFAULT_APPROVAL_PATTERNS);
+    return Array.isArray(raw) ? raw : DEFAULT_APPROVAL_PATTERNS;
+  }
+
+  /** 用户等待上限（毫秒，已按可用区间收敛） */
+  private _approvalTimeoutMs(): number {
+    const raw = vscode.workspace
+      .getConfiguration('hello.chat')
+      .get<number>('approval.timeoutSec', DEFAULT_APPROVAL_TIMEOUT_SEC);
+    const rawSec = Number.isFinite(raw) ? Math.round(raw) : DEFAULT_APPROVAL_TIMEOUT_SEC;
+    const sec = Math.min(Math.max(rawSec, APPROVAL_TIMEOUT_MIN_SEC), APPROVAL_TIMEOUT_MAX_SEC);
+    return sec * 1000;
+  }
+
+  // ---------- C4 工作区外写：判定「越界」----------
+
+  /** 越界是否弹确认条（hello.chat.approval.outsideWorkspace，默认开）。
+   *  **只 gate「问」**：hook 挂着的时候，区外目标照旧进本轮审阅 —— 关掉它等于「不问只记」。 */
+  private _approvalOutsideEnabled(): boolean {
+    return (
+      vscode.workspace
+        .getConfiguration('hello.chat')
+        .get<boolean>('approval.outsideWorkspace', DEFAULT_APPROVAL_OUTSIDE) === true
+    );
+  }
+
+  /**
+   * 本次调用的会话工作区（相对 file_path 的解析基准）。用 hook 载荷里的 `cwd` —— DSH 给的就是
+   * 会话工作区，路径本来就是相对它解析的；拿不到才退到打开的工作区根。
+   * **绝不用 `_dshCwd()`**：那个无工作区时会退成用户主目录，拿家目录当"界内"等于放行一切。
+   */
+  private _sessionWorkspaceRoot(ask: ApprovalAsk): string {
+    return String(ask.cwd ?? '').trim() || this._reviewRoot() || '';
+  }
+
+  /** fs 工具的目标绝对路径（拿不到 → undefined）。 */
+  private _fsTargetAbs(ask: ApprovalAsk): string | undefined {
+    const raw = String(ask.filePath ?? '').trim();
+    if (!raw) return undefined;
+    // POSIX 形态（Linux 侧给的 /mnt/… 之类）：Windows 的 path 会把它当"当前盘根下"解析出
+    // 一个完全错误的位置 —— 宁可判不出来（调用方按越界处理，多问一次），也不乱认。
+    if (raw.startsWith('/') && !raw.startsWith('//')) return undefined;
+    if (path.isAbsolute(raw)) return path.resolve(raw);
+    const base = this._sessionWorkspaceRoot(ask);
+    return base ? path.resolve(path.join(base, raw)) : undefined;
+  }
+
+  /** target 是否落在 root 之内（含 root 自身）。win32 下 path.relative 已做大小写归一。
+   *  **绝不用 startsWith 比前缀**：`C:\proj2` 会被 `C:\proj` 骗过。 */
+  private _isInside(target: string, root: string): boolean {
+    if (!root) return false;
+    const rel = path.relative(path.resolve(root), path.resolve(target));
+    if (!rel) return true; // 就是根本身
+    if (path.isAbsolute(rel)) return false; // 不同盘符 → relative 返回绝对路径
+    return rel !== '..' && !rel.startsWith('..' + path.sep);
+  }
+
+  /** 平台临时区内的路径（DSH 沙箱也刻意放行那里；temp churn 不该进审阅，也不该弹条）。 */
+  private _isTempPath(abs: string): boolean {
+    const tmp = os.tmpdir();
+    return !!tmp && this._isInside(abs, tmp);
+  }
+
+  /** 是否越出会话工作区（临时区豁免）。定位不了 → 保守当越界。 */
+  private _isOutsideWorkspace(ask: ApprovalAsk): boolean {
+    const target = this._fsTargetAbs(ask);
+    if (!target) return true;
+    if (this._isTempPath(target)) return false;
+    const root = this._sessionWorkspaceRoot(ask);
+    return !this._isInside(target, root);
+  }
+
+  /**
+   * 审批策略（注入给 ApprovalServer 的谓词，每次现读）。
+   * bash 走 C1 的正则清单；write/edit 走 C4 的越界判定；其余工具不表态。
+   */
+  private _askNeedsApproval(ask: ApprovalAsk): boolean {
+    if (ask.toolName === 'bash') {
+      return matchesAnyPattern(this._approvalPatterns(), ask.command);
+    }
+    if (ask.toolName === 'write' || ask.toolName === 'edit') {
+      return this._approvalOutsideEnabled() && this._isOutsideWorkspace(ask);
+    }
+    return false;
+  }
+
+  /**
+   * C4 可见性那半：每次 write/edit 会先经过这里（**不论要不要问**），在工具**执行之前**
+   * 给工作区外目标抓一张轮前快照。于是：
+   * - 被用户拒绝的写从不落盘 → 轮末对比自然没有它，不需要额外判断；
+   * - 用户自己在同一轮的编辑不会被算成 agent 的改动（只快照目标那一个文件）。
+   */
+  private _onApprovalObserved(ask: ApprovalAsk): void {
+    if (ask.toolName !== 'write' && ask.toolName !== 'edit') return;
+    // `_abort` 是本轮的 token：**轮跑着的时候非空**（_sendUser 里设、_runLive 的 finally 里清），
+    // 而 hook 只在轮中触发 —— 所以这里要的是 `!this._abort`（不在轮中就别认领）。
+    // 写成 `this._abort` 会让本方法每一轮都当场 return（区内行来自轮首播种的树根，不受影响，
+    // 所以症状是「区外改动悄无声息地永远不进审阅」）。
+    if (!this._abort || !this._reviewChangesOn()) return;
+
+    const target = this._fsTargetAbs(ask);
+    if (!target || this._isTempPath(target)) return;
+    const root = this._sessionWorkspaceRoot(ask);
+    // 工作区内的写由工作区树根那半负责；没开文件夹时 root 为空 → 一律按区外处理
+    if (root && this._isInside(target, root)) return;
+
+    for (const r of this._reviewRoots.values()) {
+      if (r.kind === 'tree' && this._isInside(target, r.root)) return; // 已被树根覆盖
+    }
+    // 先到先得：第二次写到同一文件时，"轮前"早被第一次写污染了，换掉会让还原撒谎
+    if (this._reviewRoots.has(target)) return;
+    let outsideCount = 0;
+    for (const r of this._reviewRoots.values()) if (r.kind === 'file') outsideCount += 1;
+    // 满了就跳过，**不做淘汰** —— 淘汰会丢已有可还原项，那比少记一条更糟
+    if (outsideCount >= MAX_OUTSIDE_REVIEW_ROOTS) return;
+
+    const dir = path.dirname(target);
+    this._reviewRoots.set(target, {
+      kind: 'file',
+      root: dir,
+      // 键用**目标文件**而不是父目录：同目录两个目标会撞键，第二个就再也记不上了
+      target,
+      outside: dir,
+      snap: snapshotSingleFile(dir, target),
+    });
+  }
+
+  /**
+   * 解析 `hello.dsh.runtimeDir`：读清单、把三个相对路径解析成绝对路径、逐个验存在。
+   * 每次现读（清单才几百字节）→ 改了设置即时生效，也免去失效缓存的坑。
+   */
+  private _runtime(): RuntimeResolution | undefined {
+    const raw = String(this._dshConfig().get('runtimeDir') ?? '').trim();
+    if (!raw) return undefined;
+    return readRuntimeDir(path.isAbsolute(raw) ? raw : path.resolve(this._dshCwd(), raw));
+  }
+
+  /**
+   * spawn 用的 node：便携运行时自带的优先（版本由清单保证），否则用户手工配的。
+   * 审批 hook 脚本也走这里 —— 否则便携场景下 hook 会落到 PATH 上的旧 node 上。
+   */
+  private _effectiveNodePath(): string {
+    const runtime = this._runtime();
+    if (runtime?.ok) return runtime.node;
+    return String(this._dshConfig().get('nodePath') ?? '').trim();
+  }
+
+  /**
+   * 入口要不要配 tsx loader。显式设了 `hello.dsh.loader` 就用它；否则按入口扩展名判断：
+   * `.ts/.tsx/.mts` 走 tsx/esm（兼容既有手工配置），打包好的 `.js`（便携运行时的
+   * packaged-bin.js）**不加任何 loader**。设置默认值因此是空串 —— 空 = 交给这条规则。
+   */
+  private _dshLoader(entry: string): string {
+    const explicit = String(this._dshConfig().get('loader') ?? '').trim();
+    if (explicit) return explicit;
+    return /\.(ts|tsx|mts)$/i.test(entry) ? 'tsx/esm' : '';
+  }
+
+  /** 用户的基础 cordis.yml 绝对路径（相对路径按 runCwd 解析）；空串 = 没配 */
+  private _baseConfigPathAbs(): string {
+    const runtime = this._runtime();
+    // 便携运行时：清单里的 config 就是基础配置 —— C1 的派生配置从这里派生出去
+    if (runtime) return runtime.ok ? runtime.config : '';
+    const raw = String(this._dshConfig().get('config') ?? '').trim();
+    if (!raw) return '';
+    return path.isAbsolute(raw) ? raw : path.resolve(this._dshRunCwd(), raw);
+  }
+
+  /** spawn 时真正下发的 cordis.yml：审批就绪 → 派生配置；否则用户原配置。 */
+  private _effectiveConfigPath(): string {
+    if (this._approvalFiles) return this._approvalFiles.cordisPath;
+    const runtime = this._runtime();
+    if (runtime) return runtime.ok ? runtime.config : '';
+    return String(this._dshConfig().get('config') ?? '').trim();
+  }
+
+  /**
+   * 确保审批就绪（幂等）。开关关着 → 顺手拆掉服务与派生配置（下次 spawn 回到用户原配置）。
+   * 任何一步失败都只降级 + 告警：审批不生效，但插件照常能用。
+   */
+  private _ensureApproval(): Promise<void> {
+    if (!this._approvalEnabled()) {
+      if (this._approval) {
+        this._approval.dispose();
+        this._approval = undefined;
+      }
+      this._approvalFiles = undefined;
+      return Promise.resolve();
+    }
+    if (this._approval && this._approvalFiles) return Promise.resolve();
+    if (this._approvalSetup) return this._approvalSetup;
+    const p = this._setupApproval();
+    this._approvalSetup = p;
+    const clear = (): void => {
+      if (this._approvalSetup === p) this._approvalSetup = undefined;
+    };
+    p.then(clear, clear);
+    return p;
+  }
+
+  private async _setupApproval(): Promise<void> {
+    const conf = this._dshConfig();
+    // 整段覆盖启动命令时，config 写死在 args 里，我们无从替换 → 明确不启用（并说清原因）
+    if (String(conf.get('command') ?? '').trim()) {
+      this._approvalWarn('hello.dsh.command 整段覆盖了启动命令，配置由该命令自带，审批无法接入。');
+      return;
+    }
+    // 运行时目录坏了就别往下走：派生配置没有底本，再往下只会报出「未配置 hello.dsh.config」这种误导文案
+    const problem = this._dshConfigProblem();
+    if (problem) {
+      this._approvalWarn(`${problem} 审批无法接入。`);
+      return;
+    }
+    // 便携运行时自带的 node 优先 —— 否则便携场景下 hook 会落到 PATH 上的旧 node 上（静默降级）
+    const nodePath = this._effectiveNodePath();
+    if (!nodePath) {
+      this._approvalWarn('没有可用的 node（既没配便携运行时也没配 hello.dsh.nodePath），hook 脚本跑不起来。');
+      return;
+    }
+
+    const server = new ApprovalServer(
+      (ask) => this._askNeedsApproval(ask),
+      () => this._approvalTimeoutMs(),
+      (ask) => this._onApprovalAsk(ask),
+      (id, outcome) => this._onApprovalResolved(id, outcome),
+      (ask) => this._onApprovalObserved(ask)
+    );
+    try {
+      await server.start();
+    } catch (err) {
+      this._approvalWarn(`审批服务启动失败：${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+
+    // hook 由 DSH 用 `bash -c` 跑，而 bash 可能是 WSL 也可能是 Git Bash —— 路径形态完全不同，
+    // 必须先探出来（同一台机器上两种都见过）。
+    const runCwd = this._dshRunCwd();
+    const shellKind = await probeShell(runCwd);
+
+    try {
+      const timeoutMs = this._approvalTimeoutMs();
+      const files = writeApprovalHookFiles({
+        storageDir: this._storageDir,
+        nodePath,
+        shellKind,
+        url: server.url,
+        token: server.token,
+        // 三层超时梯度：扩展先放弃并拒绝(540) < 脚本 socket 放弃(560) < DSH 杀 hook(580)
+        scriptTimeoutMs: timeoutMs + 20000,
+        hookTimeoutSec: Math.ceil((timeoutMs + 40000) / 1000),
+        baseConfigPath: this._baseConfigPathAbs(),
+      });
+      this._approval = server;
+      this._approvalFiles = files;
+    } catch (err) {
+      server.dispose();
+      this._approvalWarn(`审批 hook 生成失败：${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+
+    // 自检：这条 hook 命令在**同一个 shell**（DSH 也是 bash -c）里跑得起来吗？
+    // 起不来 = 审批不会生效 —— 这种情况必须让用户知道，而不是看起来配好了。
+    const test = await testApprovalHook(this._approvalFiles.hookCommand, runCwd);
+    if (test.ok) {
+      console.log(`[approval] 事前审批已就绪（shell=${shellKind}，hook 自检通过）`);
+    } else {
+      this._approvalWarn(`审批 hook 自检未通过，审批不会生效：${test.detail}`);
+    }
+  }
+
+  /**
+   * 确认条与留痕要显示的文本。bash = 命令原文；C4 的 write/edit 载荷里**根本没有可展示的
+   * 命令**（正文是模型写的文件内容，绝不转发），所以在这里现拼一个路径标签。
+   */
+  private _approvalLabel(ask: ApprovalAsk): string {
+    if (ask.toolName === 'write' || ask.toolName === 'edit') {
+      const verb = ask.toolName === 'edit' ? '编辑' : '写';
+      const target = this._fsTargetAbs(ask) ?? String(ask.filePath ?? '（未知路径）');
+      return `${verb}工作区外的文件：${target}`;
+    }
+    return ask.command;
+  }
+
+  /** 需要用户拍板：推确认条 + 把侧栏亮出来（视图折叠着就看不见确认条，只能干等到超时）。 */
+  private _onApprovalAsk(ask: ApprovalAsk): void {
+    const label = this._approvalLabel(ask);
+    this._approvalCmds.set(ask.id, label);
+    this._post({
+      type: 'approval-request',
+      id: ask.id,
+      toolName: ask.toolName,
+      command: label,
+    });
+    // 视图折叠着就看不到确认条，只能干等到超时 → 主动把它亮出来（失败也不影响流程）
+    vscode.commands.executeCommand('hello.chatView.focus').then(undefined, () => {});
+    vscode.window.setStatusBarMessage(`等待确认：${oneLine(label, 60)}`, 5000);
+  }
+
+  /** 一条审批有了结果：收起确认条 + 往转写补一条留痕（note 随会话持久化/回放）。 */
+  private _onApprovalResolved(id: string, outcome: ApprovalOutcome): void {
+    const command = this._approvalCmds.get(id);
+    this._approvalCmds.delete(id);
+    this._post({ type: 'approval-resolved', id, outcome });
+    if (!command) return;
+    const label =
+      outcome === 'allowed'
+        ? '已允许执行'
+        : outcome === 'rejected'
+          ? '已拒绝，未执行'
+          : outcome === 'timeout'
+            ? '确认超时，已按拒绝处理（未执行）'
+            : '审批已取消（本轮停止或切换），未执行';
+    this._pushNote(`${label}：${oneLine(command, 120)}`);
+  }
+
+  /** 审批相关告警：控制台始终留痕，用户侧每次 activation 只弹一次（不刷屏）。 */
+  private _approvalWarn(text: string): void {
+    console.warn('[approval]', text);
+    if (this._approvalWarned) return;
+    this._approvalWarned = true;
+    void vscode.window.showWarningMessage(`事前审批未生效：${text}`);
+  }
+
   // ----- 配置 / 子进程构建（全部来自 hello.dsh.*，可被用户覆盖） -----
 
   private _dshConfig(): vscode.WorkspaceConfiguration {
     return vscode.workspace.getConfiguration('hello.dsh');
   }
 
-  /** DSH 运行路径是否已配：nodePath 与 entry 都填了才算（与 _makeSpawnRequest 的 throw 条件同构）。
+  /** DSH 运行路径是否已配（与 _makeSpawnRequest 的 throw 条件同构）：
+   *  便携运行时目录合法 → 算配好；否则要求 nodePath 与 entry 都填。
    *  注：若用户走 hello.dsh.command 整段覆盖而 nodePath/entry 为空，这里会报「未配置」——可接受边缘，
-   *  因为配置条引导的就是 nodePath/entry 路径本身。 */
+   *  因为配置条引导的就是这两条路径本身。 */
   private _dshConfigured(): boolean {
+    const runtime = this._runtime();
+    if (runtime) return runtime.ok;
     const conf = this._dshConfig();
     const nodePath = String(conf.get('nodePath') ?? '').trim();
     const entry = String(conf.get('entry') ?? '').trim();
     return !!(nodePath && entry);
+  }
+
+  /** 配置有什么毛病时说给用户听的一句话（配置条/告警用）；没问题则返回空串。 */
+  private _dshConfigProblem(): string {
+    const runtime = this._runtime();
+    return runtime && !runtime.ok ? runtime.problem : '';
   }
 
   /** 路径存在判断（目录或文件都算）。 */
@@ -1240,8 +2060,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return folder ? folder.uri.fsPath : os.homedir();
   }
 
-  /** 子进程 spawn 的 cwd：保证 tsx / @deepseek-ai/* 能解析（默认 DSH 仓库根）。 */
+  /** 子进程 spawn 的 cwd：便携运行时 = 运行时目录本身；否则保证 tsx / @deepseek-ai/* 能解析（默认 DSH 仓库根）。 */
   private _dshRunCwd(): string {
+    const runtime = this._runtime();
+    if (runtime?.ok) return runtime.dir;
     const conf = this._dshConfig();
     return String(conf.get('runCwd') ?? '').trim() || this._dshCwd();
   }
@@ -1268,11 +2090,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const conf = this._dshConfig();
     const env: NodeJS.ProcessEnv = { ...process.env };
 
-    const configFile = String(conf.get('config') ?? '').trim();
+    // C1：审批就绪时这里下发的是"派生配置"（用户原文 + hooks 插件块），否则就是用户原配置
+    const configFile = this._effectiveConfigPath();
     if (configFile) env.DSH_CORDIS_CONFIG = configFile;
 
+    // 便携运行时是打包好的纯 JS，不经过 tsx —— 别给它塞无意义的 tsconfig 环境变量
     const tsconfig = String(conf.get('tsconfig') ?? '').trim();
-    if (tsconfig) env.TSX_TSCONFIG_PATH = tsconfig;
+    if (tsconfig && !this._runtime()?.ok) env.TSX_TSCONFIG_PATH = tsconfig;
 
     // 会话落盘到 globalStorage（绝不落工作区 ./ 造成污染）
     const sessionRoot = path.join(this._storageDir, 'dsh-sessions');
@@ -1290,9 +2114,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * 组装 spawn 请求。支持两种模式：
+   * 组装 spawn 请求。三种模式，优先级从高到低：
    * - `hello.dsh.command` 非空 → 整段覆盖（command + args）；
-   * - 否则按 nodePath + --import loader + entry + config 拼（默认）。
+   * - `hello.dsh.runtimeDir` 指向一个合法的便携运行时 → 包内 node 跑纯 JS 入口（**不加 loader**）；
+   * - 否则按 nodePath + [--import loader] + entry + config 拼（开发者路径）。
    */
   private _makeSpawnRequest(): DshSpawnRequest {
     const conf = this._dshConfig();
@@ -1307,15 +2132,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         env,
       };
     }
+
+    const runtime = this._runtime();
+    if (runtime) {
+      // 指了运行时目录但不可用 → 报错。绝不退回 nodePath：那会让用户以为自己在跑便携包
+      if (!runtime.ok) throw new Error(runtime.problem);
+      return { command: runtime.node, args: [runtime.entry, runtime.config], cwd, env };
+    }
+
     const nodePath = String(conf.get('nodePath') ?? '').trim();
     const entry = String(conf.get('entry') ?? '').trim();
     if (!nodePath || !entry) {
-      throw new Error('DSH 未配置：请设置 hello.dsh.nodePath 与 hello.dsh.entry（或直接设 hello.dsh.command）。');
+      throw new Error('DSH 未配置：请设置 hello.dsh.runtimeDir（便携运行时），或 hello.dsh.nodePath + hello.dsh.entry，或直接设 hello.dsh.command。');
     }
-    const loader = String(conf.get('loader') ?? '').trim() || 'tsx/esm';
-    const configFile = String(conf.get('config') ?? '').trim();
-    const args = ['--import', loader];
-    if (entry) args.push(entry);
+    const loader = this._dshLoader(entry);
+    const configFile = this._effectiveConfigPath();
+    const args: string[] = [];
+    if (loader) args.push('--import', loader);
+    args.push(entry);
     if (configFile) args.push(configFile);
     return { command: nodePath, args, cwd, env };
   }
@@ -1531,6 +2365,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** 安全中止当前正在跑的流/整轮：半截助手消息标 interrupted，running 工具卡落 error。 */
   private _cancelActiveRun(): void {
+    // C1：切会话/切模式/新建对话都会走到这里，挂起的审批一律取消（放到早返回之前，宁可多清）
+    this._approval?.cancelAll();
     const ctrl = this._abort;
     if (!ctrl) return;
     const msg = this._runningMsg;
@@ -1554,6 +2390,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     this._cancelActiveRun();
     this._dropReview(true); // 切会话 → 清掉上一会话的审阅
+    this._resetTurnUsage(); // C3a：本轮读数属于切走的那个会话
     this._persistActiveSession();
 
     // 新打开的会话不会再续跑任何流：残留的 streaming 一律落成 interrupted
@@ -1576,6 +2413,58 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._sendHistory();
   }
 
+  /**
+   * 「在新对话中分支」（真 DSH ChatView 轮尾动作栏的分支按钮触发）：把当前 harness
+   * 会话深拷贝出一份新会话（保留全部转写）并切换过去。新会话继续发消息即进入 DSH
+   * 会话的下一轮；因分支与源会话共享同一 DSH 会话映射，模型记忆无缝延续（各 UI 会话
+   * 只展示自己的转写）。用户已在设计时拍板采用该"同记忆"语义。
+   */
+  private _forkSession(): void {
+    if (this._mode !== 'harness') return; // 分支按钮只在 harness 的真 ChatView 里存在
+    if (this._liveRunning || this._abort) {
+      vscode.window.setStatusBarMessage('等本轮结束后再分支', 3000);
+      return;
+    }
+    const src = this._active;
+    if (src.messages.length === 0) return;
+
+    // 深拷贝转写（ChatMessage 是纯 JSON 字段）；克隆副本防与源会话未来互染
+    const messages = JSON.parse(JSON.stringify(src.messages)) as ChatMessage[];
+    const firstUser = messages.find((m) => m.role === 'user');
+    const fork = this._store.create(
+      src.title
+        ? src.title + '（分支）'
+        : firstUser
+          ? titleFromText(firstUser.text)
+          : ''
+    );
+    fork.messages = messages;
+    fork.updatedAt = Date.now();
+    // C3a：分支**继承**用量累计。它保留了整份转写、且下面复用同一个 DSH 会话，
+    // 清零会让"刚分完支就显示本会话 0 token"读起来像 bug。代价是两个会话各显示同一份
+    // 累计（是副本不是分割）—— 这是有意为之。
+    fork.usage = src.usage;
+
+    this._dropReview(true); // 切会话 → 清掉上一会话的审阅（同 _openSession 惯例）
+    this._resetTurnUsage(); // C3a：本轮读数属于切走的那个会话
+    this._store.add(fork); // fork 已有内容 → 立即上历史列表
+    this._persistActiveSession(); // 归档源会话并落盘（fork 此时已在列，一并写入）
+
+    // C5：分支**继承**源会话的 DSH 身份，这样「分支共享同一份 DSH 记忆」在 host 重启之后依然成立。
+    // （只挂在 _dshSessions 这个缓存上是不够的 —— 缓存活不过重载，重载后 fork 会另铸 id、记忆断掉。）
+    fork.dsh = src.dsh;
+    // 记忆延续：分支共享源 DSH 会话 → 后续 _ensureDshSession 直接复用、不插"失忆"note
+    const srcDshId = this._dshSessions.get(src.id);
+    if (srcDshId) {
+      this._dshSessions.set(fork.id, srcDshId);
+    }
+
+    this._actives[this._mode] = fork;
+    this._seedMsgSeq(); // 续接消息 id 尾号，防撞 id
+    this._postSnapshot();
+    this._sendHistory();
+  }
+
   private _deleteSession(id: string): void {
     const isActive = this._active.id === id;
     if (isActive) {
@@ -1586,6 +2475,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     if (isActive) {
       this._dropReview(true); // 删的是当前会话 → 一并清掉审阅
+      this._resetTurnUsage(); // C3a：连同被删会话的本轮读数一起清掉
       this._actives[this._mode] = this._store.create();
       this._postSnapshot();
     }
@@ -1744,55 +2634,61 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   }
 
-  /** 轮首：清上一轮审阅 + 快照当前工作区根（同步取盘，快照点必须在一切 await 之前）。 */
+  /**
+   * 轮首：清上一轮审阅 + 快照当前工作区根（同步取盘，快照点必须在一切 await 之前）。
+   * 工作区外目标的根**这里不建** —— 它们由 C4 在 PreToolUse 路径上、真执行之前逐个补进
+   * `_reviewRoots`（见 `_onApprovalObserved`）。所以「工作区根快照 abort / 没有工作区文件夹」
+   * 不等于本轮无审阅，别在这里提前 return 掉那半。
+   */
   private _captureBaselineAtTurnStart(): void {
     this._reviewSeq += 1;
-    this._baseline = undefined;
-    this._reviewRootAbs = undefined;
+    // 重新赋值一个新 Map（而不是 clear）：对比那边靠**引用相等**判断「还是不是本轮」
+    this._reviewRoots = new Map();
     this._pendingReview = [];
     this._post({ type: 'review-clear' }); // 新一轮开始 → 隐去上轮审阅条
     const root = this._reviewRoot();
     if (!root || !this._reviewChangesOn()) return;
     const shot = snapshotTree(root);
-    if ('aborted' in shot) return; // 目录过大/根不可读 → 本轮静默无审阅
-    this._reviewRootAbs = root;
-    this._baseline = shot;
+    if ('aborted' in shot) return; // 目录过大/根不可读 → 工作区那半本轮无审阅（区外那半照常）
+    this._reviewRoots.set(root, { kind: 'tree', root, snap: shot });
   }
 
   /** 清掉本轮审阅内存；doPost 时通知 webview 隐藏审阅条/面板。 */
   private _dropReview(doPost: boolean): void {
     this._reviewSeq += 1;
-    this._baseline = undefined;
-    this._reviewRootAbs = undefined;
+    this._reviewRoots = new Map();
     this._pendingReview = [];
     if (doPost) {
       this._post({ type: 'review-clear' });
     }
   }
 
-  /** 轮 done 后（finally 里）调用：退栈再异步对比，token 失配即静默丢（防新一轮/清理交错）。 */
+  /**
+   * 轮 done 后（finally 里）调用：退栈再异步对比，token 失配即静默丢（防新一轮/清理交错）。
+   *
+   * **捕获的是 Map 的引用**：工作区根快照 abort（巨型工作区）或没开工作区文件夹时，本轮开局
+   * map 就是空的，区外根要到轮中才由 `_onApprovalObserved` 逐个补进来 —— 而那正是最需要
+   * 看见越界改动的人。所以判空放在退栈之后，且判的是**捕获到的那个** map。
+   */
   private _scheduleReviewAfterTurn(): void {
     const mySeq = this._reviewSeq;
-    const before = this._baseline;
-    const root = this._reviewRootAbs;
-    if (!before || !root) return;
+    const roots = this._reviewRoots;
     void (async () => {
       // 重活不在 _finishTurn/_runLive 的同步路径上做
       await new Promise<void>((r) => setImmediate(r));
-      if (this._reviewSeq !== mySeq || this._baseline !== before) return;
-      const afterShot = snapshotTree(root);
-      if ('aborted' in afterShot) {
-        this._baseline = undefined;
-        this._reviewRootAbs = undefined;
-        return;
+      if (this._reviewSeq !== mySeq || this._reviewRoots !== roots) return;
+      if (roots.size === 0) return; // 到这儿还空 = 本轮真的没得看
+      const pending: PendingReview[] = [];
+      // 逐根重快照；单个根 abort 只跳过它自己，不影响其余根
+      for (const r of roots.values()) {
+        const afterShot = r.kind === 'tree' ? snapshotTree(r.root) : snapshotSingleFile(r.root, r.target!);
+        if ('aborted' in afterShot) continue;
+        for (const change of compareTrees(r.snap, afterShot)) {
+          pending.push({ id: `rv${++this._reviewIdSeq}`, root: r, change });
+        }
       }
-      const changes = compareTrees(before, afterShot);
-      if (changes.length === 0) {
-        this._baseline = undefined;
-        this._reviewRootAbs = undefined;
-        return;
-      }
-      this._pendingReview = changes;
+      if (pending.length === 0) return;
+      this._pendingReview = pending;
       this._postReviewSet();
     })();
   }
@@ -1801,11 +2697,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _postReviewSet(): void {
     const out: ReviewChange[] = [];
     let budget = 200 * 1024; // 跨文件 diff 文本总护栏，防压垮 postMessage
-    for (const ch of this._pendingReview) {
+    for (const p of this._pendingReview) {
+      const ch = p.change;
       const item: ReviewChange = {
+        // id 在对比时已分配并存下，这里只搬运 —— 若按 out 下标现算，每次 keep/revert 重发
+        // 都会换一批 id，前端的展开态与动作会指错行
+        id: p.id,
         kind: ch.kind,
         rel: ch.rel,
         name: ch.rel.slice(ch.rel.lastIndexOf('/') + 1),
+        outside: p.root.outside,
         reversible: ch.reversible,
       };
       const beforeC = ch.before?.content ?? undefined;
@@ -1833,61 +2734,62 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._post({ type: 'review-set', changes: out });
   }
 
-  /** 审阅动作入口（keep/revert 单条 + keep-all/revert-all）。正在跑或没有本轮基线 → 忽略。 */
-  private _reviewAction(action: 'keep' | 'revert' | 'keep-all' | 'revert-all', rel?: string): void {
-    if (this._abort || !this._baseline || !this._reviewRootAbs) return;
-    const root = this._reviewRootAbs;
+  /** 审阅动作入口（keep/revert 单条 + keep-all/revert-all）。正在跑或本轮没算过 → 忽略。
+   *  注意判空**必须看 length**：`_reviewRoots` 是 Map，拿它当布尔**恒为真**，守卫会凭空消失。 */
+  private _reviewAction(action: 'keep' | 'revert' | 'keep-all' | 'revert-all', id?: string): void {
+    if (this._abort || this._pendingReview.length === 0) return;
 
     if (action === 'keep' || action === 'keep-all') {
       // keep = 保留磁盘改动，仅从审阅里收起，不碰文件
-      this._pendingReview = rel
-        ? this._pendingReview.filter((c) => c.rel !== rel)
+      this._pendingReview = id
+        ? this._pendingReview.filter((c) => c.id !== id)
         : [];
       if (this._pendingReview.length === 0) this._dropReview(true);
       else this._postReviewSet();
       return;
     }
 
-    const targets = rel
-      ? this._pendingReview.filter((c) => c.rel === rel)
+    const targets = id
+      ? this._pendingReview.filter((c) => c.id === id)
       : this._pendingReview.slice();
     if (targets.length === 0) return;
 
-    const ok: TreeChange[] = [];
+    const ok: PendingReview[] = [];
     const failed: { rel: string; reason: string }[] = [];
-    for (const ch of targets) {
-      if (!ch.reversible) {
-        failed.push({ rel: ch.rel, reason: '无轮前内容可还原（二进制/超大文件）' });
+    for (const p of targets) {
+      if (!p.change.reversible) {
+        failed.push({ rel: p.change.rel, reason: '无轮前内容可还原（二进制/超大文件）' });
         continue;
       }
       try {
-        applyRevert(root, ch);
-        ok.push(ch);
+        // 还原回**它自己那个根**（区外项的工作区根完全不同）
+        applyRevert(p.root.root, p.change);
+        ok.push(p);
       } catch (err) {
-        failed.push({ rel: ch.rel, reason: err instanceof Error ? err.message : String(err) });
+        failed.push({ rel: p.change.rel, reason: err instanceof Error ? err.message : String(err) });
       }
     }
     if (ok.length > 0) {
       this._pendingReview = this._pendingReview.filter((c) => !ok.includes(c));
       const summary =
         ok.length === 1
-          ? `已还原本轮 DSH 改动：${ok[0].rel}`
+          ? `已还原本轮 DSH 改动：${oneLine(ok[0].change.rel, 120)}`
           : `已还原本轮 DSH 改动：${ok.length} 个文件成功`;
-      this._pushReviewNote(
-        failed.length > 0 ? `${summary}；${failed.length} 个未还原` : summary
-      );
+      this._pushNote(failed.length > 0 ? `${summary}；${failed.length} 个未还原` : summary);
     }
     if (failed.length > 0) {
       vscode.window.showErrorMessage(
-        `还原失败 ${failed.length} 项：${failed.map((f) => `${f.rel}（${f.reason}）`).join('、')}`
+        `还原失败 ${failed.length} 项：${failed
+          .map((f) => `${oneLine(f.rel, 80)}（${f.reason}）`)
+          .join('、')}`
       );
     }
     if (this._pendingReview.length === 0) this._dropReview(true);
     else this._postReviewSet();
   }
 
-  /** 把一条 role:'note' 说明入列当前会话并下发（还原反馈；react-live 态仅在转录持久化可见）。 */
-  private _pushReviewNote(text: string): void {
+  /** 把一条 role:'note' 说明入列当前会话并下发（还原反馈/审批留痕；react-live 态仅在转录持久化可见）。 */
+  private _pushNote(text: string): void {
     const note: ChatMessage = {
       id: this._nextMsgId(),
       role: 'note',
@@ -1926,6 +2828,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       messages: this._active.messages,
       sessionId: this._active.id,
       sessionTitle: this._active.title,
+      // C3a：读数随整帧一起下发 —— 它本身就是会话级状态，跟 snapshot 同生共死，
+      // 既能把重开会话的累计恢复出来，也保证"切到没有用量的会话"时细条被清掉。
+      usage: this._usageReadout(),
     });
   }
 
@@ -1950,6 +2855,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
     const jsUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this._extensionUri, 'media', 'chat.js')
+    );
+    // 侧栏头部的品牌标记：拿单色 icon.svg 当遮罩（见 chat.html 的 .brand-mark）。
+    // 走 img-src（CSP 已放行 cspSource），不需要额外改 CSP。
+    const iconUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this._extensionUri, 'media', 'icon.svg')
     );
 
     // 真 DSH 组件的构建产物（media/dsh-live）。缺失时置空 → webview 侧懒加载桥自动
@@ -1979,6 +2889,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       .replace(/%%CSP_SOURCE%%/g, webview.cspSource)
       .replace(/%%NONCE%%/g, nonce)
       .replace(/%%CSS_URI%%/g, cssUri.toString())
+      .replace(/%%ICON_URI%%/g, iconUri.toString())
       .replace(/%%JS_URI%%/g, jsUri.toString())
       .replace(/%%DSH_THEME_LINK%%/g, dshThemeLink)
       .replace(/%%DSH_LIVE_JS_URI%%/g, dshLiveJsUri)

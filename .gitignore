@@ -13,6 +13,11 @@ logs/
 # 公开仓不含此目录——clone 后需按 README 从 DSH 仓库重建（否则回退 VS Code 观感、无 react-live）。
 media/dsh-live/
 
+# 便携运行时产出（scripts/build-runtime.mjs；含 node.exe + 上百个包，体积大且可重建）
+dist-runtime/
+
 # 无头开发探针（本机验证用，引用本地 dsh-live 产物）
 probe-*.html
 probe-server.mjs
+# 审批链路自检脚本：写死了本机 node / bash 绝对路径，不入库
+probe-*.cjs

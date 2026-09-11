@@ -1,9 +1,10 @@
 {
   "name": "hello-vscode-ext",
-  "displayName": "Hello VS Code",
-  "description": "第一个最小可跑的 VS Code 插件：一条打招呼命令 + 读取当前文件",
+  "displayName": "AlohaDSH",
+  "description": "把 DeepSeek Harness（DSH）接进 VS Code 侧边栏：流式对话、选区自动附带、每轮文件改动审阅、破坏性命令执行前审批。",
   "version": "0.0.1",
   "publisher": "starmerx-local",
+  "icon": "media/logo.png",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -17,7 +18,7 @@
       "activitybar": [
         {
           "id": "hello-chat",
-          "title": "Hello Chat",
+          "title": "AlohaDSH",
           "icon": "media/icon.svg"
         }
       ]
@@ -36,44 +37,50 @@
       {
         "command": "hello.sayHello",
         "title": "打个招呼",
-        "category": "Hello"
+        "category": "AlohaDSH"
       },
       {
         "command": "hello.readActiveFile",
         "title": "读取当前文件第一行",
-        "category": "Hello"
+        "category": "AlohaDSH"
       },
       {
         "command": "hello.chat.newChat",
         "title": "开始新对话",
-        "category": "Hello Chat"
+        "category": "AlohaDSH"
       },
       {
         "command": "hello.dsh.configure",
         "title": "配置 DSH 运行路径",
-        "category": "Hello Chat"
+        "category": "AlohaDSH"
       }
     ],
     "configuration": [
       {
-        "title": "Hello Chat · DeepSeek Harness",
+        "title": "AlohaDSH · DeepSeek Harness",
         "properties": {
+        "hello.dsh.runtimeDir": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "**便携运行时目录（推荐）**：指向一个含 `runtime.json` 的目录（由 `scripts/build-runtime.mjs` 产出）。node、入口、cordis.yml 全从清单里解析，包内自带 node，**不需要 tsx、不需要 DSH 检出**。\n\n设了它就**优先于** `nodePath` / `loader` / `entry` / `config` / `runCwd`（`hello.dsh.command` 仍最高，整段覆盖）；目录不可用时会明确报错，**不会**悄悄回退到旧的 nodePath 配置。",
+          "scope": "machine"
+        },
         "hello.dsh.nodePath": {
           "type": "string",
           "default": "",
-          "markdownDescription": "启动 DSH JSON-RPC runtime 用的 node 可执行文件（留空会走提示引导，见 README「DSH 直播配置」）。",
+          "markdownDescription": "启动 DSH JSON-RPC runtime 用的 node 可执行文件。**开发者路径**：需要本地 DSH 检出，配 `entry` / `config` / `runCwd`。若已设 `hello.dsh.runtimeDir`，这一项不生效。（留空会走提示引导，见 README「DSH 直播配置」。）",
           "scope": "machine"
         },
         "hello.dsh.loader": {
           "type": "string",
-          "default": "tsx/esm",
-          "markdownDescription": "传给 `node --import` 的 tsx 加载器标识（与 DSH 仓库自身的启动脚本一致）。",
+          "default": "",
+          "markdownDescription": "传给 `node --import` 的加载器标识。**留空即按入口扩展名自动判断**：`.ts` / `.tsx` / `.mts` 走 `tsx/esm`，打包好的 `.js`（如便携运行时的入口）不加任何加载器。只有在自动判断不合用时才需要显式覆盖。",
           "scope": "machine"
         },
         "hello.dsh.entry": {
           "type": "string",
           "default": "",
-          "markdownDescription": "DSH jsonrpc-agent 的入口脚本（源码版，需配 tsx 加载；留空会走提示引导）。",
+          "markdownDescription": "DSH jsonrpc-agent 的入口脚本。**开发者路径**：源码版 `.ts` 需配 tsx 加载（留空会自动判断）；若已设 `hello.dsh.runtimeDir`，这一项不生效。",
           "scope": "machine"
         },
         "hello.dsh.config": {
@@ -134,7 +141,7 @@
         }
       },
       {
-        "title": "Hello Chat · 发送与审阅",
+        "title": "AlohaDSH · 发送与审阅",
         "properties": {
           "hello.chat.autoAttachSelection": {
             "type": "boolean",
@@ -145,7 +152,45 @@
           "hello.chat.reviewChanges": {
             "type": "boolean",
             "default": true,
-            "markdownDescription": "每轮 Harness 结束后对比工作区根的文件改动并显示审阅条（增/改/删，可展开行级 diff，可单文件或全部保留/还原）。需打开工作区文件夹；二进制/超大文件只列出、不预览也不可还原。\n\nAfter each Harness turn, diff file changes under the workspace root and show a review bar (added/modified/deleted with inline diffs; keep or revert per file or all). Requires an open workspace folder; binary/oversized files are listed but not previewable or revertible.",
+            "markdownDescription": "每轮 Harness 结束后对比工作区根的文件改动并显示审阅条（增/改/删，可展开行级 diff，可单文件或全部保留/还原）。二进制/超大文件只列出、不预览也不可还原。\n\n**工作区外**的改动也会一并列出（标出所在目录），前提是 `hello.chat.approval.enabled` 开着 —— 那条 `PreToolUse` hook 顺带在写之前留了张轮前快照。同样只看 `write`/`edit` 工具，bash 命令造成的区外改动不在内。\n\nAfter each Harness turn, diff file changes under the workspace root and show a review bar. Changes **outside** the workspace are listed too (with their directory), as long as `hello.chat.approval.enabled` is on. Written via the `write`/`edit` tools only — bash-mediated writes are not covered.",
+            "scope": "window"
+          },
+          "hello.chat.approval.enabled": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "**事前审批**（**默认开启**）：命中下方策略的 bash 命令、以及越出工作区的写文件/改文件，在**执行前**弹确认条，整轮暂停等你点「允许执行 / 拒绝」；拒绝则该调用不会执行，转写里留一条记录。实现方式是在 DSH 组合配置里挂一条 `PreToolUse` hook（派生配置写在扩展存储目录，不改动你的 cordis.yml）。不需要这道护栏就把这里关掉。\n\n**关掉它会连带关掉「工作区外改动」的可见性** —— 那条 hook 是唯一的传感器。另外注意它**只覆盖 bash 与 write/edit 工具**：agent 用 bash 命令（`cp`/`mv`/重定向）写到工作区外时既不弹条、也不会出现在审阅里（见 `hello.chat.approval.outsideWorkspace` 说明）。\n\n改这个开关后需重连（切模型或重载窗口）才生效；`patterns` / `timeoutSec` / `outsideWorkspace` 改动即时生效。若 `hello.dsh.command` 整段覆盖了启动命令，则此功能不可用（会提示）。\n\n**Pre-execution approval** (on by default): matching bash commands, plus file writes outside the workspace, raise a confirm bar before running. Turning this off also disables outside-workspace change visibility (the hook is the only sensor). Covers `bash` and `write`/`edit` only — writes made by a bash command are neither gated nor reviewed. Requires a reconnect after toggling.",
+            "scope": "window"
+          },
+          "hello.chat.approval.outsideWorkspace": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "**工作区外写确认**（**默认开启**）：agent 写文件/改文件的目标落在当前工作区之外时，执行前弹确认条（工作区**内**的写不弹，照旧由每轮改动审阅展示）。关掉它只是**不再问** —— 只要上面的事前审批还开着，工作区外的改动仍然会照旧出现在本轮审阅里（可看、可还原）。平台临时目录（`%TEMP%` / `/tmp`）两边都豁免：临时文件的增删改不值得打断你，也不该算进本轮改动。\n\n局限：判定只看 `write`/`edit` 工具的目标路径，**不解析 bash 命令串里的路径**。所以 agent 用 `cp`/`mv`/`>` 写到工作区外时，这道确认与审阅都盖不到。\n\n**Outside-workspace write approval** (on by default). Turning it off only stops the asking; outside changes are still shown in the per-turn review. Temp directories are exempt from both. Limitation: only `write`/`edit` tool targets are inspected — paths inside a bash command string are not parsed, so bash-mediated outside writes are neither gated nor reviewed.",
+            "scope": "window"
+          },
+          "hello.chat.approval.patterns": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": [
+              "\\brm\\b",
+              "\\brmdir\\b",
+              "\\bmkfs(\\.|\\s|$)",
+              "\\bdd\\b[^|]*\\bof=",
+              "\\bdiskpart\\b",
+              "\\bformat\\s+[A-Za-z]:",
+              "\\bgit\\s+push\\b[^|]*--force",
+              "\\bgit\\s+reset\\s+--hard\\b",
+              "\\b(shutdown|reboot|poweroff)\\b",
+              ":\\s*\\(\\s*\\)\\s*\\{"
+            ],
+            "markdownDescription": "命中任意一条（不区分大小写的正则）即弹确认条。默认是一份保守清单：任何 `rm`（含 `rm <文件>`）、`rmdir`、`mkfs`、`dd of=`、`diskpart`、`format X:`、`git push --force`、`git reset --hard`、关机类、fork bomb。改这里即时生效。非法正则会跳过该条（不会变成「拒绝一切」）。\n\nRegular expressions (case-insensitive); a match triggers the confirm bar. Empty/invalid entries are skipped.",
+            "scope": "window"
+          },
+          "hello.chat.approval.timeoutSec": {
+            "type": "number",
+            "default": 540,
+            "minimum": 10,
+            "maximum": 1800,
+            "markdownDescription": "等你确认的秒数；超时按**拒绝**处理（命令不执行）。默认 540 秒，与 hook 超时形成梯度，保证是扩展先放弃而不是进程被砍在半路。\n\nSeconds to wait before denying by timeout (default 540).",
             "scope": "window"
           }
         }

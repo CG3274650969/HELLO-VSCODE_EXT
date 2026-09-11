@@ -5,9 +5,9 @@ import { ChatViewProvider } from './chatViewProvider';
 // VS Code 加载插件后，会先调用 activate()。
 // 你的所有注册（命令、监听器、视图…）都要放在这里，并 push 进 context.subscriptions。
 export function activate(context: vscode.ExtensionContext) {
-  console.log('Hello 插件已激活 🎉');
+  console.log('AlohaDSH 插件已激活 🎉');
 
-  // ---- 侧边栏聊天（Hello Chat） ----
+  // ---- 侧边栏聊天（AlohaDSH） ----
   const chatProvider = new ChatViewProvider(
     context.extensionUri,
     context.globalStorageUri.fsPath, // 历史会话持久化目录（含 dsh-sessions/ 子目录）
