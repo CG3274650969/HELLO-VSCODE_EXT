@@ -9,7 +9,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
-import { ChatMessage } from './protocol';
+import { ChatMessage, UsageBuckets } from './protocol';
 
 export interface StoredSession {
   id: string;
@@ -17,6 +17,9 @@ export interface StoredSession {
   createdAt: number;
   updatedAt: number;
   messages: ChatMessage[];
+  /** C3a 本会话 token 累计（跨轮累加、随会话落盘）。旧数据没有本字段 → 视为缺省，
+   *  `_load` 只按 messages 是否数组过滤，故加字段向后兼容。 */
+  usage?: UsageBuckets;
 }
 
 /** 由首条用户消息生成一句话标题（单行、截断）。 */

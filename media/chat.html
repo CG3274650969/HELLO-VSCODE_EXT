@@ -97,6 +97,13 @@
     <div id="attach-bar" class="attach-bar" hidden>
       <div id="attach-list" class="attach-list"></div>
     </div>
+    <!-- C3a 用量读数细条：本轮/本会话 token + 上下文占用率。挂在输入卡正上方、composer 内 →
+         react-live 只藏 #messages，两种画面都看得见（同 review-bar 的道理）。
+         由扩展 usage / snapshot 驱动：没数据时（旧会话、刚切过来、内嵌聊天）整条隐藏。
+         文案由 chat.js 用 textContent 落进这一个 span（全仓零 innerHTML）。 -->
+    <div id="usage-bar" class="usage-bar" hidden>
+      <span id="usage-summary" class="usage-summary"></span>
+    </div>
     <!-- CC 桌面式整卡 composer：输入区与下方工具行并入同一张圆角卡片（输入透明、无自身边框），
          卡片 hover/focus 整圈出环；内嵌聊天 / harness 共用这一张卡，只是中间簇显隐不同。 -->
     <div id="composer-card" class="composer-card">

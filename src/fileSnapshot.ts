@@ -4,7 +4,8 @@
  * 按轮前内容还原。全 node fs 同步、零第三方依赖；行级 diff 用 LCS（预算内），无 diff 库。
  *
  * 统一约定：
- * - `rel` 一律用 `/` 分隔的工作区根相对路径，绝对路径不出模块。
+ * - `rel` 一律用 `/` 分隔的**根相对**路径（根由调用方给：工作区根，或 C4 的单文件父目录），
+ *   绝对路径不出模块 —— `SnapEntry.abs` 是唯一的例外，但它只在本模块内被读。
  * - 内容存内存有上限（单文件 + 总量软预算）；超大/二进制只记 `size+mtime`，判为不可预览、
  *   不可还原（除非是 added —— 删除文件不需要内容）。
  */
@@ -112,35 +113,72 @@ export function snapshotTree(root: string): SnapOutcome {
       count += 1;
       if (count > MAX_FILES) return { aborted: true, reason: `文件数超限（>${MAX_FILES}）` };
 
-      let size = 0;
-      let mtimeMs = 0;
-      try {
-        const s = fs.statSync(childAbs);
-        size = s.size;
-        mtimeMs = s.mtimeMs;
-      } catch {
-        continue;
-      }
-
-      let content: string | null = null;
-      const isBinExt = BIN_EXT.has(path.extname(ent.name).slice(1).toLowerCase());
-      if (!isBinExt && size <= MAX_FILE_STORE_BYTES && budget > 0) {
-        try {
-          const buf = fs.readFileSync(childAbs);
-          // 前 8KB 含 NUL → 判二进制（扩展名表没盖住的真二进制）
-          if (!buf.subarray(0, 8192).includes(0)) {
-            content = buf.toString('utf8');
-            budget -= buf.length;
-            if (budget <= 0) truncated = true;
-          }
-        } catch {
-          /* 读失败当无内容（仍记元数据，改动可检出但不可预览/不可还原） */
-        }
-      }
-      files.set(childRel, { rel: childRel, abs: childAbs, size, mtimeMs, content });
+      const entry = readEntry(childAbs, childRel, budget);
+      if (!entry) continue;
+      budget = entry.budget;
+      if (entry.truncated) truncated = true;
+      files.set(childRel, entry.entry);
     }
   }
   return { root: rootAbs, files, truncated };
+}
+
+/**
+ * 读单个文件条目（文件不存在 / stat 失败 → null，与树快照「跳过这颗文件」同义）。
+ * 抽出来给 C4 的单文件快照复用 —— 两条路径对「什么算可预览内容」必须完全一致，
+ * 否则工作区内外的同一个文件会出现两种 diff 行为。
+ */
+function readEntry(
+  abs: string,
+  rel: string,
+  budget: number
+): { entry: SnapEntry; budget: number; truncated: boolean } | null {
+  let size = 0;
+  let mtimeMs = 0;
+  try {
+    const s = fs.statSync(abs);
+    size = s.size;
+    mtimeMs = s.mtimeMs;
+  } catch {
+    return null;
+  }
+
+  let content: string | null = null;
+  let truncated = false;
+  const isBinExt = BIN_EXT.has(path.extname(abs).slice(1).toLowerCase());
+  if (!isBinExt && size <= MAX_FILE_STORE_BYTES && budget > 0) {
+    try {
+      const buf = fs.readFileSync(abs);
+      // 前 8KB 含 NUL → 判二进制（扩展名表没盖住的真二进制）
+      if (!buf.subarray(0, 8192).includes(0)) {
+        content = buf.toString('utf8');
+        budget -= buf.length;
+        if (budget <= 0) truncated = true;
+      }
+    } catch {
+      /* 读失败当无内容（仍记元数据，改动可检出但不可预览/不可还原） */
+    }
+  }
+  return { entry: { rel, abs, size, mtimeMs, content }, budget, truncated };
+}
+
+/**
+ * 单文件快照（C4：工作区外目标）。根取该文件的**父目录**，条目 rel = basename ——
+ * 于是 `compareTrees` / `applyRevert` 对这个快照与树快照**完全同构**，一行不用改。
+ *
+ * 为什么不快照父目录：① `~` 这类父目录动辄撞 `MAX_FILES` 直接 abort，越该看见的越静默；
+ * ② 本函数在 PreToolUse 路径上（HTTP 处理中、确认条弹出**之前**）同步跑，扫大目录会卡住
+ *   UI；③ 目录快照会把用户同一时段的编辑一并算到 agent 头上。单文件快照三者皆无。
+ */
+export function snapshotSingleFile(rootAbs: string, absFile: string): FsSnapshot {
+  const root = path.resolve(rootAbs);
+  const abs = path.resolve(absFile);
+  const rel = path.basename(abs);
+  const files = new Map<string, SnapEntry>();
+  const r = readEntry(abs, rel, MAX_CONTENT_BUDGET);
+  if (r) files.set(rel, r.entry);
+  // 文件不存在时是空快照 —— 正是「新增」该有的轮前状态，不是失败。
+  return { root, files, truncated: r?.truncated ?? false };
 }
 
 /** 对比两棵快照：before 有 after 无 = deleted；都有 = content/size+mtime 比较 → modified；反之为 added。 */

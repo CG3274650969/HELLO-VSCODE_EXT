@@ -623,6 +623,32 @@ body.vscode-high-contrast .brand-mark {
   gap: 4px;
 }
 
+/* ---------- C3a 用量读数条（本轮/本会话 token + 上下文占用） ---------- */
+/* 同 review-bar：挂在 composer 内、输入卡正上方；react-live 只藏 #messages，故两态都可见。
+   纯读数不可点，故比 review-bar 更薄（无按钮列、上下留白各减 1px），仍是同一张软卡片配方。 */
+.usage-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px;
+  border: 1px solid var(--dsw-alias-border-l2, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.25)));
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-1, var(--vscode-editor-inactiveSelectionBackground, rgba(128, 128, 128, 0.12)));
+  font-size: 11px;
+  line-height: 1.6;
+}
+.usage-summary {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  /* 数字位数会随流式刷新跳（2.8K → 11.8K），等宽数字让整行不左右抖。
+     不给整行挂 code 字体：行里混着中文标签，会 fallback 到系统等宽中文字体，反而更丑。 */
+  font-variant-numeric: tabular-nums;
+}
+
 /* 通用附件 chip：待发送可移除 / 气泡里只读 */
 .chip {
   display: inline-flex;
@@ -1250,6 +1276,18 @@ body.react-live #empty-hint {
   font-family: var(--dsw-code-font-family, var(--vscode-editor-font-family, Consolas, monospace));
   font-size: 11px;
   color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
+}
+/* C4：工作区外项的所在目录。单独一个元素（不并进 .rp-name）是为了让它**先于文件名**
+   被压缩，且 hover 有 title 给全路径；flex 不增长 —— 它只是标识，不该把文件名挤没。 */
+.rp-outside {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  opacity: 0.72;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
 }
 .rp-file-spacer {
   flex: 1;

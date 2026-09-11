@@ -78,7 +78,12 @@
   var approvalAllowBtn = document.getElementById('approval-allow');
   var approvalDenyBtn = document.getElementById('approval-deny');
   var approvalId = null;
-  var expandedRel = null; // 当前展开 diff 的文件（同刻只开一行）
+  var expandedRel = null; // 当前展开 diff 的审阅项 id（同刻只开一行；键用 id 不用 rel，C4 起可跨根）
+
+  // C3a 用量读数：扩展把整条 UsageReadout 算好下发，这里只格式化 + 填充。null = 无数据，整条隐藏。
+  var usageBar = document.getElementById('usage-bar');
+  var usageSummary = document.getElementById('usage-summary');
+  var usageState = null;
 
   // 顶部模式：chat（内嵌聊天）/ harness（Agent）。两种模式各一套草稿与待发附件，互不串。
   var modeTabs = Array.prototype.slice.call(document.querySelectorAll('.mode-tab'));
@@ -288,11 +293,12 @@
       else modified++;
     }
     reviewPanelSub.textContent = '＋' + added + '  改' + modified + '  −' + deleted;
-    // 展开的那行若已被移出（revert/keep），重置 expandedRel
+    // 展开的那行若已被移出（revert/keep），重置 expandedRel。键用 id 而不是 rel ——
+    // C4 之后列表可能跨多个根，不同目录下会有同名 rel（两个 note.txt）
     var still = false;
     if (expandedRel !== null) {
       for (var e = 0; e < reviewChanges.length; e++) {
-        if (reviewChanges[e].rel === expandedRel) {
+        if (reviewChanges[e].id === expandedRel) {
           still = true;
           break;
         }
@@ -304,11 +310,11 @@
     }
   }
 
-  /** 单条改动的行：操作徽 + 相对路径 + 展开 diff / 保留 / 还原。按钮回调闭包捕获 rel。 */
+  /** 单条改动的行：操作徽 + 相对路径 + 展开 diff / 保留 / 还原。按钮回调闭包捕获 id。 */
   function buildReviewRow(ch) {
     var box = document.createElement('div');
     box.className = 'rp-file';
-    var isOpen = expandedRel === ch.rel;
+    var isOpen = expandedRel === ch.id;
 
     var row = document.createElement('div');
     row.className = 'rp-file-row';
@@ -321,8 +327,18 @@
     var name = document.createElement('span');
     name.className = 'rp-name';
     name.textContent = ch.rel;
-    name.title = ch.rel;
+    name.title = ch.outside ? ch.outside + '\\' + ch.rel : ch.rel;
     row.appendChild(name);
+
+    // C4：工作区外的项另起一段显示所在目录。**不能并进 .rp-name** —— 那是
+    // overflow:hidden + ellipsis，长路径被截掉的恰好是最该看见的尾巴。
+    if (ch.outside) {
+      var out = document.createElement('span');
+      out.className = 'rp-outside';
+      out.textContent = '工作区外 · ' + ch.outside;
+      out.title = ch.outside;
+      row.appendChild(out);
+    }
 
     var spacer = document.createElement('span');
     spacer.className = 'rp-file-spacer';
@@ -334,12 +350,12 @@
     toggle.textContent = isOpen ? '收起' : 'Diff';
     toggle.disabled = !ch.diff && !ch.diffTruncated;
     toggle.title = ch.diff ? '展开行级 diff' : (ch.diffTruncated ? 'diff 过大未附内容' : '无可预览内容（二进制/超大）');
-    (function (rel) {
+    (function (id) {
       toggle.addEventListener('click', function () {
-        expandedRel = expandedRel === rel ? null : rel;
+        expandedRel = expandedRel === id ? null : id;
         renderReviewList();
       });
-    })(ch.rel);
+    })(ch.id);
     row.appendChild(toggle);
 
     var keep = document.createElement('button');
@@ -347,11 +363,11 @@
     keep.className = 'link-button rp-keep';
     keep.textContent = '保留';
     keep.title = '保留该文件改动，从审阅里移除';
-    (function (rel) {
+    (function (id) {
       keep.addEventListener('click', function () {
-        post({ type: 'review-keep', rel: rel });
+        post({ type: 'review-keep', id: id });
       });
-    })(ch.rel);
+    })(ch.id);
     row.appendChild(keep);
 
     var revert = document.createElement('button');
@@ -360,11 +376,11 @@
     revert.textContent = '还原';
     revert.disabled = !ch.reversible;
     revert.title = ch.reversible ? '用轮前快照还原该文件' : '无轮前内容可还原（二进制/超大文件）';
-    (function (rel) {
+    (function (id) {
       revert.addEventListener('click', function () {
-        post({ type: 'review-revert', rel: rel });
+        post({ type: 'review-revert', id: id });
       });
-    })(ch.rel);
+    })(ch.id);
     row.appendChild(revert);
 
     box.appendChild(row);
@@ -710,6 +726,10 @@
     harnessStatusEl.hidden = mode !== 'harness';
     refreshLiveConfigVisibility(); // 配置条仅 harness 常驻
     renderPending();
+    // C3a：先清读数。紧随其后的 snapshot 会带该模式的 usage 重新点亮（顺序有保证：
+    // mode-set 后必跟 snapshot）；没带就说明该模式无数据（内嵌聊天）→ 保持隐藏。
+    usageState = null;
+    renderUsageBar();
     syncReactLive(); // 模式一变先重算真组件显隐，updateBusy 才能据此锁按钮
     updateBusy();
     toggleEmptyHint();
@@ -778,6 +798,72 @@
     var hm = pad(d.getHours()) + ':' + pad(d.getMinutes());
     if (d.toDateString() === now.toDateString()) return hm;
     return pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + hm;
+  }
+
+  // ---------- C3a 用量读数 ----------
+
+  /** token 数紧凑化：<1000 原样，<1e6 一位小数 K，其余一位小数 M（同 DSH 官方 formatTokens）。 */
+  function fmtTokens(n) {
+    if (!(n > 0)) return '0';
+    if (n < 1000) return String(n);
+    if (n < 1000000) return (n / 1000).toFixed(1) + 'K';
+    return (n / 1000000).toFixed(1) + 'M';
+  }
+
+  /** part/whole 的百分比取整；whole 非正时返回 null（调用方据此整段略去）。 */
+  function fmtPercent(part, whole) {
+    if (!(whole > 0)) return null;
+    return Math.round((part / whole) * 100);
+  }
+
+  /**
+   * 整条重绘读数条。usageState 为 null（内嵌聊天 / 旧会话 / 该轮无样本）时整条隐藏。
+   * 文案形如：本轮 ↑11.8K ↓948 · 缓存 97% · 累计 ↑58.2K ↓4.1K · 上下文 2.8K / 1M
+   * ↑ = 计费输入（未命中 + 缓存读），↓ = 输出（已含 reasoning，勿另加）。
+   * 上下文用绝对值打底：1M 窗口下百分比长期是 0.x%，主显百分比等于常驻「0%」。
+   */
+  function renderUsageBar() {
+    var u = usageState;
+    if (!u) {
+      usageBar.hidden = true;
+      usageSummary.textContent = '';
+      usageSummary.title = '';
+      return;
+    }
+    var parts = [];
+    var t = u.turn;
+    if (t && (t.inputTokens || t.cacheReadTokens || t.outputTokens)) {
+      var billedIn = t.inputTokens + t.cacheReadTokens;
+      var seg = '本轮 ↑' + fmtTokens(billedIn) + ' ↓' + fmtTokens(t.outputTokens);
+      var hit = fmtPercent(t.cacheReadTokens, billedIn);
+      if (hit !== null) seg += ' · 缓存 ' + hit + '%';
+      parts.push(seg);
+    }
+    var s = u.session;
+    if (s && (s.inputTokens || s.cacheReadTokens || s.outputTokens)) {
+      parts.push(
+        '累计 ↑' + fmtTokens(s.inputTokens + s.cacheReadTokens) + ' ↓' + fmtTokens(s.outputTokens)
+      );
+    }
+    var ctx = u.context;
+    if (ctx && ctx.contextWindow > 0) {
+      var seg2 = '上下文 ' + fmtTokens(ctx.usedTokens) + ' / ' + fmtTokens(ctx.contextWindow);
+      var pct = fmtPercent(ctx.usedTokens, ctx.contextWindow);
+      if (pct !== null && pct >= 1) seg2 += '（' + pct + '%）';
+      parts.push(seg2);
+    }
+    if (!parts.length) {
+      usageBar.hidden = true;
+      usageSummary.textContent = '';
+      usageSummary.title = '';
+      return;
+    }
+    var line = parts.join(' · ');
+    // title 给全量（含被 ellipsis 截掉的中段）+ 口径说明：读数条窄，侧栏一窄就截。
+    usageSummary.title =
+      line + '\n↑ 计费输入（未命中 + 缓存读）· ↓ 输出（含 reasoning）· 缓存 = 缓存读占输入比';
+    usageSummary.textContent = line;
+    usageBar.hidden = false;
   }
 
   function renderHistory() {
@@ -1606,10 +1692,20 @@
         }
         renderSnapshot(data.messages);
         renderHistory();
+        // C3a：读数随快照整帧重放（切会话/切模式/重开窗口）。没带就是真没有 → 藏起来，
+        // 免得带着上个会话的数字留在条上。
+        usageState = data.usage || null;
+        renderUsageBar();
         // react-live：把最新整幅消息中继给真 ChatView 作回放前缀（重建/切会话/清空/删除）。
         // 扩展不再直发 dsh-replay——快照可能早于 React 挂载，统一由此处按较晚者补发。
         lastSnapshotMessages = data.messages;
         maybeBridgeReplay(data.messages);
+        break;
+
+      case 'usage':
+        // C3a：每个 usage 样本一条 + 轮尾定稿一条，整条重绘（数据由扩展算好，这里只格式化）。
+        usageState = data.usage || null;
+        renderUsageBar();
         break;
 
       case 'history-update':

@@ -180,6 +180,18 @@ Harness 页签顶部状态点依次显示连接：灰 未连接 → 蓝 连接�
 面板开着时改动任一路径 / 模型 / key，live 子进程会自动重启（状态点跟随）。历史存在扩展
 globalStorage；Harness 会话与内嵌聊天分开存放。
 
+另一组键在 `hello.chat` 下，`scope: window`（随工作区）：护栏与审阅。
+
+| 键 | 默认 | 作用 |
+|---|---|---|
+| `hello.chat.approval.enabled` | `true` | **事前审批**。命中策略的 bash 命令、以及越出工作区的 `write`/`edit`，在**执行前**弹确认条并暂停整轮。实现是一条 `PreToolUse` hook（派生配置落在扩展存储目录，**不改动你的 cordis.yml**）。**关掉它会连带关掉「工作区外改动」的可见性**（hook 是唯一的传感器）。改这个开关需重连才生效。 |
+| `hello.chat.approval.patterns` | 见 package.json | bash 侧策略：命中任意一条（不区分大小写的正则）即弹条。默认是 `rm`/`rmdir`/`mkfs`/`dd of=`/`diskpart`/`format X:`/`git push --force`/`git reset --hard`/关机类/fork bomb。改动即时生效。 |
+| `hello.chat.approval.outsideWorkspace` | `true` | **工作区外写确认**。关掉只是**不再问** —— 只要 `enabled` 还开着，区外改动仍会照旧出现在本轮审阅里。平台临时目录（`%TEMP%` / `/tmp`）两边都豁免。改动即时生效。 |
+| `hello.chat.approval.timeoutSec` | `540` | 等确认的秒数；超时按**拒绝**处理。 |
+| `hello.chat.reviewChanges` | `true` | 每轮结束后对比文件改动并显示审阅条（增/改/删 + 行级 diff + 保留/还原）。工作区**外**的改动也会一并列出（标出所在目录）。 |
+
+**已知局限（不是 bug）**：护栏只看 `write`/`edit` 工具的目标路径，**不解析 bash 命令串里的路径**。所以 agent 用 `cp`/`mv`/`>` 写到工作区外时，既不弹确认条、**也不会出现在审阅里**。另外扩展不可达时 fs 侧一律放行（护栏降级，可见性同时停摆）。
+
 ---
 
 ## 真 DSH 组件画面（react-live，可选）

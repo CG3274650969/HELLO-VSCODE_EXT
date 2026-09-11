@@ -198,6 +198,21 @@ Changing any path/model/key while the panel is open reconnects the live subproce
 (the status dot follows). History lives in the extension's global storage; Harness sessions are kept
 separate from Embedded-chat ones.
 
+A second group lives under `hello.chat` (`scope: window`) — guardrails and review:
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `hello.chat.approval.enabled` | `true` | **Pre-execution approval.** Matching bash commands, and `write`/`edit` calls targeting paths **outside the workspace**, raise a confirm bar and pause the turn before running. Implemented as a `PreToolUse` hook (derived config in the extension's storage dir — **your `cordis.yml` is never modified**). **Turning it off also disables outside-workspace change visibility** (the hook is the only sensor). Requires a reconnect. |
+| `hello.chat.approval.patterns` | see package.json | bash-side policy: any case-insensitive regex match raises the bar. Defaults cover `rm`/`rmdir`/`mkfs`/`dd of=`/`diskpart`/`format X:`/`git push --force`/`git reset --hard`/shutdown/fork bomb. Takes effect immediately. |
+| `hello.chat.approval.outsideWorkspace` | `true` | **Outside-workspace write approval.** Turning it off only stops the *asking* — outside changes are still listed in the per-turn review while `enabled` is on. Temp dirs (`%TEMP%` / `/tmp`) are exempt from both. Takes effect immediately. |
+| `hello.chat.approval.timeoutSec` | `540` | Seconds to wait before denying by timeout. |
+| `hello.chat.reviewChanges` | `true` | Diff file changes after each turn and show a review bar (added/modified/deleted, inline diff, keep/revert). Changes **outside** the workspace are listed too, tagged with their directory. |
+
+**Known limitation (not a bug):** the guardrail only inspects `write`/`edit` tool targets — paths
+inside a bash command string are **not** parsed. So an agent writing outside the workspace via
+`cp`/`mv`/`>` is neither gated **nor shown in the review**. Also, when the extension is unreachable
+the fs side always allows (guardrail degrades, visibility stops with it).
+
 ---
 
 ## Real DSH components (react-live, optional)

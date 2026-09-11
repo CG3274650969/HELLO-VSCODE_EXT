@@ -50,12 +50,31 @@ export interface DshSessionEvent {
   sourceEventSeqs?: unknown;
 }
 
+/**
+ * 一次模型调用的 token 计数（线上原样，不做加工）。
+ * **三项互斥**：inputTokens 是未命中输入，缓存命中单列 cacheReadTokens；outputTokens 已含
+ * reasoningTokens —— 详见 src/protocol.ts 的 UsageBuckets 注释与 DSH 的 llm/src/types.ts。
+ */
+export interface DshTokenUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  reasoningTokens?: number;
+}
+
 /** 各类事件真实载荷（尽力而为的宽松类型；多余字段无视）。 */
 export interface DshEventData {
   turn?: unknown;
   step?: unknown;
-  /** assistant/chunk 的载荷 */
-  chunk?: { type?: string; text?: string; id?: string };
+  /** assistant/chunk 的载荷。usage chunk（type:'usage'）的计数在 usage 字段上 */
+  chunk?: { type?: string; text?: string; id?: string; usage?: DshTokenUsage };
+  /** 本次模型调用的用量：assistant/chunk(usage) 是早样本、assistant/message 是终样本，两者同值 */
+  usage?: DshTokenUsage;
+  /** request/context 的载荷：本次请求的路由与上下文窗口（占用率的分母） */
+  provider?: string;
+  model?: string;
+  contextWindow?: number;
   /** tool/call 的载荷 */
   callId?: string;
   name?: string;

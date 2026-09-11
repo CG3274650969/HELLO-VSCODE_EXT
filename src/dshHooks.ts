@@ -2,7 +2,8 @@
  * C1 事前审批：生成 DSH 侧需要的三个文件（全部落在扩展 globalStorage，绝不进仓库/工作区）。
  *
  *   1. `dsh-hooks/approval-hook.mjs` —— 真正的 hook 脚本（node 跑；见文件头注释）
- *   2. `dsh-hooks/hooks.json`        —— CC 方言 hook 配置，PreToolUse + matcher:bash
+ *   2. `dsh-hooks/hooks.json`        —— CC 方言 hook 配置，PreToolUse + matcher:bash|write|edit
+ *      （C4：matcher 的主语是**工具名**，扩到 write/edit 就能在 fs 工具执行前拿到控制权）
  *   3. `dsh-config/cordis.yml`       —— **派生配置** = 用户那份 cordis.yml 原文 + 末尾追加
  *                                       一个 hooks-claude-code 插件块
  *
@@ -79,7 +80,8 @@ export function writeApprovalHookFiles(opts: ApprovalHookOptions): ApprovalHookF
     hooks: {
       PreToolUse: [
         {
-          matcher: 'bash',
+          // C1 管 bash；C4 起同一条通路也管 fs 工具（越出工作区的写才问，见 chatViewProvider）
+          matcher: 'bash|write|edit',
           hooks: [
             {
               type: 'command',
@@ -286,18 +288,21 @@ function isBlockSequenceRoot(text: string): boolean {
  */
 const HOOK_SCRIPT = String.raw`#!/usr/bin/env node
 /**
- * AlohaDSH · C1 事前审批 hook（由扩展自动生成，请勿手工编辑）。
+ * AlohaDSH · C1/C4 事前审批 hook（由扩展自动生成，请勿手工编辑）。
  *
- * DSH 的 hooks-claude-code 插件在每次 bash 工具调用**之前**执行本脚本，把载荷
- * （{tool_name, tool_input, tool_use_id}）从 stdin 递进来；脚本向本机的审批服务
- * 询问决策并**保持连接**，直到用户点了允许/拒绝 —— 所以 agent 那一轮真的暂停在这里。
+ * DSH 的 hooks-claude-code 插件在每次 bash / write / edit 工具调用**之前**执行本脚本，
+ * 把载荷（{tool_name, tool_input, tool_use_id, cwd}）从 stdin 递进来；脚本向本机的审批
+ * 服务询问决策并**保持连接**，直到用户点了允许/拒绝 —— 所以 agent 那一轮真的暂停在这里。
  *
  * 输出约定（CC 风格）：
  *   放行 = 不输出任何东西、exit 0（不表态）
  *   拒绝 = stdout 输出 hookSpecificOutput.permissionDecision = 'deny' + 原因，exit 0
  *
- * 兜底（扩展不可达/超时）：按内置危险清单拒绝，其余放行 —— 既不因扩展挂掉而 sha 掉
- * 所有 bash，也不会把 rm -rf 这种放过去。
+ * 两条工具的兜底不一样，**这是有意的**：
+ *   bash  —— 扩展不可达时按内置危险清单拒绝，其余放行（既不因扩展挂掉而 sha 掉所有 bash，
+ *            也不会把 rm -rf 这种放过去）。
+ *   write/edit —— 扩展不可达时**一律放行**。C4 那半是「越出工作区才问」，属于额外护栏 +
+ *            可见性纯增益；护栏自己坏了不该把 agent 的正常写文件能力一起拖下水。
  */
 import * as http from 'node:http'
 
@@ -366,34 +371,63 @@ function ask(url, token, payload, timeoutMs) {
   })
 }
 
+/** 顶层 catch 靠它区分：true = 本次是 fs 工具（异常时放行而不是拒绝） */
+let fsTool = false
+
 async function main() {
   const raw = await readStdin()
   let payload
   try { payload = JSON.parse(raw) } catch { deny('无法解析 hook 输入，已按拒绝处理。'); return }
-  if (!payload || payload.tool_name !== 'bash') return
-  const input = payload.tool_input && typeof payload.tool_input === 'object' ? payload.tool_input : {}
-  const command = typeof input.command === 'string' ? input.command : ''
-  if (!command) return
+  if (!payload || typeof payload !== 'object') return
 
+  const toolName = typeof payload.tool_name === 'string' ? payload.tool_name : ''
+  const input = payload.tool_input && typeof payload.tool_input === 'object' ? payload.tool_input : {}
   const url = argOf('--url')
   const token = argOf('--token')
   const timeoutMs = Number(argOf('--timeout-ms')) || 540000
 
-  const res = url
-    ? await ask(url, token, { toolName: 'bash', command: command, toolUseId: payload.tool_use_id }, timeoutMs)
-    : null
-
-  if (res && typeof res.decision === 'string') {
-    if (res.decision === 'deny') {
-      deny(typeof res.reason === 'string' && res.reason ? res.reason : '未获批准，命令未执行。')
+  if (toolName === 'bash') {
+    const command = typeof input.command === 'string' ? input.command : ''
+    if (!command) return
+    const res = url
+      ? await ask(url, token, { toolName: 'bash', command: command, toolUseId: payload.tool_use_id }, timeoutMs)
+      : null
+    if (res && typeof res.decision === 'string') {
+      if (res.decision === 'deny') {
+        deny(typeof res.reason === 'string' && res.reason ? res.reason : '未获批准，命令未执行。')
+      }
+      return
+    }
+    for (const re of FALLBACK) {
+      if (re.test(command)) { deny('审批服务不可达，且该命令命中内置危险清单，已拒绝。'); return }
     }
     return
   }
 
-  for (const re of FALLBACK) {
-    if (re.test(command)) { deny('审批服务不可达，且该命令命中内置危险清单，已拒绝。'); return }
+  if (toolName === 'write' || toolName === 'edit') {
+    fsTool = true
+    const filePath = typeof input.file_path === 'string' ? input.file_path : ''
+    if (!filePath) return
+    // cwd 是 DSH 给的会话工作区 —— 相对 file_path 的解析基准，判「是否越界」全靠它
+    const cwd = typeof payload.cwd === 'string' ? payload.cwd : ''
+    const res = url
+      ? await ask(url, token, {
+          toolName: toolName, filePath: filePath, cwd: cwd, toolUseId: payload.tool_use_id,
+        }, timeoutMs)
+      : null
+    // 拿不到决策（扩展不可达/超时/异常）→ 放行；只有明确 deny 才拦（见文件头说明）
+    if (res && res.decision === 'deny') {
+      deny(typeof res.reason === 'string' && res.reason ? res.reason : '未获批准，该写入未执行。')
+    }
+    return
   }
+
+  // 其余工具（read/glob/…）：不表态，exit 0
 }
 
-main().catch(() => { deny('审批 hook 异常，已按拒绝处理。') })
+main().catch(() => {
+  // fs 工具放行 —— 脚本自身出问题时，宁可让 agent 正常写文件，也不要变成写不了
+  if (fsTool) return
+  deny('审批 hook 异常，已按拒绝处理。')
+})
 `;

@@ -12,9 +12,11 @@ import {
   Mode,
   ReviewChange,
   SessionSummary,
+  UsageBuckets,
+  UsageReadout,
   WebviewToExt,
 } from './protocol';
-import { ApprovalAsk, ApprovalOutcome, ApprovalServer } from './approvalServer';
+import { ApprovalAsk, ApprovalOutcome, ApprovalServer, matchesAnyPattern } from './approvalServer';
 import { ApprovalHookFiles, probeShell, testApprovalHook, writeApprovalHookFiles } from './dshHooks';
 import { isAbortError, streamMockReply } from './mockAssistant';
 import { SessionStore, StoredSession, titleFromText } from './sessionStore';
@@ -23,6 +25,7 @@ import {
   compareTrees,
   FsSnapshot,
   lineDiff,
+  snapshotSingleFile,
   snapshotTree,
   TreeChange,
 } from './fileSnapshot';
@@ -33,6 +36,7 @@ import {
   DshRuntime,
   DshSpawnRequest,
   DshStatusFrame,
+  DshTokenUsage,
 } from './dshRuntime';
 
 /** 附件内容上限：超过这个字节数的文件不读；超过这个字符数的内容截断。 */
@@ -74,6 +78,35 @@ const DEFAULT_APPROVAL_PATTERNS = [
   '\\b(shutdown|reboot|poweroff)\\b',
   ':\\s*\\(\\s*\\)\\s*\\{', // fork bomb
 ];
+
+/**
+ * C4 一个审阅根。`tree` = 工作区整棵树（2.1 老行为）；`file` = 工作区外单个文件，
+ * 快照的 root 是它的父目录、条目 rel 是 basename —— 于是对比/还原与树根完全同构。
+ */
+interface ReviewRoot {
+  kind: 'tree' | 'file';
+  /** 快照的根（tree = 工作区根；file = 目标文件的父目录） */
+  root: string;
+  snap: FsSnapshot;
+  /** 仅 kind==='file'：目标文件的绝对路径，也是它在 map 里的键 */
+  target?: string;
+  /** 仅 kind==='file'：展示给用户的所在目录（就是 root，留个语义名免得读混） */
+  outside?: string;
+}
+
+/** 已算出、等待 keep/revert 的一条：带上它所属的根，还原时才找得回磁盘位置。 */
+interface PendingReview {
+  /** 动作主键（`rv1`、`rv2`…），跨根唯一 */
+  id: string;
+  root: ReviewRoot;
+  change: TreeChange;
+}
+
+/** C4 区外审阅的根数上限：满了就不再新增（**不做淘汰** —— 淘汰会丢已有可还原项）。 */
+const MAX_OUTSIDE_REVIEW_ROOTS = 20;
+
+/** `hello.chat.approval.outsideWorkspace` 的默认值（只 gate「问」，不 gate「看」） */
+const DEFAULT_APPROVAL_OUTSIDE = true;
 
 /** 用户等待上限（秒）的默认值；与 hook 超时形成 540 < 560 < 580 的梯度 */
 const DEFAULT_APPROVAL_TIMEOUT_SEC = 540;
@@ -181,6 +214,46 @@ function readRuntimeDir(dir: string): RuntimeResolution {
  * 切换/新建/删除会话或模式时，若正在流式生成，会先安全中止（把半截回复标记为
  * interrupted、running 工具卡落成 error）再切换，避免残留"永远生成中"的状态把输入锁死。
  */
+/**
+ * 本轮的用量累计（C3a）。
+ *
+ * **必须按 (turn, step) 去重**：DSH 对同一步会报两次 usage —— `assistant/chunk` 的早样本
+ * （躲过一次失败的请求也能留下计数）与 `assistant/message` 的终样本，两者值**逐字节相同**。
+ * 实测三份抓帧里，天真累加的结果**恰好都是 2 倍**。故这里以 `${turn}:${step}` 为键、
+ * **后到覆盖**（同 DSH 自己 token-meter 投影的语义），再对值求和。
+ */
+interface TurnUsage {
+  /** 去重键 `${turn}:${step}` → 该步的计数（早样本被终样本覆盖） */
+  byStep: Map<string, UsageBuckets>;
+  /** 最近一次样本的 prompt 侧压力（未命中 + 缓存读 + [缓存写]），末次优先 */
+  pressureTokens?: number;
+  /** 已折进 `_active.usage`。折完**仍留着显示** —— 不然"本轮"会在轮尾突然归零，
+   *  而人正是想在这一轮跑完后看它烧了多少。下一条样本到来时换一个新的。 */
+  folded: boolean;
+}
+
+/** 线上字段可能缺省或非数字 → 一律折成非负数。 */
+function asCount(v: unknown): number {
+  return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0;
+}
+
+/** 三项计数互斥，逐项相加即可（outputTokens 已含 reasoningTokens，别再叠加）。 */
+function addBuckets(a: UsageBuckets, b: UsageBuckets): UsageBuckets {
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    cacheReadTokens: a.cacheReadTokens + b.cacheReadTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+  };
+}
+
+function zeroUsage(): UsageBuckets {
+  return { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0 };
+}
+
+function isZeroUsage(b: UsageBuckets): boolean {
+  return b.inputTokens === 0 && b.cacheReadTokens === 0 && b.outputTokens === 0;
+}
+
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _view?: vscode.WebviewView;
   /** 每模式一个存储 / 一个"当前会话" */
@@ -235,14 +308,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** 本轮是否正常走完（idle → done）。interrupted/error/abort 恒 false → 收尾清掉审阅 */
   private _turnNormalDone = false;
-  /** 本轮审阅快照所在的工作区根（undefined = 本轮不审） */
-  private _reviewRootAbs?: string;
-  /** 轮首工作区快照：diff 完成后仍保留供 keep/revert 动作还原用 */
-  private _baseline?: FsSnapshot;
-  /** token：新一轮 / 导航清理时自增，让迟到的异步对比失效（防两轮 diff 交错） */
+  /**
+   * 本轮审阅快照的根（C4 起多根）。键 = 根自身的标识：
+   * 工作区根用它的绝对路径，工作区外目标用**该文件的绝对路径**（不是父目录 —— 同目录
+   * 两个目标会撞键）。值为轮首快照，diff 之后仍保留供 keep/revert 还原用。
+   * 空 map = 本轮不审。
+   */
+  private _reviewRoots = new Map<string, ReviewRoot>();
+  /** token：新一轮 / 导航清理时自增，让迟到的异步对比失效（防两轮 diff 交错）。
+   *  配套的 `_reviewRoots` 判代靠**引用相等**：轮首/清理一律换一个新 Map，从不原地 clear。 */
   private _reviewSeq = 0;
-  /** 已算出、尚未被 keep/revert 处理的改动（rich 版，动作处理与还原用） */
-  private _pendingReview: TreeChange[] = [];
+  /** 已算出、尚未被 keep/revert 处理的改动（rich 版 + 动作主键 id，还原时知道回哪个根） */
+  private _pendingReview: PendingReview[] = [];
+  /** 审阅项 id 递增源（`rv1`、`rv2`…），只在对比时分配一次 */
+  private _reviewIdSeq = 0;
 
   // ---------- C1 事前审批（破坏性 bash 命令确认条）状态 ----------
 
@@ -258,6 +337,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _approvalWarned = false;
   /** 与视图无关的订阅（全局配置变更监听），dispose 时统一清 */
   private readonly _globalDisposables: vscode.Disposable[] = [];
+
+  // ---------- C3a 用量读数（每轮/每会话 token + 上下文占用率）状态 ----------
+
+  /** 本轮累计；一轮跑着才有值。轮尾折进 `_active.usage` 后置空（单点折叠 → 不可能双计） */
+  private _turnUsage?: TurnUsage;
+  /** 本次请求的上下文窗口（占用率分母），来自 request/context；换子进程要重取 */
+  private _contextWindow?: number;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -282,10 +368,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       harness: this._stores.harness.create(),
     };
 
-    // C1：审批开关翻转 → 重建审批服务/派生配置，并重连让子进程带上（策略正则是每次现读，改策略即时生效）
+    // C1：审批开关翻转 → 重建审批服务/派生配置，并重连让子进程带上（策略正则是每次现读，改策略即时生效）。
+    // **只认 enabled**：hook 的 matcher 是生成期定的，非得重连才生效；而 patterns /
+    // timeoutSec / C4 的 outsideWorkspace 都是每次现读的，跟着重启一次 DSH 子进程纯属白搭
+    // （还会打断正在跑的会话）。
     this._globalDisposables.push(
       vscode.workspace.onDidChangeConfiguration((e) => {
-        if (!e.affectsConfiguration('hello.chat.approval')) return;
+        if (!e.affectsConfiguration('hello.chat.approval.enabled')) return;
         if (this._abort || this._liveRunning) return; // 跑着的时候不动，下次连接自然带上
         void this._ensureApproval().then(() => this._restartLiveProcess());
       })
@@ -343,6 +432,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   startNewSession(): void {
     this._cancelActiveRun();
     this._dropReview(true); // 新建对话 → 清掉上一轮遗留的审阅
+    this._resetTurnUsage(); // C3a：本轮读数不跨会话
     if (this._active.messages.length > 0) {
       this._store.replace(this._active);
       this._store.persist();
@@ -384,7 +474,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // webview 每次显示都重建：harness 状态点/运行锁一律以扩展侧为真相重放一遍
         this._postBackendStatus();
         // 2.1 ready 重放：已算出未处理的本轮审阅补推（新一轮开始时已发 review-clear 隐去）
-        if (this._pendingReview.length > 0 && this._baseline !== undefined && !this._liveRunning) {
+        if (this._pendingReview.length > 0 && this._reviewRoots.size > 0 && !this._liveRunning) {
           this._postReviewSet();
         }
         // harness 默认模式：视图每次就绪都预热到「在线/未配置」可读状态
@@ -443,10 +533,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._renameSession(msg.title);
         break;
       case 'review-keep':
-        this._reviewAction('keep', msg.rel);
+        this._reviewAction('keep', msg.id);
         break;
       case 'review-revert':
-        this._reviewAction('revert', msg.rel);
+        this._reviewAction('revert', msg.id);
         break;
       case 'review-keep-all':
         this._reviewAction('keep-all');
@@ -462,6 +552,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (mode === this._mode) return; // 点的还是当前模式，无事可做
     this._cancelActiveRun();
     this._dropReview(true); // 切换模式 → 清掉审阅（harness 独有功能）
+    this._resetTurnUsage(); // C3a：本轮读数不跨模式
     this._persistActiveSession();
     this._mode = mode;
     void this._globalState.update(MODE_KEY, mode);
@@ -707,6 +798,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._liveRunning = false;
       this._post({ type: 'run-busy', busy: false });
       this._postBackendStatus();
+      // C3a：折账兜底（正路已在 _finishTurn 里同步折过，幂等）。剩下唯一会走到这里的
+      // 是"没经过 _finishTurn 的出错轮"——那些 token 是真的，同样计入。
+      // 必须在 _afterTurn 之前：由它落盘。
+      this._foldTurnUsage();
       this._afterTurn();
       // 2.1：正常走完（done）→ 退栈后异步对比工作区、算 diff 推审阅条；
       // interrupted / error / abort → 清掉本轮的 baseline（不做审阅）
@@ -738,6 +833,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._turnNormalDone = true; // 2.1：正常走完 → finally 里排异步改动对比
     }
     this._liveRunning = false;
+    // C3a：在这里折账，**不能**只靠 _runLive 的 finally —— 那是微任务，而「运行中切会话」
+    // 那条路上（_cancelActiveRun → _actives[_mode] = 新会话 → 落盘）全是同步的，
+    // finally 跑到时 _active 已经换人了，半轮的 token 会记到新会话头上。
+    // 此处是同步的、_active 还是本轮那个。_foldTurnUsage 自带幂等，finally 里那次只作兜底。
+    this._foldTurnUsage();
     this._finalizeOpenAssistant(outcome);
     if (outcome === 'interrupted') {
       // 停止时还挂着的 running 工具卡 → error，不留转圈残留
@@ -860,6 +960,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._backendState = 'offline';
     this._backendModel = undefined;
     this._backendDetail = undefined;
+    // C3a：上下文上限是「这次请求」的属性，换子进程后要等新的 request/context 才有
+    this._contextWindow = undefined;
   }
 
   /** 配置条里改模型：记住 → 重启 live 子进程（旧会话记忆清空，下一句插灰 note）。 */
@@ -1256,6 +1358,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     switch (ev.type) {
       case 'assistant/chunk': {
         const chunk = d.chunk;
+        // C3a：usage 早样本。必须先于下面那行 text-delta 早退处理 —— 它也是 chunk.type，
+        // 否则每步的计数会在这里被静默丢掉。
+        if (chunk && chunk.type === 'usage') {
+          this._onUsageSample(d, chunk.usage);
+          return;
+        }
         if (!chunk || chunk.type !== 'text-delta') return;
         const delta = typeof chunk.text === 'string' ? chunk.text : '';
         if (!delta) return;
@@ -1265,6 +1373,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const m = this._openAssistant as ChatMessage;
         m.text += delta;
         this._post({ type: 'assistant-delta', id: m.id, delta });
+        return;
+      }
+      case 'assistant/message': {
+        // C3a：同一步的终样本，值与上面那条 usage chunk 逐字节相同 → 覆盖式并入，不重复计。
+        if (d.usage) this._onUsageSample(d, d.usage);
+        return;
+      }
+      case 'request/context': {
+        // C3a：本次请求的路由与上下文窗口（占用率的分母）。每会话一条、会话开头就到，
+        // 所以占用率不用等首轮跑完。换子进程会重新发（见 _teardownLive 的清理）。
+        if (typeof d.contextWindow === 'number' && d.contextWindow > 0) {
+          this._contextWindow = d.contextWindow;
+          this._postUsage();
+        }
         return;
       }
       case 'tool/call': {
@@ -1338,10 +1460,96 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return;
       }
       default:
-        // turn/start、user/message、assistant/message、agent/inbox/*、
-        // reasoning-delta、tool-call-delta、subagent.* 一律忽略
+        // turn/start、user/message、agent/inbox/*、reasoning-delta、
+        // tool-call-delta、subagent.* 一律忽略
+        // （assistant/message 与 request/context 原在此列，C3a 起各自成 case 了）
         return;
     }
+  }
+
+  // ---------- C3a 用量读数 ----------
+
+  /**
+   * 并入一条 usage 样本。
+   *
+   * **覆盖而非累加**：同一步的 chunk 早样本会被 message 终样本覆盖 —— 两者值相同，
+   * 累加就是双计（实测三份抓帧都是恰好 2 倍）。
+   */
+  private _onUsageSample(d: DshEventData, usage: DshTokenUsage | undefined): void {
+    if (!usage) return;
+    // 新的这一轮（或上一轮已折叠）→ 换一个干净的累计器
+    if (!this._turnUsage || this._turnUsage.folded) {
+      this._turnUsage = { byStep: new Map(), folded: false };
+    }
+    const turn = this._turnUsage;
+    turn.byStep.set(`${String(d.turn ?? '')}:${String(d.step ?? '')}`, {
+      inputTokens: asCount(usage.inputTokens),
+      cacheReadTokens: asCount(usage.cacheReadTokens),
+      outputTokens: asCount(usage.outputTokens),
+    });
+    // prompt 侧压力 = 本次请求的输入规模（含缓存读写），末次样本优先
+    turn.pressureTokens =
+      asCount(usage.inputTokens) + asCount(usage.cacheReadTokens) + asCount(usage.cacheWriteTokens);
+    this._postUsage();
+  }
+
+  /** 把本轮计数折进会话累计，**只此一处**（单点折叠 → 不可能双计）。轮尾调用。 */
+  private _foldTurnUsage(): void {
+    const turn = this._turnUsage;
+    if (!turn || turn.folded) return;
+    let sum = zeroUsage();
+    for (const b of turn.byStep.values()) sum = addBuckets(sum, b);
+    this._active.usage = addBuckets(this._active.usage ?? zeroUsage(), sum);
+    turn.folded = true;
+    this._postUsage();
+  }
+
+  /**
+   * 组装读数：本轮 / 本会话累计（含尚未折叠的当前轮）/ 上下文占用。
+   *
+   * **什么数据都没有时返回 undefined** —— 调用方据此把细条藏起来，而不是显示一排 0。
+   * 三种情形都靠它兜住：重开一个从没跑过的旧会话、刚从别的会话切过来、切到「内嵌聊天」。
+   */
+  private _usageReadout(): UsageReadout | undefined {
+    if (this._mode !== 'harness') return undefined;
+    const turn = this._turnUsage;
+    let turnSum = zeroUsage();
+    if (turn) {
+      for (const b of turn.byStep.values()) turnSum = addBuckets(turnSum, b);
+    }
+    // 未折叠的当前轮还没进 _active.usage，这里补上 —— 否则轮尾折叠那一刻读数会跳变。
+    // 落盘的数据过一遍 asCount：手改坏了 sessions-harness.json 也别让读数显示 NaN。
+    const stored = this._active.usage;
+    const session = addBuckets(
+      stored
+        ? {
+            inputTokens: asCount(stored.inputTokens),
+            cacheReadTokens: asCount(stored.cacheReadTokens),
+            outputTokens: asCount(stored.outputTokens),
+          }
+        : zeroUsage(),
+      turn && !turn.folded ? turnSum : zeroUsage()
+    );
+    const used = turn?.pressureTokens;
+    const contextWindow = this._contextWindow;
+    if (used === undefined && contextWindow === undefined && isZeroUsage(turnSum) && isZeroUsage(session)) {
+      return undefined;
+    }
+    const readout: UsageReadout = { turn: turnSum, session };
+    if (used !== undefined && contextWindow !== undefined) {
+      readout.context = { usedTokens: used, contextWindow };
+    }
+    return readout;
+  }
+
+  private _postUsage(): void {
+    const usage = this._usageReadout();
+    if (usage) this._post({ type: 'usage', usage });
+  }
+
+  /** 换会话 / 换模式 / 新建时清掉本轮读数。**会话累计在 `_active.usage` 上，不动**。 */
+  private _resetTurnUsage(): void {
+    this._turnUsage = undefined;
   }
 
   /**
@@ -1398,6 +1606,119 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const rawSec = Number.isFinite(raw) ? Math.round(raw) : DEFAULT_APPROVAL_TIMEOUT_SEC;
     const sec = Math.min(Math.max(rawSec, APPROVAL_TIMEOUT_MIN_SEC), APPROVAL_TIMEOUT_MAX_SEC);
     return sec * 1000;
+  }
+
+  // ---------- C4 工作区外写：判定「越界」----------
+
+  /** 越界是否弹确认条（hello.chat.approval.outsideWorkspace，默认开）。
+   *  **只 gate「问」**：hook 挂着的时候，区外目标照旧进本轮审阅 —— 关掉它等于「不问只记」。 */
+  private _approvalOutsideEnabled(): boolean {
+    return (
+      vscode.workspace
+        .getConfiguration('hello.chat')
+        .get<boolean>('approval.outsideWorkspace', DEFAULT_APPROVAL_OUTSIDE) === true
+    );
+  }
+
+  /**
+   * 本次调用的会话工作区（相对 file_path 的解析基准）。用 hook 载荷里的 `cwd` —— DSH 给的就是
+   * 会话工作区，路径本来就是相对它解析的；拿不到才退到打开的工作区根。
+   * **绝不用 `_dshCwd()`**：那个无工作区时会退成用户主目录，拿家目录当"界内"等于放行一切。
+   */
+  private _sessionWorkspaceRoot(ask: ApprovalAsk): string {
+    return String(ask.cwd ?? '').trim() || this._reviewRoot() || '';
+  }
+
+  /** fs 工具的目标绝对路径（拿不到 → undefined）。 */
+  private _fsTargetAbs(ask: ApprovalAsk): string | undefined {
+    const raw = String(ask.filePath ?? '').trim();
+    if (!raw) return undefined;
+    // POSIX 形态（Linux 侧给的 /mnt/… 之类）：Windows 的 path 会把它当"当前盘根下"解析出
+    // 一个完全错误的位置 —— 宁可判不出来（调用方按越界处理，多问一次），也不乱认。
+    if (raw.startsWith('/') && !raw.startsWith('//')) return undefined;
+    if (path.isAbsolute(raw)) return path.resolve(raw);
+    const base = this._sessionWorkspaceRoot(ask);
+    return base ? path.resolve(path.join(base, raw)) : undefined;
+  }
+
+  /** target 是否落在 root 之内（含 root 自身）。win32 下 path.relative 已做大小写归一。
+   *  **绝不用 startsWith 比前缀**：`C:\proj2` 会被 `C:\proj` 骗过。 */
+  private _isInside(target: string, root: string): boolean {
+    if (!root) return false;
+    const rel = path.relative(path.resolve(root), path.resolve(target));
+    if (!rel) return true; // 就是根本身
+    if (path.isAbsolute(rel)) return false; // 不同盘符 → relative 返回绝对路径
+    return rel !== '..' && !rel.startsWith('..' + path.sep);
+  }
+
+  /** 平台临时区内的路径（DSH 沙箱也刻意放行那里；temp churn 不该进审阅，也不该弹条）。 */
+  private _isTempPath(abs: string): boolean {
+    const tmp = os.tmpdir();
+    return !!tmp && this._isInside(abs, tmp);
+  }
+
+  /** 是否越出会话工作区（临时区豁免）。定位不了 → 保守当越界。 */
+  private _isOutsideWorkspace(ask: ApprovalAsk): boolean {
+    const target = this._fsTargetAbs(ask);
+    if (!target) return true;
+    if (this._isTempPath(target)) return false;
+    const root = this._sessionWorkspaceRoot(ask);
+    return !this._isInside(target, root);
+  }
+
+  /**
+   * 审批策略（注入给 ApprovalServer 的谓词，每次现读）。
+   * bash 走 C1 的正则清单；write/edit 走 C4 的越界判定；其余工具不表态。
+   */
+  private _askNeedsApproval(ask: ApprovalAsk): boolean {
+    if (ask.toolName === 'bash') {
+      return matchesAnyPattern(this._approvalPatterns(), ask.command);
+    }
+    if (ask.toolName === 'write' || ask.toolName === 'edit') {
+      return this._approvalOutsideEnabled() && this._isOutsideWorkspace(ask);
+    }
+    return false;
+  }
+
+  /**
+   * C4 可见性那半：每次 write/edit 会先经过这里（**不论要不要问**），在工具**执行之前**
+   * 给工作区外目标抓一张轮前快照。于是：
+   * - 被用户拒绝的写从不落盘 → 轮末对比自然没有它，不需要额外判断；
+   * - 用户自己在同一轮的编辑不会被算成 agent 的改动（只快照目标那一个文件）。
+   */
+  private _onApprovalObserved(ask: ApprovalAsk): void {
+    if (ask.toolName !== 'write' && ask.toolName !== 'edit') return;
+    // `_abort` 是本轮的 token：**轮跑着的时候非空**（_sendUser 里设、_runLive 的 finally 里清），
+    // 而 hook 只在轮中触发 —— 所以这里要的是 `!this._abort`（不在轮中就别认领）。
+    // 写成 `this._abort` 会让本方法每一轮都当场 return（区内行来自轮首播种的树根，不受影响，
+    // 所以症状是「区外改动悄无声息地永远不进审阅」）。
+    if (!this._abort || !this._reviewChangesOn()) return;
+
+    const target = this._fsTargetAbs(ask);
+    if (!target || this._isTempPath(target)) return;
+    const root = this._sessionWorkspaceRoot(ask);
+    // 工作区内的写由工作区树根那半负责；没开文件夹时 root 为空 → 一律按区外处理
+    if (root && this._isInside(target, root)) return;
+
+    for (const r of this._reviewRoots.values()) {
+      if (r.kind === 'tree' && this._isInside(target, r.root)) return; // 已被树根覆盖
+    }
+    // 先到先得：第二次写到同一文件时，"轮前"早被第一次写污染了，换掉会让还原撒谎
+    if (this._reviewRoots.has(target)) return;
+    let outsideCount = 0;
+    for (const r of this._reviewRoots.values()) if (r.kind === 'file') outsideCount += 1;
+    // 满了就跳过，**不做淘汰** —— 淘汰会丢已有可还原项，那比少记一条更糟
+    if (outsideCount >= MAX_OUTSIDE_REVIEW_ROOTS) return;
+
+    const dir = path.dirname(target);
+    this._reviewRoots.set(target, {
+      kind: 'file',
+      root: dir,
+      // 键用**目标文件**而不是父目录：同目录两个目标会撞键，第二个就再也记不上了
+      target,
+      outside: dir,
+      snap: snapshotSingleFile(dir, target),
+    });
   }
 
   /**
@@ -1494,10 +1815,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     const server = new ApprovalServer(
-      () => this._approvalPatterns(),
+      (ask) => this._askNeedsApproval(ask),
       () => this._approvalTimeoutMs(),
       (ask) => this._onApprovalAsk(ask),
-      (id, outcome) => this._onApprovalResolved(id, outcome)
+      (id, outcome) => this._onApprovalResolved(id, outcome),
+      (ask) => this._onApprovalObserved(ask)
     );
     try {
       await server.start();
@@ -1542,18 +1864,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /**
+   * 确认条与留痕要显示的文本。bash = 命令原文；C4 的 write/edit 载荷里**根本没有可展示的
+   * 命令**（正文是模型写的文件内容，绝不转发），所以在这里现拼一个路径标签。
+   */
+  private _approvalLabel(ask: ApprovalAsk): string {
+    if (ask.toolName === 'write' || ask.toolName === 'edit') {
+      const verb = ask.toolName === 'edit' ? '编辑' : '写';
+      const target = this._fsTargetAbs(ask) ?? String(ask.filePath ?? '（未知路径）');
+      return `${verb}工作区外的文件：${target}`;
+    }
+    return ask.command;
+  }
+
   /** 需要用户拍板：推确认条 + 把侧栏亮出来（视图折叠着就看不见确认条，只能干等到超时）。 */
   private _onApprovalAsk(ask: ApprovalAsk): void {
-    this._approvalCmds.set(ask.id, ask.command);
+    const label = this._approvalLabel(ask);
+    this._approvalCmds.set(ask.id, label);
     this._post({
       type: 'approval-request',
       id: ask.id,
       toolName: ask.toolName,
-      command: ask.command,
+      command: label,
     });
     // 视图折叠着就看不到确认条，只能干等到超时 → 主动把它亮出来（失败也不影响流程）
     vscode.commands.executeCommand('hello.chatView.focus').then(undefined, () => {});
-    vscode.window.setStatusBarMessage(`等待确认：${oneLine(ask.command, 60)}`, 5000);
+    vscode.window.setStatusBarMessage(`等待确认：${oneLine(label, 60)}`, 5000);
   }
 
   /** 一条审批有了结果：收起确认条 + 往转写补一条留痕（note 随会话持久化/回放）。 */
@@ -2006,6 +2342,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     this._cancelActiveRun();
     this._dropReview(true); // 切会话 → 清掉上一会话的审阅
+    this._resetTurnUsage(); // C3a：本轮读数属于切走的那个会话
     this._persistActiveSession();
 
     // 新打开的会话不会再续跑任何流：残留的 streaming 一律落成 interrupted
@@ -2055,8 +2392,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
     fork.messages = messages;
     fork.updatedAt = Date.now();
+    // C3a：分支**继承**用量累计。它保留了整份转写、且下面复用同一个 DSH 会话，
+    // 清零会让"刚分完支就显示本会话 0 token"读起来像 bug。代价是两个会话各显示同一份
+    // 累计（是副本不是分割）—— 这是有意为之。
+    fork.usage = src.usage;
 
     this._dropReview(true); // 切会话 → 清掉上一会话的审阅（同 _openSession 惯例）
+    this._resetTurnUsage(); // C3a：本轮读数属于切走的那个会话
     this._store.add(fork); // fork 已有内容 → 立即上历史列表
     this._persistActiveSession(); // 归档源会话并落盘（fork 此时已在列，一并写入）
 
@@ -2082,6 +2424,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     if (isActive) {
       this._dropReview(true); // 删的是当前会话 → 一并清掉审阅
+      this._resetTurnUsage(); // C3a：连同被删会话的本轮读数一起清掉
       this._actives[this._mode] = this._store.create();
       this._postSnapshot();
     }
@@ -2240,55 +2583,61 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   }
 
-  /** 轮首：清上一轮审阅 + 快照当前工作区根（同步取盘，快照点必须在一切 await 之前）。 */
+  /**
+   * 轮首：清上一轮审阅 + 快照当前工作区根（同步取盘，快照点必须在一切 await 之前）。
+   * 工作区外目标的根**这里不建** —— 它们由 C4 在 PreToolUse 路径上、真执行之前逐个补进
+   * `_reviewRoots`（见 `_onApprovalObserved`）。所以「工作区根快照 abort / 没有工作区文件夹」
+   * 不等于本轮无审阅，别在这里提前 return 掉那半。
+   */
   private _captureBaselineAtTurnStart(): void {
     this._reviewSeq += 1;
-    this._baseline = undefined;
-    this._reviewRootAbs = undefined;
+    // 重新赋值一个新 Map（而不是 clear）：对比那边靠**引用相等**判断「还是不是本轮」
+    this._reviewRoots = new Map();
     this._pendingReview = [];
     this._post({ type: 'review-clear' }); // 新一轮开始 → 隐去上轮审阅条
     const root = this._reviewRoot();
     if (!root || !this._reviewChangesOn()) return;
     const shot = snapshotTree(root);
-    if ('aborted' in shot) return; // 目录过大/根不可读 → 本轮静默无审阅
-    this._reviewRootAbs = root;
-    this._baseline = shot;
+    if ('aborted' in shot) return; // 目录过大/根不可读 → 工作区那半本轮无审阅（区外那半照常）
+    this._reviewRoots.set(root, { kind: 'tree', root, snap: shot });
   }
 
   /** 清掉本轮审阅内存；doPost 时通知 webview 隐藏审阅条/面板。 */
   private _dropReview(doPost: boolean): void {
     this._reviewSeq += 1;
-    this._baseline = undefined;
-    this._reviewRootAbs = undefined;
+    this._reviewRoots = new Map();
     this._pendingReview = [];
     if (doPost) {
       this._post({ type: 'review-clear' });
     }
   }
 
-  /** 轮 done 后（finally 里）调用：退栈再异步对比，token 失配即静默丢（防新一轮/清理交错）。 */
+  /**
+   * 轮 done 后（finally 里）调用：退栈再异步对比，token 失配即静默丢（防新一轮/清理交错）。
+   *
+   * **捕获的是 Map 的引用**：工作区根快照 abort（巨型工作区）或没开工作区文件夹时，本轮开局
+   * map 就是空的，区外根要到轮中才由 `_onApprovalObserved` 逐个补进来 —— 而那正是最需要
+   * 看见越界改动的人。所以判空放在退栈之后，且判的是**捕获到的那个** map。
+   */
   private _scheduleReviewAfterTurn(): void {
     const mySeq = this._reviewSeq;
-    const before = this._baseline;
-    const root = this._reviewRootAbs;
-    if (!before || !root) return;
+    const roots = this._reviewRoots;
     void (async () => {
       // 重活不在 _finishTurn/_runLive 的同步路径上做
       await new Promise<void>((r) => setImmediate(r));
-      if (this._reviewSeq !== mySeq || this._baseline !== before) return;
-      const afterShot = snapshotTree(root);
-      if ('aborted' in afterShot) {
-        this._baseline = undefined;
-        this._reviewRootAbs = undefined;
-        return;
+      if (this._reviewSeq !== mySeq || this._reviewRoots !== roots) return;
+      if (roots.size === 0) return; // 到这儿还空 = 本轮真的没得看
+      const pending: PendingReview[] = [];
+      // 逐根重快照；单个根 abort 只跳过它自己，不影响其余根
+      for (const r of roots.values()) {
+        const afterShot = r.kind === 'tree' ? snapshotTree(r.root) : snapshotSingleFile(r.root, r.target!);
+        if ('aborted' in afterShot) continue;
+        for (const change of compareTrees(r.snap, afterShot)) {
+          pending.push({ id: `rv${++this._reviewIdSeq}`, root: r, change });
+        }
       }
-      const changes = compareTrees(before, afterShot);
-      if (changes.length === 0) {
-        this._baseline = undefined;
-        this._reviewRootAbs = undefined;
-        return;
-      }
-      this._pendingReview = changes;
+      if (pending.length === 0) return;
+      this._pendingReview = pending;
       this._postReviewSet();
     })();
   }
@@ -2297,11 +2646,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _postReviewSet(): void {
     const out: ReviewChange[] = [];
     let budget = 200 * 1024; // 跨文件 diff 文本总护栏，防压垮 postMessage
-    for (const ch of this._pendingReview) {
+    for (const p of this._pendingReview) {
+      const ch = p.change;
       const item: ReviewChange = {
+        // id 在对比时已分配并存下，这里只搬运 —— 若按 out 下标现算，每次 keep/revert 重发
+        // 都会换一批 id，前端的展开态与动作会指错行
+        id: p.id,
         kind: ch.kind,
         rel: ch.rel,
         name: ch.rel.slice(ch.rel.lastIndexOf('/') + 1),
+        outside: p.root.outside,
         reversible: ch.reversible,
       };
       const beforeC = ch.before?.content ?? undefined;
@@ -2329,51 +2683,54 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._post({ type: 'review-set', changes: out });
   }
 
-  /** 审阅动作入口（keep/revert 单条 + keep-all/revert-all）。正在跑或没有本轮基线 → 忽略。 */
-  private _reviewAction(action: 'keep' | 'revert' | 'keep-all' | 'revert-all', rel?: string): void {
-    if (this._abort || !this._baseline || !this._reviewRootAbs) return;
-    const root = this._reviewRootAbs;
+  /** 审阅动作入口（keep/revert 单条 + keep-all/revert-all）。正在跑或本轮没算过 → 忽略。
+   *  注意判空**必须看 length**：`_reviewRoots` 是 Map，拿它当布尔**恒为真**，守卫会凭空消失。 */
+  private _reviewAction(action: 'keep' | 'revert' | 'keep-all' | 'revert-all', id?: string): void {
+    if (this._abort || this._pendingReview.length === 0) return;
 
     if (action === 'keep' || action === 'keep-all') {
       // keep = 保留磁盘改动，仅从审阅里收起，不碰文件
-      this._pendingReview = rel
-        ? this._pendingReview.filter((c) => c.rel !== rel)
+      this._pendingReview = id
+        ? this._pendingReview.filter((c) => c.id !== id)
         : [];
       if (this._pendingReview.length === 0) this._dropReview(true);
       else this._postReviewSet();
       return;
     }
 
-    const targets = rel
-      ? this._pendingReview.filter((c) => c.rel === rel)
+    const targets = id
+      ? this._pendingReview.filter((c) => c.id === id)
       : this._pendingReview.slice();
     if (targets.length === 0) return;
 
-    const ok: TreeChange[] = [];
+    const ok: PendingReview[] = [];
     const failed: { rel: string; reason: string }[] = [];
-    for (const ch of targets) {
-      if (!ch.reversible) {
-        failed.push({ rel: ch.rel, reason: '无轮前内容可还原（二进制/超大文件）' });
+    for (const p of targets) {
+      if (!p.change.reversible) {
+        failed.push({ rel: p.change.rel, reason: '无轮前内容可还原（二进制/超大文件）' });
         continue;
       }
       try {
-        applyRevert(root, ch);
-        ok.push(ch);
+        // 还原回**它自己那个根**（区外项的工作区根完全不同）
+        applyRevert(p.root.root, p.change);
+        ok.push(p);
       } catch (err) {
-        failed.push({ rel: ch.rel, reason: err instanceof Error ? err.message : String(err) });
+        failed.push({ rel: p.change.rel, reason: err instanceof Error ? err.message : String(err) });
       }
     }
     if (ok.length > 0) {
       this._pendingReview = this._pendingReview.filter((c) => !ok.includes(c));
       const summary =
         ok.length === 1
-          ? `已还原本轮 DSH 改动：${ok[0].rel}`
+          ? `已还原本轮 DSH 改动：${oneLine(ok[0].change.rel, 120)}`
           : `已还原本轮 DSH 改动：${ok.length} 个文件成功`;
       this._pushNote(failed.length > 0 ? `${summary}；${failed.length} 个未还原` : summary);
     }
     if (failed.length > 0) {
       vscode.window.showErrorMessage(
-        `还原失败 ${failed.length} 项：${failed.map((f) => `${f.rel}（${f.reason}）`).join('、')}`
+        `还原失败 ${failed.length} 项：${failed
+          .map((f) => `${oneLine(f.rel, 80)}（${f.reason}）`)
+          .join('、')}`
       );
     }
     if (this._pendingReview.length === 0) this._dropReview(true);
@@ -2420,6 +2777,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       messages: this._active.messages,
       sessionId: this._active.id,
       sessionTitle: this._active.title,
+      // C3a：读数随整帧一起下发 —— 它本身就是会话级状态，跟 snapshot 同生共死，
+      // 既能把重开会话的累计恢复出来，也保证"切到没有用量的会话"时细条被清掉。
+      usage: this._usageReadout(),
     });
   }
 
