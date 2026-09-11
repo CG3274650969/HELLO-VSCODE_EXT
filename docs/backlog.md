@@ -14,7 +14,7 @@
 | C3a | 用量可视化（每轮/每会话 token + 上下文占用） | P0 | 无（wire 带 usage，已实证） | [x] |
 | C3b | 费用估算 + 预算拦截 | P0 | 无价目数据（DSH 不带）；wire 无 prompt-cancel，超限只能拦下一轮 | [ ] |
 | C4 | 工作区外写护栏与可见性 | P0 | 沙箱路线已 spike 否决（bash 侧 fail-closed）；改走 C1 的 hook 扩 matcher（`bash\|write\|edit`）+ 审阅多根。**已实测通过**（2026-09-11 F5）：挡/看/还原/临时区豁免/关设置只停问不停看/同名文件不连坐，逐条见正文 —— 期间修掉一个守卫极性 bug（区外可见性曾整个不生效） | [x] |
-| C5 | 会话记忆跨重启（复用 DSH_SESSION_ROOT） | P1 | 需实证「新进程 + 旧 sessionId」可续 | [ ] |
+| C5 | 会话记忆跨重启（复用 DSH_SESSION_ROOT） | P1 | wire 无 resume；已自建运行时补丁接上（upstream 有现成 resume-first 写法）。**阶段 0 闸门 + 构建冒烟 + F5 真机均已通过**（2026-09-11）：未补丁必现 id collision，补丁后跨进程答出暗号；真机五条用例逐条见正文 | [x] |
 | C6 | 会话全文检索 + 导出 + 软删除 | P1 | 无 | [ ] |
 | C7 | 转写敏感内容治理（脱敏/加密/留存/彻底删） | P1 | 无（本地实现） | [ ] |
 | C8 | 运行可靠性：中断续跑 / 重试 / 超时幂等 | P1 | 受「无 cancel RPC」限制 | [ ] |
@@ -225,11 +225,35 @@ if (!this._abort || !this._reviewChangesOn()) return;  // 对
 
 ## P1 — 商用体验硬伤
 
-### C5 · 会话记忆跨重启（复用 DSH_SESSION_ROOT）
-- **现状**：`_dshSessions` 映射只在单次 activation 有效；host 重启/切模型即清空，续聊开全新 DSH 会话并插「失忆」note（[chatViewProvider.ts:711-734](../src/chatViewProvider.ts#L711-L734)）。但 runtime 已把会话落盘到 `DSH_SESSION_ROOT`（env 已注入）——通道是通的，我们没复用。
-- **缺口**：跨重启保住模型记忆。
-- **补法**：① 先在 DSH 检出实证「新进程 + 旧 sessionId + DSH_SESSION_ROOT 指向同一目录」能否续上；② 把 `dshId`（含校验它对应的 disk 会话存在）持久化进会话存储；③ 续聊时优先复用，成功则不插失忆 note。
-- **验收**：发两轮 → 重载窗口 → 继续问「刚才聊的 X」 → agent 记得。
+### C5 · 会话记忆跨重启（复用 DSH_SESSION_ROOT）  [x] 2026-09-11
+- **现状（改前）**：`_dshSessions` 映射只在单次 activation 有效；host 重启/切模型即清空，续聊开全新 DSH 会话并插「失忆」note。会话其实**已经落盘**（`DSH_SESSION_ROOT` → `globalStorage/dsh-sessions/`），通道是通的，我们没复用。
+- **实证（2026-09-11，DSH 0.1.0-rc.8 / win32-x64）—— 推翻了本轮开工前的乐观假设**：
+  1. **wire 上根本没有 resume 方法**：`dsh-sdk-jsonrpc-server` 的 `handleRequest` 只认 `initialize` / `session/prompt` / `shutdown`。
+  2. **把已落盘的 id 硬塞给 `session/prompt` 不是「续上」是「炸」**：它走 `createSession` → `ctx.agents.create`（纯内存、从不读盘），随后持久化协调器在 `session/created` 上 `adoptLivePrefix`，`seedCoversPrefix([], storedEvents)` 失败 →
+     `session "<id>" already has a persisted log on disk that does not match this live session (id collision)`。故障在第一次 LLM 流之前的 checkpoint 上以 fail-closed 姿态出现。
+     → 顺带治掉一个既有的潜在雷：`_cancelActiveRun` 中止后不清 `_dshSessions`，下一次发送会在新子进程里复用同一个已落盘 id，走的**正是**这条炸路。
+  3. **能力是有的，只是没接到 wire 上**：`ctx.agents.resume(options)` 是公开接口（`@deepseek-ai/dsh-agent` 的 `index.ts`，单参、内部自持 `ownerCtx`），upstream 自己就有现成的 **resume-first** 写法 `restoreOrCreateConfigured`（`@deepseek-ai/dsh-agent-loop`）—— 先 resume，**只有确实没有磁盘工件**时才 create，损坏/后端失败一律照抛（其注释原话：*"corruption and backend failures stay loud"*）。
+- **补法（路线 A，用户拍板）**：在**我们自己的构建脚本**里对**构建产物**做这一处替换，用户的 DSH 检出**一个字不动**。
+  - [scripts/runtime-patch.mjs](../scripts/runtime-patch.mjs)：唯一持有锚点文本的地方；锚点出现次数 ≠ 1 就 throw（不是 `includes`）。
+  - [scripts/build-runtime.mjs](../scripts/build-runtime.mjs)：构建期打补丁，并把 `patches: ['resume-first-session']` 写进 `runtime.json`；打不上直接构建失败（静默放过 = 交付一个一 resume 就炸的运行时）。同时断言扩展侧判据常量与本模块 `PATCH_NAME` 一字不差 —— 改了名字只改一边是**静默**丢记忆，只能靠构建期钉死。
+  - 扩展侧：`StoredSession.dsh = { id, cwd }`（嵌套 = 两者同生共死）随会话落盘；`_ensureDshSession` 在「运行时带补丁 **且** 盘上身份属于当前工作区」时复用旧 id，否则维持每 activation 新铸。note 二分：「已恢复此前的 DSH 会话记忆」/「已开启全新 DSH 会话」。
+  - 分支（`_forkSession`）继承 `src.dsh` → 「分支共享同一份 DSH 记忆」的既定语义跨重启也成立。
+- **闸门**：[scripts/probe-resume.mjs](../scripts/probe-resume.mjs) 跑两个对照组（同 sandbox / 同 `DSH_SESSION_ROOT` / 同 sessionId，只差补丁）—— A 未打补丁**必现** id collision；B 打补丁后模型答出轮 1 埋的暗号。**A：轮 1「好的」→ 轮 2 id collision（零输出）；B：轮 1「好的」→ 轮 2「7413」** ✅
+- **回归**：`smoke-runtime.mjs --resume` 并入 `build-runtime.mjs` 收尾冒烟（拿不到 key 就打醒目 ⚠ 跳过、以 0 退出，**不假装验过**）。实跑四项全过，含 `裸 initialize` 判据（无回归）。
+- **已知局限**（接受并记录）：
+  - **补丁悬空**：日志被手工删除、或同一工作区从别的机器同步过来只有转录没有 `dsh-sessions/` —— 此时 `list()` 说「不存在」，补丁按 upstream 纪律回落 create，于是**静默**开新会话（note 却说是「已恢复」）。这是唯一残留的静默窗口。
+  - **只有便携运行时带补丁**：开发者路径（手配 `nodePath`/`entry`）与 `hello.dsh.command` 走用户自己的 DSH，**没有补丁** → 那里维持「每 activation 新铸 + 失忆 note」的老行为（硬复用会撞 id collision，门控就是为了不把这条炸路递给用户）。手配路径指向我们已打补丁的产物则能用。
+  - 删会话不删磁盘 DSH 日志（归 C7）→ 日志只增不减。
+  - 不验跨 DSH 版本的日志兼容（升级 DSH 后旧日志能否 resume，未验）。
+  - resume 失败**不自动换新 id 重试**：错误照抛、用户可见（自动重试归 C8）。
+  - 分支不做「真分叉」（复制日志成新 id），延续既定的共享语义。
+- **验收（2026-09-11 F5 真机，五条全过）**——沿用 C4 的教训，**盯留痕（note / 盘上指针），别盯界面元素**：
+  1. 发两轮埋暗号 → 重载窗口 → 点回**那个**会话问 → 答出暗号，note「已恢复此前的 DSH 会话记忆」。
+  2. 完全关掉 VS Code 再开 → 点回该会话 → 仍记得（hostRand 换了新值，证明**存储里的 id 说了算**）。
+  3. 中止后再发 → 不报 id collision（阶段 0 那条潜在雷一并治掉）。
+  4. 建分支 → 分支的 `dsh.id` 与源**逐字相同**，继续聊记得。
+  5. 换工作区打开 → note 是「已开启全新 DSH 会话」（**不假装记得**），且切回原工作区后**仍然记得** —— 盘上指针的 `cwd` 一字未变，没被覆盖。
+  - 踩过的坑（记下来免重犯）：**「续聊」必须点回原会话**。新建一个对话再问暗号，那是另一个 DSH 会话，模型当然不知道 —— 一度被误判成缺陷。盘上会话 `dsh` 指针 + note 文本是唯一可靠的判据。
 
 ### C6 · 会话全文检索 + 导出 + 软删除
 - **现状**：历史是 per-mode JSON；有改名/按标题搜索/物理删除；无内容检索、无导出、无回收站。

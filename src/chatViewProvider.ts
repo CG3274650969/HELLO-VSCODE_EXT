@@ -153,7 +153,16 @@ interface RuntimeManifest {
   node: string;
   entry: string;
   config: string;
+  /** 我们对产物做过的改动清单（build-runtime.mjs 写；手搓/外部运行时通常没有本字段）。
+   *  目前只有一个取值 `resume-first-session` —— 它就是「这个运行时能不能跨进程复用 DSH id」的判据。 */
+  patches?: string[];
 }
+
+/**
+ * 我们给便携运行时打的补丁名（与 scripts/runtime-patch.mjs 的 `PATCH_NAME` 一字不差）。
+ * 构建期有一致性断言盯着这个字面量，改了一边忘了另一边会当场构建失败，而不是静默丢记忆。
+ */
+const DSH_RESUME_PATCH = 'resume-first-session';
 
 /**
  * `hello.dsh.runtimeDir` 的解析结果。
@@ -281,9 +290,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _backendDetail?: string;
   /** 常驻 DSH 子进程客户端：懒创建；被杀后置空、下次自动重建 */
   private _dsh?: DshRuntime;
-  /** UI 会话 id → DSH sessionId（`${uiId}::${hostRand}`）；同 activation 内复用 = 真多轮记忆 */
+  /** UI 会话 id → DSH sessionId。**纯缓存**：真相在 `StoredSession.dsh`（跨重启），
+   *  这里只是省掉「每轮都去问一遍运行时能不能续」；重连/重载后可从盘上重新推导。 */
   private readonly _dshSessions = new Map<string, string>();
-  /** 每 activation 随机一次：host 重启后绝不撞上旧进程的 DSH 会话 id */
+  /** 「不能安全续上」时给临时 id 加的盐（见 _dshIdentityReusable）：每 activation 随机一次，
+   *  于是每次激活铸出的 id 都不同，绝不会撞上旧进程留在盘上的会话日志。 */
   private readonly _dshHostRand = randomBytes(4).toString('hex');
   /** live 正在跑一轮（busy / 输入锁定的扩展侧真相） */
   private _liveRunning = false;
@@ -920,9 +931,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * C5 这个运行时**允不允许**跨进程复用 DSH 会话 id。
+   *
+   * 只有经 scripts/build-runtime.mjs 打过 resume-first 补丁的便携运行时才允许：DSH 的 wire 上
+   * 没有 resume 方法，把已落盘的 id 硬塞给 `session/prompt` 会在第一次 checkpoint 上以
+   * `id collision` 炸掉（见 docs/backlog.md 的 C5）。补丁把它换成了先 resume、只对确实没有
+   * 磁盘工件的 id 才 create。
+   *
+   * 开发者路径（手配 nodePath/entry）与 `hello.dsh.command` 走的是**用户自己的 DSH**，没有我们的
+   * 补丁 → 那里必须维持「每 activation 新铸」的老行为，否则就是把上面那条炸路递给用户。
+   */
+  private _dshIdentityReusable(): boolean {
+    const rt = this._runtime();
+    return rt?.ok === true && rt.manifest.patches?.includes(DSH_RESUME_PATCH) === true;
+  }
+
+  /**
    * UI 会话 → DSH 会话 id 的（首次）映射，并在"续聊旧历史"时插一行 note。
    * 必须在 _sendUser 把本条 user 消息入列**之后**调用（保证 note 排在其后，
    * 不会劫持 isFirst / 默认标题逻辑）。
+   *
+   * 三条出路：
+   *   ① 能安全续上（运行时带补丁 + 盘上那套身份属于当前工作区）→ 复用旧 id，记忆接上；
+   *   ② 不能续（开发者路径 / 换了工作区 / 旧数据没这个字段）→ 本 activation 内一次性临时 id；
+   *   ③ 本 activation 内已经映射过 → 直接取缓存。
    */
   private _ensureDshSession(): string {
     const uiId = this._active.id;
@@ -931,20 +963,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._currentDshId = existing;
       return existing;
     }
-    const dshId = `${uiId}::${this._dshHostRand}`;
+
+    const cwd = this._dshCwd();
+    const stored = this._active.dsh;
+    const patched = this._dshIdentityReusable();
+    // 续上的前提是两件事同时成立：运行时能 resume，**且**盘上那份身份是当前工作区铸的
+    // （DSH 的会话日志按 cwd 归属，换工作区就对不上）。
+    const resumeId = patched && stored?.cwd === cwd ? stored.id : undefined;
+    const dshId = resumeId ?? `${uiId}::${this._dshHostRand}`;
+
+    // 只有「补丁可用 + 这个会话还没有身份」才把新铸的 id 记账（随 _afterTurn 落盘）。
+    // 另两种**绝不写盘**：
+    //   · 补丁不可用（开发者路径 / hello.dsh.command）—— 硬复用会撞 id collision；
+    //   · 指针属于别的工作区 —— 覆盖它等于把原工作区那份记忆的指针永久丢掉。
+    // 两者都退回「本 activation 内一次性的临时 id」：每次激活互不相同，撞不上旧日志。
+    if (resumeId === undefined && patched && stored === undefined) {
+      this._active.dsh = { id: dshId, cwd };
+    }
+
     this._dshSessions.set(uiId, dshId);
     this._currentDshId = dshId;
-    // 该 UI 会话在**这个 activation**里首次发消息，且此前已有人类历史
-    // （典型：host 重启后继续旧对话）。DSH 会话是全新的，模型不记得之前的内容。
+    // 该 UI 会话在**这个 activation**里首次发消息，且此前已有人类历史（典型：host 重启后继续旧对话）。
+    // 说清楚模型到底记不记得之前的内容 —— 这个 note 是用户唯一能看到的判据，别含糊。
     if (this._hadHistoryBeforeSend) {
-      const note: ChatMessage = {
-        id: this._nextMsgId(),
-        role: 'note',
-        text: '已开启全新 DSH 会话 —— 模型只记得本条消息之后的内容，不再拥有此前对话的记忆。',
-        status: 'done',
-      };
-      this._active.messages.push(note);
-      this._post({ type: 'note-message', message: note });
+      this._pushNote(
+        resumeId !== undefined
+          ? '已恢复此前的 DSH 会话记忆 —— 模型仍记得本条消息之前的对话。'
+          : '已开启全新 DSH 会话 —— 模型只记得本条消息之后的内容，不再拥有此前对话的记忆。'
+      );
     }
     return dshId;
   }
@@ -955,6 +1001,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._dsh = undefined;
     this._approval?.cancelAll(); // C1：子进程一杀，hook 连接就断了；先把挂起的收干净
     this._connectPromise = undefined;
+    // 只清缓存、不动 _active.dsh：下一次发送会从盘上的身份重新推导 ——
+    // 于是换模型/换 key/换路径之后，会话记忆仍在（C5）。
     this._dshSessions.clear();
     this._currentDshId = undefined;
     this._backendState = 'offline';
@@ -2402,6 +2450,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._store.add(fork); // fork 已有内容 → 立即上历史列表
     this._persistActiveSession(); // 归档源会话并落盘（fork 此时已在列，一并写入）
 
+    // C5：分支**继承**源会话的 DSH 身份，这样「分支共享同一份 DSH 记忆」在 host 重启之后依然成立。
+    // （只挂在 _dshSessions 这个缓存上是不够的 —— 缓存活不过重载，重载后 fork 会另铸 id、记忆断掉。）
+    fork.dsh = src.dsh;
     // 记忆延续：分支共享源 DSH 会话 → 后续 _ensureDshSession 直接复用、不插"失忆"note
     const srcDshId = this._dshSessions.get(src.id);
     if (srcDshId) {

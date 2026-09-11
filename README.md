@@ -160,7 +160,7 @@ All keys live under `hello.dsh` and are `scope: machine` (read from user setting
 
 | Setting | Default | Purpose |
 |---|---|---|
-| `hello.dsh.runtimeDir` | `""` | **Portable runtime (recommended).** A directory containing `runtime.json`. Takes precedence over `nodePath`/`loader`/`entry`/`config`/`runCwd`; an unusable directory is reported as an error rather than silently falling back. |
+| `hello.dsh.runtimeDir` | `""` | **Portable runtime (recommended).** A directory containing `runtime.json`. Takes precedence over `nodePath`/`loader`/`entry`/`config`/`runCwd`; an unusable directory is reported as an error rather than silently falling back. **Cross-restart session memory only works with a runtime produced by this repo's `build-runtime.mjs`** (it carries the resume patch); the developer path / `command` drive the user's own DSH, which has no patch — there a continued chat starts a fresh session and says so in a note. |
 | `hello.dsh.nodePath` | `""` | *Developer path.* `node.exe` used to launch the runtime (must satisfy DSH `engines`). Ignored when `runtimeDir` is set. |
 | `hello.dsh.loader` | `""` | Loader id passed to `node --import`. **Empty ⇒ inferred from the entry's extension**: `.ts`/`.tsx`/`.mts` ⇒ `tsx/esm`, anything else (a pre-built `.js`) ⇒ no loader at all. |
 | `hello.dsh.entry` | `""` | *Developer path.* The jsonrpc-agent entry script. Ignored when `runtimeDir` is set. |

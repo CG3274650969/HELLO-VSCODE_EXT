@@ -1,28 +1,35 @@
 #!/usr/bin/env node
 /**
- * 便携运行时的裸冒烟：不依赖扩展、不依赖 F5 —— 直接 spawn 包内的 node + 入口 + 配置，
- * 喂一条 `initialize`，看是否回一条 id 对得上的 JSON-RPC 响应。
+ * 便携运行时的冒烟，两段：
  *
- * 这是整条 C2 路线的分离器：`packaged-bin.js` 在 Windows 上能不能跑、
- * 闭包的裸插件名能不能解析、默认 cordis.yml 能不能 boot —— 全在这一个断言里。
- * initialize 不调模型，**不需要 DEEPSEEK_API_KEY**。
+ *   ① 裸 initialize（默认就跑）—— 不依赖扩展、不依赖 F5：spawn 包内的 node + 入口 + 配置，
+ *      喂一条 `initialize`，看是否回一条 id 对得上的 JSON-RPC 响应。
+ *      **这是整条 C2 路线的分离器**：`packaged-bin.js` 在 Windows 上能不能跑、
+ *      闭包的裸插件名能不能解析、默认 cordis.yml 能不能 boot —— 全在这一个断言里。
+ *      initialize 不调模型，**不需要 DEEPSEEK_API_KEY**。
  *
- *   node scripts/smoke-runtime.mjs --runtime <便携运行时目录>
- *   node scripts/smoke-runtime.mjs --runtime <目录> --keep-session   # 保留临时会话目录便于排查
+ *   ② resume（`--resume`）—— C5 的回归闸门：同一个 sessionId 跨**两个进程**、同一个
+ *      `DSH_SESSION_ROOT`，第二轮必须记得第一轮埋的暗号。要真跑两轮模型 → **需要 key**；
+ *      拿不到 key 就打一条醒目的 ⚠ 并跳过（以 0 退出，不假装验过）。
+ *
+ *   node scripts/smoke-runtime.mjs --runtime <便携运行时目录> [--resume] [--keep-session]
  */
-import { spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
+import { DEFAULT_CREDENTIALS_FILE, readApiKey, runTurn } from './dsh-turn.mjs';
 
-/** 等一条 id 对得上的响应；超时即判失败。首次 boot 要加载上百个插件包，给足时间。 */
-const RESPONSE_TIMEOUT_MS = 90_000;
+/** resume 场景埋的暗号；纯数字，避免模型改写格式。 */
+const NONCE = '7413';
+const SESSION_ID = 'smoke-resume::1';
 
 const { values } = parseArgs({
   options: {
     runtime: { type: 'string' },
+    resume: { type: 'boolean', default: false },
+    'api-key-file': { type: 'string', default: DEFAULT_CREDENTIALS_FILE },
     'keep-session': { type: 'boolean', default: false },
     help: { type: 'boolean', default: false },
   },
@@ -32,9 +39,12 @@ const { values } = parseArgs({
 if (values.help || (!values.runtime && process.argv.length < 3)) {
   console.log(
     [
-      '用法：node scripts/smoke-runtime.mjs --runtime <便携运行时目录> [--keep-session]',
+      '用法：node scripts/smoke-runtime.mjs --runtime <便携运行时目录> [--resume] [--keep-session]',
       '',
       '目录里应有 runtime.json（由 scripts/build-runtime.mjs 产出）。',
+      '  --resume          额外验「跨进程续上同一会话」（C5）；需要 API key，读不到会 ⚠ 跳过',
+      '  --api-key-file    从哪读 key（默认 ~/.dsh/.credentials.yaml）',
+      '  --keep-session    保留临时会话目录便于排查',
     ].join('\n')
   );
   process.exit(values.help ? 0 : 1);
@@ -61,104 +71,6 @@ async function resolveRuntime(dir) {
   return resolved;
 }
 
-/**
- * spawn 运行时、发一条 initialize、等响应。
- * DSH 在 stdin end 时会自认父进程断开而干净退出，所以**保持 stdin 打开**直到我们主动 kill。
- */
-function probe({ node, entry, config, cwd, sessionRoot }) {
-  return new Promise((resolvePromise) => {
-    const child = spawn(node, [entry, config], {
-      cwd,
-      env: {
-        ...process.env,
-        DSH_CORDIS_CONFIG: config,
-        DSH_CWD: cwd,
-        DSH_SESSION_ROOT: sessionRoot,
-      },
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true,
-    });
-
-    let stdout = '';
-    let stderr = '';
-    let settled = false;
-
-    // Windows 上被杀的子进程还会短暂持有句柄，不等它真的退出就去删会话目录会 EPERM。
-    // 所以 finish 一律等 exited，且给个上限：杀不掉也不能把自己卡死。
-    let resolveExit;
-    const exited = new Promise((r) => {
-      resolveExit = r;
-    });
-    const graceTimer = setTimeout(resolveExit, 5000);
-    child.on('exit', () => {
-      clearTimeout(graceTimer);
-      resolveExit();
-    });
-
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      try {
-        child.kill();
-      } catch {
-        /* 已退出 */
-      }
-      void exited.then(() => resolvePromise(result));
-    };
-
-    const timer = setTimeout(
-      () => finish({ ok: false, detail: `等待 initialize 响应超时（${RESPONSE_TIMEOUT_MS / 1000}s）` }),
-      RESPONSE_TIMEOUT_MS
-    );
-
-    child.on('error', (err) => finish({ ok: false, detail: `无法启动运行时：${err.message}` }));
-    child.stderr.on('data', (d) => {
-      stderr += String(d);
-    });
-    child.stdout.on('data', (d) => {
-      stdout += String(d);
-      // 逐行找 id 对得上的响应
-      let nl;
-      while ((nl = stdout.indexOf('\n')) >= 0) {
-        const line = stdout.slice(0, nl).trim();
-        stdout = stdout.slice(nl + 1);
-        if (!line) continue;
-        let frame;
-        try {
-          frame = JSON.parse(line);
-        } catch {
-          // 非 JSON 行 = stdout 被污染（配置里混进了 logger/终端 UI），这是硬错误
-          finish({ ok: false, detail: `stdout 出现非 JSON 行（stdout 必须留给 JSON-RPC）：${line.slice(0, 200)}` });
-          return;
-        }
-        if (frame.id !== 1) continue;
-        if (frame.error) {
-          finish({ ok: false, detail: `initialize 返回错误：${JSON.stringify(frame.error)}` });
-          return;
-        }
-        finish({ ok: true, detail: `initialize 回执 id=1：${JSON.stringify(frame.result).slice(0, 200)}` });
-        return;
-      }
-    });
-    child.on('exit', (code) => {
-      finish({
-        ok: false,
-        detail: `运行时提前退出（code=${String(code)}）${stderr.trim() ? `；stderr：${stderr.trim().slice(0, 600)}` : ''}`,
-      });
-    });
-
-    child.stdin.write(
-      JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'initialize',
-        params: { cwd, provider: 'deepseek-official', model: 'deepseek-v4-flash' },
-      }) + '\n'
-    );
-  });
-}
-
 const resolved = await resolveRuntime(runtimeDir);
 console.log(`运行时：${runtimeDir}`);
 console.log(`  node   ${resolved.node}`);
@@ -167,26 +79,82 @@ console.log(`  config ${resolved.config}`);
 console.log(
   `  清单   dsh ${resolved.manifest.dshVersion ?? '?'} · ${resolved.manifest.platform ?? '?'} · node ${
     resolved.manifest.nodeVersion ?? '?'
-  }`
+  } · patches ${JSON.stringify(resolved.manifest.patches ?? [])}`
 );
 
 // 会话落在临时目录：冒烟不该污染任何人的真实会话，也不该落在仓库里
 const sandbox = mkdtempSync(join(tmpdir(), 'hello-runtime-smoke-'));
 console.log(`  会话   ${sandbox}`);
 
-const result = await probe({
+const common = {
   node: resolved.node,
   entry: resolved.entry,
   config: resolved.config,
   cwd: sandbox,
   sessionRoot: join(sandbox, 'sessions'),
-});
+};
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// 先给结论，再清理 —— 清理失败不该盖掉结论
-if (result.ok) {
-  console.log(`\n✓ 冒烟通过 —— ${result.detail}`);
-} else {
-  console.error(`\n✗ 冒烟失败 —— ${result.detail}`);
+/** 逐段收集结论，最后一起判定 —— 先给结论再清理，清理失败不该盖掉结论。 */
+const results = [];
+
+// ---- ① 裸 initialize ----
+results.push({ name: '裸 initialize', ...(await runTurn(common)) });
+
+// ---- ② resume：同一个 sessionId 跨两个进程 ----
+let resumeSkipped = false;
+let skippedWhy = '';
+if (values.resume) {
+  const apiKey = readApiKey(values['api-key-file']);
+  if (!apiKey) {
+    resumeSkipped = true;
+    skippedWhy = values['api-key-file'];
+  } else {
+    console.log(`  key    已读到（${apiKey.length} 字符，不打印）`);
+    const r1 = await runTurn({
+      ...common,
+      sessionId: SESSION_ID,
+      apiKey,
+      prompt: `记住这个数字：${NONCE}。只需要回复「好的」，不要做别的。`,
+    });
+    await sleep(600); // 让上一个进程与它的句柄彻底退干净
+
+    const r2 = await runTurn({
+      ...common,
+      sessionId: SESSION_ID,
+      apiKey,
+      prompt: '我刚才让你记住的数字是多少？只回复那个数字，不要解释。',
+    });
+
+    const errors = r2.frames.filter((f) => f.error).map((f) => JSON.stringify(f.error).slice(0, 300));
+    results.push({ name: 'resume 轮 1', ...r1 });
+    results.push({ name: `resume 轮 2（应记得 ${NONCE}）`, ...r2 });
+    console.log(`  resume 轮 1 ${r1.ok ? '✓' : '✗'} ${r1.reason}${r1.assistant.trim() ? ` —— 模型说：${r1.assistant.trim().slice(0, 80)}` : ''}`);
+    console.log(`  resume 轮 2 ${r2.ok ? '✓' : '✗'} ${r2.reason} —— 模型说：${r2.assistant.trim().slice(0, 120) || '(无)'}`);
+
+    const resumeOk = r1.ok && r2.ok && errors.length === 0 && r2.assistant.includes(NONCE);
+    results.push({
+      name: 'resume',
+      ok: resumeOk,
+      reason: resumeOk
+        ? `跨进程续上，模型答出 ${NONCE}`
+        : `轮 1 ${r1.ok ? 'ok' : '失败'}；轮 2 ${r2.ok ? 'ok' : '失败'}；错误帧 ${errors.length} 条` +
+          `${errors.length ? `（${errors[0]}）` : ''}；回复里有暗号=${r2.assistant.includes(NONCE)}`,
+    });
+  }
+}
+
+// ---- 判定 ----
+const failed = results.filter((r) => !r.ok);
+for (const r of results) {
+  if (r.ok) console.log(`✓ ${r.name} —— ${r.reason}`);
+  else console.error(`✗ ${r.name} —— ${r.reason}`);
+}
+if (resumeSkipped) {
+  console.log(
+    `\n⚠ resume 冒烟**未跑**：读不到 API key（${skippedWhy}，也没有 DEEPSEEK_API_KEY）。\n` +
+      '  → 「会话记忆跨重启」这一条本次**未经验证**。要验就给它一把 key，或先跑 scripts/probe-resume.mjs。'
+  );
 }
 
 if (!values['keep-session']) {
@@ -198,4 +166,4 @@ if (!values['keep-session']) {
   }
 }
 
-process.exit(result.ok ? 0 : 1);
+process.exit(failed.length > 0 ? 1 : 0);

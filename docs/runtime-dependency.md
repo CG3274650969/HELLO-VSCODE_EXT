@@ -60,7 +60,27 @@ node scripts/update-dsh.mjs <DSH检出根> --to dsh-vX.Y.Z-rc.N
 1. 打开扩展 → Harness 页签，状态点转绿「在线 · \<模型\>」。
 2. 发一句话，确认工具卡 + 转写正常（真实会话）。
 3. 若跨了大版本，跑一次 `node scripts/capture-dsh-frames.mjs …` 核对 JSON-RPC 事件词表有无漂移。
-4. 升级成功后把本文「当前锁定版本」与上面 `--expected` 的示例更新到新版本。
+4. **重建便携运行时**（`node scripts/build-runtime.mjs --dsh <检出>`）—— 见下「补丁与锚点漂移」。F5 里再顺一遍「续聊记得上一轮」。
+5. 升级成功后把本文「当前锁定版本」与上面 `--expected` 的示例更新到新版本。
+
+### 补丁与锚点漂移（升级必看）
+
+便携运行时不是检出的原样拷贝：`build-runtime.mjs` 会对产物打一个**补丁**，把「恢复已落盘的会话」
+接到 JSON-RPC 的 wire 上（DSH 的 wire 上**没有** resume 方法；硬复用旧 sessionId 会 fail-closed 成
+`id collision`。背景与实证见 [backlog.md](backlog.md) 的 C5）。
+
+这意味着：
+
+- **升级后必须经 `build-runtime.mjs` 重建运行时**，别手工搬目录 —— 手搬的那份没有补丁。
+- 补丁是**按锚点文本**定位的（`scripts/runtime-patch.mjs` 是唯一持有锚点的地方）。上游改了那段
+  实现 → 锚点找不着或出现次数 ≠ 1 → **构建当场失败**并报出锚点路径。
+  **这就是漂移检测点**：不必再往 `update-dsh.mjs` 里塞检查，它跑在 `pnpm run build` 之前，
+  那时各包的 `lib/` 还没重新生成，想查也无从查起。
+- 构建期还会断言扩展侧那个判据常量（`src/chatViewProvider.ts` 的 `DSH_RESUME_PATCH`）与本脚本的
+  `PATCH_NAME` 一字不差：改了名字只改一边，表现是**「续聊永远丢记忆」且不报任何错**，只能靠构建期钉死。
+- 锚点真漂了怎么办：照着 upstream 里 `restoreOrCreateConfigured`（`@deepseek-ai/dsh-agent-loop`）
+  的 resume-first 写法更新 `runtime-patch.mjs` 的替换文本，然后**重跑 `scripts/probe-resume.mjs`**
+  两个对照组（未补丁必现 id collision / 补丁后答得出暗号），过了才算修好。
 
 ### 选项
 
@@ -102,9 +122,12 @@ node scripts/update-dsh.mjs <DSH检出根> --to dsh-vX.Y.Z-rc.N
 
 **判定点**：`node scripts/smoke-runtime.mjs --runtime <目录>` —— 裸 spawn 包内 node + 入口 + 配置，
 喂一条 `initialize`（**不需要 API key**），断言收到 id 对得上的 JSON-RPC 回执。这条不过，后面全白写。
+加 `--resume` 再验一条「同一个 sessionId 跨两个进程还记得上一轮」（C5；**要 API key**，读不到会打一条
+醒目的 ⚠ 并跳过，不假装验过）。
 
 **升级耦合**：便携运行时的字节仍来自检出，所以**升 tag 后要重建一次运行时目录**，与重建
 `media/dsh-live` 同理。重建同样走 `scripts/build-runtime.mjs`（它会先调 `update-dsh.mjs` 断言锁点）。
+**注意别手工搬目录** —— 产物里有一处我们的补丁，手工搬的那份没有（见「升级仪式 · 补丁与锚点漂移」）。
 
 **已知风险**：这条路线**没有上游背书**（node 载体被上游划为 dev-only）。兜底是我们自己的构建 +
 冒烟。将来换供给方（上游 Windows 制品 / 内网包）只改"目录从哪来"，扩展侧接口不动。

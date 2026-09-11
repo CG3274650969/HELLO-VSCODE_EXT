@@ -143,7 +143,7 @@ Harness 页签顶部状态点依次显示连接：灰 未连接 → 蓝 连接�
 
 | 键 | 默认 | 作用 |
 |---|---|---|
-| `hello.dsh.runtimeDir` | `""` | **便携运行时（推荐）**：含 `runtime.json` 的目录。**优先于** `nodePath`/`loader`/`entry`/`config`/`runCwd`；目录不可用会明确报错，不会静默回退。 |
+| `hello.dsh.runtimeDir` | `""` | **便携运行时（推荐）**：含 `runtime.json` 的目录。**优先于** `nodePath`/`loader`/`entry`/`config`/`runCwd`；目录不可用会明确报错，不会静默回退。**会话记忆跨重启只在指向本仓库 `build-runtime.mjs` 产出的运行时下生效**（那份带 resume 补丁）；开发者路径/`command` 走用户自己的 DSH，没有补丁，续聊会开新会话并插一行说明。 |
 | `hello.dsh.nodePath` | `""` | *开发者路径*。启动运行时用的 `node.exe`（须满足 DSH `engines`）。设了 `runtimeDir` 时不生效。 |
 | `hello.dsh.loader` | `""` | 传给 `node --import` 的加载器标识。**留空 ⇒ 按入口扩展名自动判断**：`.ts`/`.tsx`/`.mts` ⇒ `tsx/esm`，其余（预构建的 `.js`）⇒ 不加任何加载器。 |
 | `hello.dsh.entry` | `""` | *开发者路径*。jsonrpc-agent 入口脚本。设了 `runtimeDir` 时不生效。 |

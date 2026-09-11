@@ -23,6 +23,7 @@ import { copyFile, cp, lstat, mkdir, readFile, readdir, realpath, rm, writeFile 
 import { existsSync } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 import { parseArgs } from 'node:util';
+import { PATCH_NAME, applyResumePatch } from './runtime-patch.mjs';
 
 const REPO_ROOT = resolve(import.meta.dirname, '..');
 
@@ -38,6 +39,8 @@ const DEPLOY_ONLY_DOCS = ['README.md', 'README.zh.md', 'README.i18n.yaml'];
 const DEFAULT_CONFIG_REL = 'runtime/cordis.default.yml';
 /** DSH 的 engines.node 要求（见检出根 package.json）。 */
 const MIN_NODE = { major: 22, minor: 19 };
+/** 扩展侧那个判据常量的出处（必须与 runtime-patch.mjs 的 PATCH_NAME 一字不差）。 */
+const EXT_PATCH_CONST_FILE = 'src/chatViewProvider.ts';
 
 const { values } = parseArgs({
   options: {
@@ -81,6 +84,34 @@ function log(msg) {
 function fail(msg) {
   console.error(`[build-runtime] ✗ ${msg}`);
   process.exit(1);
+}
+
+/**
+ * 构建期一致性断言：扩展侧的判据常量必须与本模块的 PATCH_NAME 一字不差。
+ *
+ * 这两半是耦的却分居两个语言里：构建脚本往产物上打 `PATCH_NAME` 的补丁并写进 runtime.json，
+ * 扩展靠自己的 `DSH_RESUME_PATCH` 去认。改了名字只改一边 → 补丁照样打、清单照样写，
+ * 但扩展认不出来 → **表现是「续聊永远丢记忆」，全程不报一个错**。这种静默失败只能靠构建期钉死。
+ */
+async function assertPatchNameAgreesWithExtension() {
+  const file = join(REPO_ROOT, EXT_PATCH_CONST_FILE);
+  let src;
+  try {
+    src = await readFile(file, 'utf8');
+  } catch (err) {
+    fail(`读不到扩展侧常量文件 ${EXT_PATCH_CONST_FILE}：${err instanceof Error ? err.message : String(err)}`);
+  }
+  const m = /DSH_RESUME_PATCH\s*=\s*'([^']+)'/.exec(src);
+  if (!m) {
+    fail(`扩展侧 ${EXT_PATCH_CONST_FILE} 里找不到 \`DSH_RESUME_PATCH = '…'\` —— 判据常量没了或被改了写法。`);
+  }
+  if (m[1] !== PATCH_NAME) {
+    fail(
+      `补丁名漂了：runtime-patch.mjs 是 "${PATCH_NAME}"，扩展侧是 "${m[1]}"。\n` +
+        '  两边必须一字不差，否则扩展认不出打了补丁的运行时（表现为「续聊永远丢记忆」且不报错）。'
+    );
+  }
+  log(`补丁名一致：${PATCH_NAME}（runtime-patch.mjs ↔ ${EXT_PATCH_CONST_FILE}）`);
 }
 
 /** 跑一个子进程并把输出透传；非零退出即抛，且把原始命令打出来（别吞退出码）。 */
@@ -306,7 +337,19 @@ async function main() {
   if (outDir === dshRoot || dshRoot.startsWith(outDir + sep)) {
     fail(`拒绝清空产出目录 ${outDir}：它包含 DSH 检出根`);
   }
-  await rm(outDir, { recursive: true, force: true });
+  // 清不掉多半不是权限问题，是**上一个运行时进程还活着**占着 outDir/node/node.exe
+  // —— Windows 上运行中的映像文件是排他的。裸 EBUSY 完全看不出这一点，所以自己说清楚。
+  // （实测踩过一次：遗留的运行时进程让整次构建在第一步就失败，报错里只有 rmdir 路径。）
+  try {
+    await rm(outDir, { recursive: true, force: true, maxRetries: 4, retryDelay: 250 });
+  } catch (err) {
+    const nodeInOut = join(outDir, 'node', process.platform === 'win32' ? 'node.exe' : 'node');
+    fail(
+      `清空产出目录失败：${outDir}\n  ${err instanceof Error ? err.message : String(err)}\n` +
+        `  → 多半是残留的运行时进程正占着 ${nodeInOut}。\n` +
+        '    先关掉在跑这个运行时的 VS Code 窗口，再按需 taskkill /F /PID <pid>（或 taskkill /F /IM node.exe），然后重跑。'
+    );
+  }
   await mkdir(outDir, { recursive: true });
 
   await run(
@@ -340,6 +383,19 @@ async function main() {
     );
   }
 
+  // ---- 打补丁：把「恢复已落盘的会话」接到 wire 上（C5）----
+  // 只动**构建产物**，用户的 DSH 检出不受影响（补丁模块见 scripts/runtime-patch.mjs）。
+  // 锚点漂移就当场失败，绝不静默放过：静默放过 = 交付出一个一 resume 就撞 id collision 的运行时。
+  await assertPatchNameAgreesWithExtension();
+  let patched = false;
+  try {
+    const result = applyResumePatch(outDir);
+    patched = true;
+    log(result.changed ? `已打补丁 ${PATCH_NAME} → ${result.file}` : `补丁 ${PATCH_NAME} 已在产物里（幂等）`);
+  } catch (err) {
+    fail(`resume 补丁打不上：${err instanceof Error ? err.message : String(err)}`);
+  }
+
   // ---- 补 node 与默认配置 ----
   const nodeDestDir = join(outDir, 'node');
   await mkdir(nodeDestDir, { recursive: true });
@@ -362,9 +418,12 @@ async function main() {
     node: `node/${process.platform === 'win32' ? 'node.exe' : 'node'}`,
     entry: ENTRY_REL.split(sep).join('/'),
     config: 'cordis.yml',
+    /** 我们对产物做的改动清单。扩展靠它判断「这个运行时能不能跨进程复用 DSH id」——
+     *  没这个标记（开发者路径/外部运行时）就只能每次激活新铸 id，否则会撞 id collision。 */
+    patches: patched ? [PATCH_NAME] : [],
   };
   await writeFile(join(outDir, 'runtime.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-  log(`已写出 runtime.json（dsh ${dshVersion} · ${manifest.platform} · node ${nodeVersion}）`);
+  log(`已写出 runtime.json（dsh ${dshVersion} · ${manifest.platform} · node ${nodeVersion} · patches ${JSON.stringify(manifest.patches)}）`);
 
   // ---- 可选 zip（阶段二的分发单元）----
   if (values.zip) {
@@ -373,9 +432,12 @@ async function main() {
     await run('打包 zip', ['tar', '-a', '-c', '-f', zipPath, '-C', dirname(outDir), outDir.split(sep).pop()]);
   }
 
-  // ---- 收尾：裸冒烟 ----
+  // ---- 收尾冒烟：一条命令里两段 ----
+  //   ① 裸 initialize —— 不需要 key，是整条 C2 路线的判定点；
+  //   ② resume —— 跨进程续上同一个会话（C5），要真跑两轮模型，需要 key。
+  // ② 拿不到 key 时会自己打一条醒目的 ⚠ 并以 0 退出：不假装验过，也不拦着没 key 的人构建。
   if (!values['skip-smoke']) {
-    await run('裸冒烟', [nodePath, join(REPO_ROOT, 'scripts', 'smoke-runtime.mjs'), '--runtime', outDir]);
+    await run('冒烟（initialize + resume）', [nodePath, join(REPO_ROOT, 'scripts', 'smoke-runtime.mjs'), '--runtime', outDir, '--resume']);
   }
 
   log(`✓ 完成：${outDir}`);
