@@ -26,6 +26,11 @@ export interface StoredSession {
    *  所以嵌套成一个可选对象而不是两个平铺字段 —— 不允许出现只有一半的中间态。
    *  旧数据没有本字段 → 视为「这个会话还没有 DSH 身份」，向后兼容。 */
   dsh?: { id: string; cwd: string };
+  /** C6 软删除时间戳（epoch ms）。**缺省 = 在列**；有值 = 在回收站，等「恢复」或「彻底删除」。
+   *
+   *  回收站只认这一个标志，别再引入并行的旁路状态（`deleted: true` 之类）——两套标志一定会打架。
+   *  旧数据没有本字段 → 视为未删除，向后兼容。 */
+  deletedAt?: number;
 }
 
 /** 由首条用户消息生成一句话标题（单行、截断）。 */
@@ -50,6 +55,12 @@ function normalize(session: StoredSession): StoredSession {
   }
   session.createdAt = session.createdAt || Date.now();
   session.updatedAt = session.updatedAt || Date.now();
+
+  // C6：软删标记只要不是「有限正数」就当**未删除**。失败一律朝「看得见」的方向倒 ——
+  // 一个损坏的时间戳（"yes" / {} / 0 / 负数）绝不能把会话永久藏进回收站里。
+  if (typeof session.deletedAt !== 'number' || !Number.isFinite(session.deletedAt) || session.deletedAt <= 0) {
+    delete session.deletedAt;
+  }
   return session;
 }
 
@@ -73,6 +84,8 @@ export class SessionStore {
       const raw = fs.readFileSync(this._file, 'utf8');
       const parsed: unknown = JSON.parse(raw);
       if (Array.isArray(parsed)) {
+        // ⚠️ 这里**只**按 messages 过滤，绝不要补一句 `&& !s.deletedAt`：回收站的会话必然有消息
+        // （空会话根本进不了列表），所以它天然活得过重启；补上那句会让回收站一重启就空。
         this._sessions = parsed
           .filter((s): s is StoredSession => !!s && Array.isArray((s as StoredSession).messages))
           .filter((s) => s.messages.length > 0)
@@ -124,6 +137,81 @@ export class SessionStore {
     }
   }
 
+  /**
+   * C6：在列会话（有内容、且不在回收站），**历史列表与检索都只认它**。
+   *
+   * 「有内容」这条过滤规则只此一处 —— 从前 `_sendHistory` 里还抄了一份，两份必然漏改一处。
+   * 返回新数组，调用方随便 sort 都不会动到内部顺序。
+   */
+  active(): StoredSession[] {
+    return this._sessions.filter((s) => s.messages.length > 0 && s.deletedAt === undefined);
+  }
+
+  /** C6：回收站（已软删）。同样返回新数组；排序交给调用方，与 `active()` 对称。 */
+  trashed(): StoredSession[] {
+    return this._sessions.filter((s) => s.deletedAt !== undefined);
+  }
+
+  /**
+   * C6：软删除 —— **原地打标记，绝不把这个对象 filter 出数组**。
+   *
+   * 这不是风格问题：`_active` 就指向数组里那个对象，而 `replace()` 是「找不到就 push」，
+   * 代码里已有两条现成的复活路径（`_afterTurn` 轮尾、`_openSession`）——一旦摘出去，
+   * 用户删完再发一条消息，它就被重新 push 回列表，「删了又回来」。
+   *
+   * **幂等**：已删的不刷新 `deletedAt`（否则重复点删除会把删除时间越推越晚）。
+   * @returns 是否真的改了状态；未知 id / 已删 → false（不抛）。
+   */
+  softDelete(id: string, at: number = Date.now()): boolean {
+    const s = this.get(id);
+    if (!s || s.deletedAt !== undefined) {
+      return false;
+    }
+    s.deletedAt = at;
+    return true;
+  }
+
+  /**
+   * C6：从回收站恢复。顺带把 `updatedAt` 顶到当前时间 —— 列表按 updatedAt 倒序，
+   * 不顶的话一个旧会话恢复后掉在列表很下面，用户会报「点了恢复但没看见」。
+   * （`_openSession` 早有「动一下就 bump updatedAt」的先例，语义一致。）
+   * @returns 是否真的改了状态；未知 id / 本来就没删 → false（不抛）。
+   */
+  restore(id: string): boolean {
+    const s = this.get(id);
+    if (!s || s.deletedAt === undefined) {
+      return false;
+    }
+    delete s.deletedAt;
+    s.updatedAt = Date.now();
+    return true;
+  }
+
+  /**
+   * C6：彻底删除（不可撤销）。**只删回收站里的** —— 对在列会话静默返回 false，
+   * 这样任何调用点写错了也不会顺手销毁一个用户还在用的会话。
+   */
+  purge(id: string): boolean {
+    const s = this.get(id);
+    if (!s || s.deletedAt === undefined) {
+      return false;
+    }
+    this.remove(id);
+    return true;
+  }
+
+  /** C6：清空回收站。@returns 清掉的条数（用于核对提示文案）。 */
+  purgeTrashed(): number {
+    const doomed = this.trashed();
+    if (doomed.length === 0) {
+      return 0;
+    }
+    const ids = new Set(doomed.map((s) => s.id));
+    this._sessions = this._sessions.filter((s) => !ids.has(s.id));
+    return ids.size;
+  }
+
+  /** 底层原语：把会话从数组里摘掉。想删会话请走 `softDelete`（软删）或 `purge`（回收站内彻底删）。 */
   remove(id: string): void {
     this._sessions = this._sessions.filter((s) => s.id !== id);
   }

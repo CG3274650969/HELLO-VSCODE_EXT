@@ -198,6 +198,24 @@ Changing any path/model/key while the panel is open reconnects the live subproce
 (the status dot follows). History lives in the extension's global storage; Harness sessions are kept
 separate from Embedded-chat ones.
 
+### Session history
+
+The **历史** panel lists past sessions for the current mode, and now does more than match titles:
+
+- **Full-text search** over message bodies plus each tool card's **name and arguments** (so you can
+  find a session by the command you ran, e.g. `rm test.py`). Tool *output* and the grey status notes
+  are deliberately not searched — they are noise for this purpose. Matches show a context snippet
+  with the hit highlighted.
+- **Export** a single session (⬇ per row, trash included) as **Markdown** (readable transcript;
+  tool input/output clipped at 4000 chars) or **JSON** (lossless — attachments, usage and the DSH
+  session identity included).
+- **Delete is now a soft delete** (✕ moves it to the **回收站** tab, which can restore it). Removing
+  something for good takes an explicit **彻底删除** or **清空回收站**, each behind a native modal
+  confirm — restoring bumps the session back to the top of the list.
+
+Search scope and the trash are per-mode, like the lists themselves. Deleting a session never touches
+the DSH session logs on disk (that is [C7](docs/backlog.md)'s job).
+
 A second group lives under `hello.chat` (`scope: window`) — guardrails and review:
 
 | Setting | Default | Purpose |
@@ -248,11 +266,14 @@ finished path.
 |---|---|
 | `src/chatViewProvider.ts` | Chat webview host: spawns the DSH runtime, handshake, message/tool streaming, mode & live-config logic |
 | `src/dshRuntime.ts` | DSH JSON-RPC child-process lifecycle (spawn/handshake/heartbeat/events) |
-| `src/sessionStore.ts` | Session titles & continuation persisted under global storage |
+| `src/sessionStore.ts` | Session titles, soft delete/trash & continuation persisted under global storage |
+| `src/sessionSearch.ts` | Full-text search over stored transcripts (pure, no `vscode`) |
+| `src/sessionExport.ts` | Transcript → Markdown / JSON, and safe default file names (pure, no `vscode`) |
 | `src/extension.ts` | Extension entry: commands + view registration |
 | `media/chat.{html,js,css}` | Side-panel front end (mode pills + harness status dot; DSH theme tokens with VS Code fallbacks) |
 | `media/dsh-live/` | **gitignored** — DSH single-file front-end bundle (see above) |
 | `scripts/capture-dsh-frames.mjs` | Frame-capture tool for the DSH runtime (`DSH_CAP_*`) |
+| `scripts/probe-session-tools.mjs` | Self-check for search/export/soft-delete (`npm run compile` first; no VS Code, no API key) |
 | `scripts/update-dsh.mjs` | Runtime-dependency governance: lock the DSH checkout to a tag, check drift, run the upgrade ritual + smoke (see `docs/runtime-dependency.md`) |
 | `docs/runtime-dependency.md` | Governance decision for treating the DSH checkout as a versioned runtime dependency, the upgrade ritual, and the “when to switch to official npm” checklist |
 

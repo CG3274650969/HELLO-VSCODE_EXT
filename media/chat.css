@@ -366,6 +366,105 @@ body.vscode-high-contrast .brand-mark {
   color: var(--dsw-alias-state-error-primary, var(--vscode-errorForeground, #f14c4c));
 }
 
+/* ---------- C6：会话 / 回收站 两个视图 + 全文检索命中 ---------- */
+
+/* 视图标签条：固定在面板顶部（同搜索框，不随列表滚走） */
+.history-tabs {
+  flex: none;
+  display: flex;
+  gap: 2px;
+  margin: 0 2px 6px;
+}
+
+.history-tab {
+  flex: 1;
+  padding: 4px 6px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.history-tab:hover {
+  background: var(--dsw-alias-interactive-bg-hover, var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.25)));
+}
+.history-tab.active {
+  background: var(--dsw-alias-button-ghost-active-fill, var(--vscode-list-activeSelectionBackground, #094771));
+  color: var(--dsw-alias-label-primary, var(--vscode-list-activeSelectionForeground, #fff));
+}
+
+/* 命中片段：一行、尾部省略（before/match/after 三段由 JS 用 textContent 拼，见 chat.js） */
+.history-snippet {
+  display: block;
+  font-size: 11px;
+  line-height: 15px;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 高亮只加在 match 段上 */
+.search-hit {
+  background: var(--dsw-alias-state-business-primary, var(--vscode-editor-findMatchHighlightBackground, rgba(255, 200, 0, 0.35)));
+  color: inherit;
+  border-radius: 3px;
+}
+.history-count {
+  font-size: 11px;
+  line-height: 15px;
+  color: var(--dsw-alias-label-dimmed, var(--vscode-descriptionForeground, #999));
+}
+
+/* 行内动作钮（导出 ⬇ / 恢复 ↩）：与 .history-delete 同款，只是 hover 不上红色 */
+.history-export,
+.history-restore {
+  flex: none;
+  border: none;
+  background: none;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 20px;
+  padding: 4px 5px;
+  border-radius: 6px;
+}
+.history-export:hover,
+.history-restore:hover {
+  background: var(--dsw-alias-interactive-bg-hover, var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.25)));
+  color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
+}
+
+/* 面板底部：只在回收站页出现 */
+.history-foot {
+  flex: none;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--dsw-alias-border-l2, var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.4)));
+  display: flex;
+  justify-content: center;
+}
+
+/* 清空回收站：不可逆 → 红字（同 .history-delete 的危险色口径） */
+.history-clear {
+  border: none;
+  background: none;
+  color: var(--dsw-alias-state-error-primary, var(--vscode-errorForeground, #f14c4c));
+  font-family: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.history-clear:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover, var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.25)));
+}
+.history-clear:disabled {
+  color: var(--dsw-alias-label-dimmed, var(--vscode-disabledForeground, #6b6b6b));
+  cursor: default;
+}
+
 .history-empty {
   padding: 14px 10px;
   text-align: center;

@@ -20,6 +20,8 @@ import { ApprovalAsk, ApprovalOutcome, ApprovalServer, matchesAnyPattern } from 
 import { ApprovalHookFiles, probeShell, testApprovalHook, writeApprovalHookFiles } from './dshHooks';
 import { isAbortError, streamMockReply } from './mockAssistant';
 import { SessionStore, StoredSession, titleFromText } from './sessionStore';
+import { searchSessions } from './sessionSearch';
+import { sessionToJson, sessionToMarkdown, suggestedFileName } from './sessionExport';
 import {
   applyRevert,
   compareTrees,
@@ -537,8 +539,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'open-session':
         this._openSession(msg.sessionId);
         break;
-      case 'delete-session':
-        this._deleteSession(msg.sessionId);
+      // --- C6：删除/恢复/彻底删/导出/检索 ---
+      case 'trash-session':
+        this._trashSession(msg.sessionId);
+        break;
+      case 'restore-session':
+        this._restoreSession(msg.sessionId);
+        break;
+      case 'purge-session':
+        void this._purgeSession(msg.sessionId);
+        break;
+      case 'purge-trash':
+        void this._purgeTrash();
+        break;
+      case 'export-session':
+        void this._exportSession(msg.sessionId);
+        break;
+      case 'search-sessions':
+        // **同步作答**：不 await 才能保证 postMessage 的 FIFO 顺序 = 请求顺序，
+        // webview 那套 seq 丢弃过期响应才成立（这里一旦异步，seq 就只是装饰）。
+        this._searchSessions(msg.query, msg.seq);
         break;
       case 'rename-session':
         this._renameSession(msg.title);
@@ -2387,6 +2407,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _openSession(id: string): void {
     const target = this._store.get(id);
     if (!target || target.id === this._active.id) return;
+    // C6：回收站里的会话不许被打开。真实触发路径：检索命中列表里点开某条 → 列表里把它删了
+    // → 再点那条**仍在屏上**的命中（点命中不重跑检索）。不拦的话它会被设成 `_active`，
+    // 接着发消息还会走 _ensureDshSession，等于给一个「已删」的会话继续烧 DSH 记忆。
+    if (target.deletedAt !== undefined) {
+      vscode.window.setStatusBarMessage('该会话已在回收站，先从回收站恢复', 3000);
+      return;
+    }
 
     this._cancelActiveRun();
     this._dropReview(true); // 切会话 → 清掉上一会话的审阅
@@ -2465,12 +2492,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._sendHistory();
   }
 
-  private _deleteSession(id: string): void {
+  /**
+   * C6：删除 = **软删除**，进回收站，可恢复。
+   *
+   * 软删不打确认（可撤销，弹条反而碍事）；真正不可逆的是 `_purgeSession` / `_purgeTrash`。
+   * 这里**不动 `_dshSessions`** —— 回收站期间 DSH 记忆保持可用，恢复后重开还接得上。
+   */
+  private _trashSession(id: string): void {
     const isActive = this._active.id === id;
     if (isActive) {
       this._cancelActiveRun();
     }
-    this._store.remove(id);
+    if (!this._store.softDelete(id)) {
+      this._sendHistory(); // 状态没变（已被别处删掉）→ 至少把列表刷成真实状态
+      return;
+    }
     this._store.persist();
 
     if (isActive) {
@@ -2480,6 +2516,123 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._postSnapshot();
     }
     this._sendHistory();
+  }
+
+  /** C6：从回收站恢复。**不自动切过去** —— 恢复是「放回列表」，不是「打开」，别把用户正在看的会话换掉。 */
+  private _restoreSession(id: string): void {
+    if (!this._store.restore(id)) {
+      this._sendHistory();
+      return;
+    }
+    this._store.persist();
+    this._sendHistory();
+  }
+
+  /** C6：彻底删除单条（不可撤销）→ 先弹原生模态。 */
+  private async _purgeSession(id: string): Promise<void> {
+    const target = this._store.get(id);
+    if (!target || target.deletedAt === undefined) {
+      this._sendHistory();
+      return;
+    }
+    const name = target.title || '（无标题）';
+    const picked = await vscode.window.showWarningMessage(
+      `彻底删除「${name}」？此操作不可撤销。`,
+      { modal: true },
+      '彻底删除'
+    );
+    if (picked !== '彻底删除') {
+      return;
+    }
+    this._purgeOne(id);
+    this._store.persist();
+    this._sendHistory();
+  }
+
+  /** C6：清空回收站（不可撤销）。条数取**点击那一刻**的 —— await 期间新删的会被一并清掉。 */
+  private async _purgeTrash(): Promise<void> {
+    const doomed = this._store.trashed();
+    if (doomed.length === 0) {
+      return;
+    }
+    const picked = await vscode.window.showWarningMessage(
+      `清空回收站里的 ${doomed.length} 个会话？此操作不可撤销。`,
+      { modal: true },
+      '清空回收站'
+    );
+    if (picked !== '清空回收站') {
+      return;
+    }
+    for (const s of doomed) {
+      this._purgeOne(s.id);
+    }
+    this._store.persist();
+    this._sendHistory();
+  }
+
+  /** 彻底删一条的真动作：从存储摘掉 + 清掉它在内存里的 DSH 身份缓存（记忆从此不可达）。 */
+  private _purgeOne(id: string): void {
+    if (this._store.purge(id)) {
+      this._dshSessions.delete(id);
+    }
+  }
+
+  /**
+   * C6：单会话导出。先选格式（**不用扩展名反推** —— `path.extname('讨论 v1.2')` 返回 `.2`
+   * 不是空串，那条路上「没有扩展名」的分支根本进不去），再弹保存对话框。
+   */
+  private async _exportSession(id: string): Promise<void> {
+    const target = this._store.get(id);
+    if (!target) {
+      return;
+    }
+    // 对话框是 await 的，期间活动会话还在被流式追加 → 先把这一刻的转写冻下来
+    const frozen = JSON.parse(JSON.stringify(target)) as StoredSession;
+
+    const fmt = await vscode.window.showQuickPick(
+      [
+        { label: 'Markdown', detail: '给人看的转写（表格/代码围栏；超长工具输出会截断）', ext: 'md' },
+        { label: 'JSON', detail: '无损转储（含附件正文与用量；将来可重新导入）', ext: 'json' },
+      ],
+      { title: '导出为什么格式？', placeHolder: 'Markdown' }
+    );
+    if (!fmt) {
+      return;
+    }
+
+    const defaultName = suggestedFileName(frozen, fmt.ext);
+    const picked = await vscode.window.showSaveDialog({
+      title: '导出会话',
+      saveLabel: '导出',
+      defaultUri: vscode.Uri.file(path.join(this._dshCwd(), defaultName)),
+      filters: fmt.ext === 'md' ? { Markdown: ['md'] } : { JSON: ['json'] },
+    });
+    if (!picked) {
+      return;
+    }
+
+    const text = fmt.ext === 'md' ? sessionToMarkdown(frozen) : sessionToJson(frozen);
+    try {
+      // 用 workspace.fs 而不是 fs.writeFileSync：只读路径、远端盘符交给 VS Code 报错，别自己炸
+      await vscode.workspace.fs.writeFile(picked, Buffer.from(text, 'utf8'));
+    } catch (err) {
+      void vscode.window.showErrorMessage(`导出失败：${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+
+    void vscode.window
+      .showInformationMessage(`已导出：${path.basename(picked.fsPath)}`, '打开')
+      .then((act) => {
+        if (act === '打开') {
+          void vscode.window.showTextDocument(picked);
+        }
+      });
+  }
+
+  /** C6：全文检索。同步返回 —— 见 `_onMessage` 里那条 case 的注释。 */
+  private _searchSessions(query: string, seq: number): void {
+    const hits = searchSessions(this._store.all(), query);
+    this._post({ type: 'search-results', seq, query, hits });
   }
 
   /**
@@ -2504,13 +2657,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** C6：列表与回收站一起下发。「哪些会话该出现在列表里」的规则只在 `SessionStore.active()` 里
+   *  —— 从前这里有第二份内联 filter，两份必然漏改一处，已删掉。 */
   private _sendHistory(): void {
-    const sessions: SessionSummary[] = this._store
-      .all()
-      .filter((s) => s.messages.length > 0)
+    const summary = (s: StoredSession): SessionSummary => ({
+      id: s.id,
+      title: s.title,
+      updatedAt: s.updatedAt,
+      deletedAt: s.deletedAt,
+    });
+    const sessions = this._store
+      .active()
       .sort((a, b) => b.updatedAt - a.updatedAt)
-      .map((s) => ({ id: s.id, title: s.title, updatedAt: s.updatedAt }));
-    this._post({ type: 'history-update', sessions, activeId: this._active.id });
+      .map(summary);
+    const trashed = this._store
+      .trashed()
+      .sort((a, b) => (b.deletedAt ?? 0) - (a.deletedAt ?? 0))
+      .map(summary);
+    this._post({ type: 'history-update', sessions, trashed, activeId: this._active.id });
   }
 
   // ---------- 工具 ----------

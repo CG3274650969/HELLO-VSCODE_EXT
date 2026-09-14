@@ -73,6 +73,32 @@ export interface SessionSummary {
   id: string;
   title: string;
   updatedAt: number;
+  /** C6 软删除时间戳（epoch ms）。有值 = 在回收站；缺省 = 在列。 */
+  deletedAt?: number;
+}
+
+// --- C6 会话全文检索 ---
+
+/**
+ * 命中处的上下文片段。**三段分开给**，不是拼好的 HTML —— webview 分别 `textContent`
+ * 渲染、只给 `match` 挂高亮类，这样检索永远不会成为 innerHTML 的入口。
+ */
+export interface SearchSnippet {
+  /** 匹配点之前的一段（被截断时前缀 `…`） */
+  before: string;
+  match: string;
+  /** 匹配点之后的一段（被截断时后缀 `…`） */
+  after: string;
+}
+
+/** 一条检索命中。`count` 只统计消息字段里的出现次数 —— 只在标题命中的会话 `count` 为 0、无片段。 */
+export interface SearchHit {
+  id: string;
+  title: string;
+  updatedAt: number;
+  count: number;
+  /** 恒取第一条命中消息里的第一次出现（确定性：同一份历史 + 同一个词 → 同一片段） */
+  snippet?: SearchSnippet;
 }
 
 // --- 改动审阅（2.1）：每轮 DSH 执行结束后对工作区根的文件改动做 Keep/Revert ---
@@ -142,7 +168,11 @@ export type ExtToWebview =
   | { type: 'snapshot'; messages: ChatMessage[]; sessionId?: string; sessionTitle?: string; usage?: UsageReadout }
   /** C3a：用量读数变化（每个 usage 样本一次 + 轮尾定稿一次），webview 整条重绘 */
   | { type: 'usage'; usage: UsageReadout }
-  | { type: 'history-update'; sessions: SessionSummary[]; activeId?: string }
+  /** C6：`trashed` = 回收站内容，与 `sessions` 一起下发 —— 每次软删/恢复/彻底删都要重刷两个列表，
+   *  合成一条消息比再开一条少一半触发点（也少一半渲染竞态）。 */
+  | { type: 'history-update'; sessions: SessionSummary[]; trashed: SessionSummary[]; activeId?: string }
+  /** C6：检索结果。`seq` 原样回传，webview 据此丢弃过期响应（配 `query` 双重校验）。 */
+  | { type: 'search-results'; seq: number; query: string; hits: SearchHit[] }
   | { type: 'user-message'; message: ChatMessage }
   | { type: 'assistant-start'; message: ChatMessage }
   | { type: 'assistant-delta'; id: string; delta: string }
@@ -195,7 +225,15 @@ export type WebviewToExt =
   | { type: 'clear' } // 新建对话
   | { type: 'list-sessions' } // 打开历史面板时刷新列表
   | { type: 'open-session'; sessionId: string }
-  | { type: 'delete-session'; sessionId: string }
+  // --- C6：删除现在是**软删**（进回收站、可恢复），动作名跟着语义走，别再叫 delete ---
+  | { type: 'trash-session'; sessionId: string }
+  | { type: 'restore-session'; sessionId: string }
+  /** 彻底删除（不可撤销；扩展侧会先弹原生模态确认） */
+  | { type: 'purge-session'; sessionId: string }
+  | { type: 'purge-trash' }
+  | { type: 'export-session'; sessionId: string }
+  /** C6 全文检索：扩展侧同步作答（`seq` 由 webview 单调递增，原样回传） */
+  | { type: 'search-sessions'; query: string; seq: number }
   | { type: 'rename-session'; title: string } // 给活动会话重命名
   | { type: 'pick-files' } // +附件按钮 → 弹系统文件选择器
   | { type: 'set-mode'; mode: Mode } // 顶部模式切换（内嵌聊天 / Harness）

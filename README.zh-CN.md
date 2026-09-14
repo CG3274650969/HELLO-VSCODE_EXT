@@ -180,6 +180,21 @@ Harness 页签顶部状态点依次显示连接：灰 未连接 → 蓝 连接�
 面板开着时改动任一路径 / 模型 / key，live 子进程会自动重启（状态点跟随）。历史存在扩展
 globalStorage；Harness 会话与内嵌聊天分开存放。
 
+### 会话历史
+
+**历史**面板列出当前模式的历史会话，现在不只按标题匹配：
+
+- **全文检索**：范围是消息正文 + 每张工具卡的**命令名与入参**（所以能按「我跑过什么命令」找会话，
+  例如 `rm test.py`）。工具的**输出**与那些灰色状态说明（note）**有意不搜** —— 对找会话来说是噪音。
+  命中会带一段上下文片段，命中词高亮。
+- **导出**单条会话（每行 ⬇，回收站里也能导）：**Markdown**（给人看的转写；工具入参/输出截到 4000 字符）
+  或 **JSON**（无损 —— 含附件正文、用量、DSH 会话身份）。
+- **删除改成了软删除**（✕ 移进**回收站**标签页，可恢复）。真要删干净得点**彻底删除**或**清空回收站**，
+  两者都有原生模态确认 —— 恢复会把该会话顶回列表最前。
+
+检索范围与回收站都是 per-mode 的，跟列表本身一致。删除会话**不会**动磁盘上的 DSH 会话日志
+（那是 [C7](docs/backlog.md) 的事）。
+
 另一组键在 `hello.chat` 下，`scope: window`（随工作区）：护栏与审阅。
 
 | 键 | 默认 | 作用 |
@@ -224,11 +239,14 @@ Harness 才是完成态。
 |---|---|
 | `src/chatViewProvider.ts` | 聊天 webview 宿主：拉起 DSH 运行时、握手、消息/工具流转发、模式与配置条逻辑 |
 | `src/dshRuntime.ts` | DSH JSON-RPC 子进程生命周期（spawn/握手/心跳/事件分发） |
-| `src/sessionStore.ts` | 会话标题/续聊落盘（globalStorage） |
+| `src/sessionStore.ts` | 会话标题、软删除/回收站、续聊落盘（globalStorage） |
+| `src/sessionSearch.ts` | 存下来的转写做全文检索（纯函数，不引 `vscode`） |
+| `src/sessionExport.ts` | 转写 → Markdown / JSON，以及安全的默认文件名（纯函数，不引 `vscode`） |
 | `src/extension.ts` | 插件入口：命令 + 视图注册 |
 | `media/chat.{html,js,css}` | 侧栏前端（模式胶囊 + harness 状态点；DSH 令牌 + VS Code 双兜底） |
 | `media/dsh-live/` | **gitignore** —— DSH 单文件前端产物（见上） |
 | `scripts/capture-dsh-frames.mjs` | DSH 运行时抓帧工具（`DSH_CAP_*`） |
+| `scripts/probe-session-tools.mjs` | 检索/导出/软删除自检（先 `npm run compile`；不需要 VS Code、不需要 key） |
 | `scripts/update-dsh.mjs` | 运行时依赖治理：把 DSH 检出锁到 tag、查漂移、跑升级仪式 + 冒烟（见 `docs/runtime-dependency.md`） |
 | `docs/runtime-dependency.md` | 治理决策依据：把 DSH 检出当「版本化运行时依赖」、升级仪式、「何时切官方 npm」观察清单 |
 
