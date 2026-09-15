@@ -11,6 +11,9 @@ import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { ChatMessage, UsageBuckets } from './protocol';
 
+/** C7 留存：一天。 */
+export const RETENTION_DAY_MS = 24 * 60 * 60 * 1000;
+
 export interface StoredSession {
   id: string;
   title: string;
@@ -62,6 +65,44 @@ function normalize(session: StoredSession): StoredSession {
     delete session.deletedAt;
   }
   return session;
+}
+
+/**
+ * C7 留存：这条会话算不算「过期」。
+ *
+ * 口径**只有回收站里的**才算 —— 按 `deletedAt` 计时，而不是 `updatedAt`。理由：这是给「清理」
+ * 用的判据，而删转写 + 它的 DSH 日志是**不可撤销**的；只圈用户**已经主动删过**的条目，
+ * 是个手动、无预览的按钮唯一站得住的口径（在列会话哪怕一年没动也不入选）。
+ *
+ * ⚠️ `days <= 0` 一律 false —— **0 是「关闭」**。少了这道闸，`now - at > 0` 会把**回收站全部条目**
+ * 判成过期，用户点一下「清理过期会话」就连转写带 DSH 日志一起清光。这是本文件里最危险的一行。
+ */
+export function isExpired(session: StoredSession, now: number, days: number): boolean {
+  if (!Number.isFinite(days) || days <= 0) {
+    return false;
+  }
+  const at = session.deletedAt;
+  if (typeof at !== 'number' || !Number.isFinite(at) || at <= 0) {
+    return false;
+  }
+  return now - at > days * RETENTION_DAY_MS;
+}
+
+/**
+ * C7：这堆会话里，除了 `excludingId` 之外还有谁引用同一份 DSH 日志（按 `{id, cwd}` 判）？
+ *
+ * **这不是防御性代码，是必需的**：`_forkSession` 里 `fork.dsh = src.dsh` 是**同一个对象引用**，
+ * 分支与源共享一份 DSH 日志 —— 删分支不能把源的记忆一起删了。
+ *
+ * 放在这里（而不是 `chatViewProvider` 里）是为了能自检：那个文件 `import vscode`，probe 加载不了。
+ * 调用方负责把**两个 store 都**拼进来 —— 判定依据是引用关系，不是「在哪个库」。
+ */
+export function dshStillReferenced(
+  sessions: StoredSession[],
+  dsh: { id: string; cwd: string },
+  excludingId: string
+): boolean {
+  return sessions.some((s) => s.id !== excludingId && s.dsh?.id === dsh.id && s.dsh?.cwd === dsh.cwd);
 }
 
 export class SessionStore {
@@ -153,6 +194,14 @@ export class SessionStore {
   }
 
   /**
+   * C7 留存：回收站里「超过 days 天」的会话。**计数与执行共用这一个口径** ——
+   * webview 只负责显示条数，绝不在那边重算判据（两份判据必然漂移，而这条漂移的代价是删错东西）。
+   */
+  expired(days: number, now: number = Date.now()): StoredSession[] {
+    return this._sessions.filter((s) => isExpired(s, now, days));
+  }
+
+  /**
    * C6：软删除 —— **原地打标记，绝不把这个对象 filter 出数组**。
    *
    * 这不是风格问题：`_active` 就指向数组里那个对象，而 `replace()` 是「找不到就 push」，
@@ -200,7 +249,13 @@ export class SessionStore {
     return true;
   }
 
-  /** C6：清空回收站。@returns 清掉的条数（用于核对提示文案）。 */
+  /**
+   * C6：清空回收站。@returns 清掉的条数（用于核对提示文案）。
+   *
+   * ⚠️ **别在删除路径上调它**（调用方请逐个走 `chatViewProvider._purgeOne`）。它一次性把条目摘掉，
+   * 调用方**读不到每条会话的 `dsh` 身份** —— 于是磁盘上那些 DSH 日志会静默漏删，
+   * 而「删除后磁盘无残留」正是 C7 的验收项。今天只有自检脚本在用它。
+   */
   purgeTrashed(): number {
     const doomed = this.trashed();
     if (doomed.length === 0) {

@@ -212,9 +212,17 @@ The **历史** panel lists past sessions for the current mode, and now does more
 - **Delete is now a soft delete** (✕ moves it to the **回收站** tab, which can restore it). Removing
   something for good takes an explicit **彻底删除** or **清空回收站**, each behind a native modal
   confirm — restoring bumps the session back to the top of the list.
+- **Deleting for good is now actually thorough**: those two actions also remove the session's DSH
+  logs from disk (`<globalStorage>/dsh-sessions/…`), which used to be left behind in full. A fork
+  shares its source's log, so a log still referenced by another session is kept — the confirm dialog
+  says which case you are in.
+- **Optional trash retention**: set `hello.chat.retention.days` and the trash tab gains a
+  "purge N expired" button. It counts from the **deletion** time and only ever touches the trash —
+  sessions you never deleted are reported but never removed — and it is **purely manual**.
 
-Search scope and the trash are per-mode, like the lists themselves. Deleting a session never touches
-the DSH session logs on disk (that is [C7](docs/backlog.md)'s job).
+Search scope and the trash are per-mode, like the lists themselves. Note that session storage is
+shared per VS Code profile while each window keeps its own in-memory list: a session deleted in one
+window can be written back by another window's next save, so use a single window.
 
 A second group lives under `hello.chat` (`scope: window`) — guardrails and review:
 
@@ -225,6 +233,7 @@ A second group lives under `hello.chat` (`scope: window`) — guardrails and rev
 | `hello.chat.approval.outsideWorkspace` | `true` | **Outside-workspace write approval.** Turning it off only stops the *asking* — outside changes are still listed in the per-turn review while `enabled` is on. Temp dirs (`%TEMP%` / `/tmp`) are exempt from both. Takes effect immediately. |
 | `hello.chat.approval.timeoutSec` | `540` | Seconds to wait before denying by timeout. |
 | `hello.chat.reviewChanges` | `true` | Diff file changes after each turn and show a review bar (added/modified/deleted, inline diff, keep/revert). Changes **outside** the workspace are listed too, tagged with their directory. |
+| `hello.chat.retention.days` | `0` | Trash retention in days. `0` (default) = off, no button. Otherwise the trash tab gains a "purge N expired" button that permanently deletes items deleted more than N days ago, **DSH logs included** (irreversible). Trash only, and it never runs on its own. |
 
 **Known limitation (not a bug):** the guardrail only inspects `write`/`edit` tool targets — paths
 inside a bash command string are **not** parsed. So an agent writing outside the workspace via
@@ -266,14 +275,16 @@ finished path.
 |---|---|
 | `src/chatViewProvider.ts` | Chat webview host: spawns the DSH runtime, handshake, message/tool streaming, mode & live-config logic |
 | `src/dshRuntime.ts` | DSH JSON-RPC child-process lifecycle (spawn/handshake/heartbeat/events) |
-| `src/sessionStore.ts` | Session titles, soft delete/trash & continuation persisted under global storage |
+| `src/sessionStore.ts` | Session titles, soft delete/trash, retention rules & continuation persisted under global storage |
 | `src/sessionSearch.ts` | Full-text search over stored transcripts (pure, no `vscode`) |
 | `src/sessionExport.ts` | Transcript → Markdown / JSON, and safe default file names (pure, no `vscode`) |
+| `src/dshPaths.ts` | DSH session-log path algorithm (**copied verbatim from the persistence plugin**) + guarded removal (pure, no `vscode`) |
 | `src/extension.ts` | Extension entry: commands + view registration |
 | `media/chat.{html,js,css}` | Side-panel front end (mode pills + harness status dot; DSH theme tokens with VS Code fallbacks) |
 | `media/dsh-live/` | **gitignored** — DSH single-file front-end bundle (see above) |
 | `scripts/capture-dsh-frames.mjs` | Frame-capture tool for the DSH runtime (`DSH_CAP_*`) |
 | `scripts/probe-session-tools.mjs` | Self-check for search/export/soft-delete (`npm run compile` first; no VS Code, no API key) |
+| `scripts/probe-purge.mjs` | Self-check for path parity / guarded removal / retention boundaries (same; **path parity needs Node ≥ 22.15** and points you at `dist-runtime/node/node.exe` otherwise) |
 | `scripts/update-dsh.mjs` | Runtime-dependency governance: lock the DSH checkout to a tag, check drift, run the upgrade ritual + smoke (see `docs/runtime-dependency.md`) |
 | `docs/runtime-dependency.md` | Governance decision for treating the DSH checkout as a versioned runtime dependency, the upgrade ritual, and the “when to switch to official npm” checklist |
 

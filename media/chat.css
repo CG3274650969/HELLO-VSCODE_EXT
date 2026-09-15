@@ -444,9 +444,11 @@ body.vscode-high-contrast .brand-mark {
   border-top: 1px solid var(--dsw-alias-border-l2, var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.4)));
   display: flex;
   justify-content: center;
+  /* C7：两个按钮并排（清空回收站 / 清理过期会话），留一点间距别粘在一起 */
+  gap: 8px;
 }
 
-/* 清空回收站：不可逆 → 红字（同 .history-delete 的危险色口径） */
+/* 清空回收站 / 清理过期：不可逆 → 红字（同 .history-delete 的危险色口径） */
 .history-clear {
   border: none;
   background: none;

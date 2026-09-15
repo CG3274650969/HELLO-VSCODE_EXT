@@ -62,9 +62,11 @@
         <div class="history-empty" id="history-empty">暂无历史会话</div>
         <ul id="history-list" class="history-list"></ul>
       </div>
-      <!-- 清空回收站：只在回收站页出现；回收站空时禁用 -->
+      <!-- 清空回收站 + C7 清理过期：只在回收站页出现；无可清条目时禁用，
+           留存设为 0（关闭）时「清理过期」整个隐藏 -->
       <div id="history-foot" class="history-foot" hidden>
         <button id="purge-trash-btn" class="history-clear" type="button">清空回收站</button>
+        <button id="purge-expired-btn" class="history-clear" type="button" hidden></button>
       </div>
     </div>
   </header>

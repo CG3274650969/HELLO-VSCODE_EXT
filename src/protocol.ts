@@ -170,7 +170,16 @@ export type ExtToWebview =
   | { type: 'usage'; usage: UsageReadout }
   /** C6：`trashed` = 回收站内容，与 `sessions` 一起下发 —— 每次软删/恢复/彻底删都要重刷两个列表，
    *  合成一条消息比再开一条少一半触发点（也少一半渲染竞态）。 */
-  | { type: 'history-update'; sessions: SessionSummary[]; trashed: SessionSummary[]; activeId?: string }
+  | {
+      type: 'history-update';
+      sessions: SessionSummary[];
+      trashed: SessionSummary[];
+      activeId?: string;
+      /** C7 留存：`days` = 当前设置（0 = 关闭），`count` = 回收站里已过期的条数。
+       *  **判据只在扩展侧算**，webview 拿它决定按钮的隐藏/禁用/文案。
+       *  老 webview 收不到这个字段 = 按钮不出现，不炸。 */
+      retention?: { days: number; count: number };
+    }
   /** C6：检索结果。`seq` 原样回传，webview 据此丢弃过期响应（配 `query` 双重校验）。 */
   | { type: 'search-results'; seq: number; query: string; hits: SearchHit[] }
   | { type: 'user-message'; message: ChatMessage }
@@ -231,6 +240,8 @@ export type WebviewToExt =
   /** 彻底删除（不可撤销；扩展侧会先弹原生模态确认） */
   | { type: 'purge-session'; sessionId: string }
   | { type: 'purge-trash' }
+  /** C7 留存：清理回收站里超过 `hello.chat.retention.days` 的条目（不可撤销，扩展侧弹模态） */
+  | { type: 'purge-expired' }
   | { type: 'export-session'; sessionId: string }
   /** C6 全文检索：扩展侧同步作答（`seq` 由 webview 单调递增，原样回传） */
   | { type: 'search-sessions'; query: string; seq: number }

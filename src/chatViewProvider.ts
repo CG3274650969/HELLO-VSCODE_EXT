@@ -19,7 +19,14 @@ import {
 import { ApprovalAsk, ApprovalOutcome, ApprovalServer, matchesAnyPattern } from './approvalServer';
 import { ApprovalHookFiles, probeShell, testApprovalHook, writeApprovalHookFiles } from './dshHooks';
 import { isAbortError, streamMockReply } from './mockAssistant';
-import { SessionStore, StoredSession, titleFromText } from './sessionStore';
+import {
+  dshStillReferenced,
+  RETENTION_DAY_MS,
+  SessionStore,
+  StoredSession,
+  titleFromText,
+} from './sessionStore';
+import { removeDshSessionDir } from './dshPaths';
 import { searchSessions } from './sessionSearch';
 import { sessionToJson, sessionToMarkdown, suggestedFileName } from './sessionExport';
 import {
@@ -551,6 +558,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case 'purge-trash':
         void this._purgeTrash();
+        break;
+      case 'purge-expired':
+        void this._purgeExpired();
         break;
       case 'export-session':
         void this._exportSession(msg.sessionId);
@@ -2118,8 +2128,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const tsconfig = String(conf.get('tsconfig') ?? '').trim();
     if (tsconfig && !this._runtime()?.ok) env.TSX_TSCONFIG_PATH = tsconfig;
 
-    // 会话落盘到 globalStorage（绝不落工作区 ./ 造成污染）
-    const sessionRoot = path.join(this._storageDir, 'dsh-sessions');
+    // 会话落盘到 globalStorage（绝不落工作区 ./ 造成污染）。
+    // C7：根目录走 `_dshRoot()` —— 同一条路径既决定子进程往哪写，也决定彻底删除时去哪删，
+    // 两份字面量复制迟早会漂移，而那意味着「删不到」或更糟。
+    const sessionRoot = this._dshRoot();
     try {
       fs.mkdirSync(sessionRoot, { recursive: true });
     } catch {
@@ -2528,6 +2540,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._sendHistory();
   }
 
+  /**
+   * C7：模态里那句补充说明 —— 说清**这一次点下去到底会删掉什么**。
+   *
+   * 三种情形给的承诺不同，含糊过去就是骗人：没跑过 harness 的会话盘上**压根没有**日志；
+   * 分支共享的会话**不会**被连坐（引用计数拦着）；只有独占的才把日志一起带走。
+   * 在 `await` **之前**算好 —— 弹窗期间列表可能变（沿用 C6 捕获计数的惯例）。
+   */
+  private _purgeDetail(s: StoredSession): string | undefined {
+    if (!s.dsh) {
+      return undefined;
+    }
+    return this._dshStillReferenced(s.dsh, s.id)
+      ? '此会话与它的分支共享同一份 DSH 记忆日志，日志会保留。'
+      : '转写与它在磁盘上的 DSH 记忆日志会一并删除。';
+  }
+
   /** C6：彻底删除单条（不可撤销）→ 先弹原生模态。 */
   private async _purgeSession(id: string): Promise<void> {
     const target = this._store.get(id);
@@ -2536,9 +2564,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     const name = target.title || '（无标题）';
+    const detail = this._purgeDetail(target);
     const picked = await vscode.window.showWarningMessage(
       `彻底删除「${name}」？此操作不可撤销。`,
-      { modal: true },
+      detail ? { modal: true, detail } : { modal: true },
       '彻底删除'
     );
     if (picked !== '彻底删除') {
@@ -2557,7 +2586,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     const picked = await vscode.window.showWarningMessage(
       `清空回收站里的 ${doomed.length} 个会话？此操作不可撤销。`,
-      { modal: true },
+      {
+        modal: true,
+        // C7：逐条承诺做不到（批量），但得说清**默认会连日志一起删** —— 唯一的例外是仍被分支引用的那些。
+        detail: '转写与它们在磁盘上的 DSH 记忆日志会一并删除（仍被分支引用的除外）。',
+      },
       '清空回收站'
     );
     if (picked !== '清空回收站') {
@@ -2570,11 +2603,98 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._sendHistory();
   }
 
-  /** 彻底删一条的真动作：从存储摘掉 + 清掉它在内存里的 DSH 身份缓存（记忆从此不可达）。 */
-  private _purgeOne(id: string): void {
-    if (this._store.purge(id)) {
-      this._dshSessions.delete(id);
+  /**
+   * C7 留存天数。**每次现读、绝不缓存**（与 `_reviewChangesOn()` 同一惯例）——
+   * 用户把设置改成 0 之后不必重载窗口就能失效。
+   *
+   * 非法值 / 负数一律归 0 = 关闭：真正的判据闸门在 `isExpired()` 里，这里只做读取与兜底。
+   */
+  private _retentionDays(): number {
+    const raw = vscode.workspace.getConfiguration('hello.chat').get('retention.days');
+    const n = typeof raw === 'number' ? raw : Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+
+  /**
+   * C7：清理「在回收站里放了超过留存天数」的会话（不可撤销）。
+   *
+   * **只清回收站里的**。同一条判据只在扩展侧算一次，webview 只负责显示条数
+   * （`history-update.retention`）—— 让第二处重算判据早晚会漂移，而这里漂移的代价是**删错东西**。
+   *
+   * 模态**额外报告**在列会话里有多少条也一样久没动：它们本次**不动**，但必须让用户看见，
+   * 否则他会以为这个按钮把整个库都瘦身了。
+   */
+  private async _purgeExpired(): Promise<void> {
+    const days = this._retentionDays();
+    if (days <= 0) {
+      return; // 0 = 关闭。按钮本该是隐藏的，走到这里说明 webview 状态过期了 —— 静默吞掉。
     }
+    const now = Date.now();
+    // ⚠️ 条数与名单取**点击那一刻**的（await 期间列表还在变）
+    const doomed = this._store.expired(days, now);
+    if (doomed.length === 0) {
+      this._sendHistory(); // 让按钮回到「没有可清理的」状态
+      return;
+    }
+    const stale = this._store.active().filter((s) => now - s.updatedAt > days * RETENTION_DAY_MS).length;
+    const picked = await vscode.window.showWarningMessage(
+      `清理 ${doomed.length} 个在回收站里放了超过 ${days} 天的会话？此操作不可撤销。`,
+      {
+        modal: true,
+        detail:
+          '转写与它们在磁盘上的 DSH 记忆日志会一并删除（仍被分支引用的除外）。' +
+          (stale > 0 ? `\n另有 ${stale} 个在列会话也超过 ${days} 天没动，本次不动。` : ''),
+      },
+      // 复用与 C6 同一个字面量：两处各写一个，将来谁改了文案按钮就**静默**失效
+      '彻底删除'
+    );
+    if (picked !== '彻底删除') {
+      return;
+    }
+    for (const s of doomed) {
+      this._purgeOne(s.id);
+    }
+    this._store.persist();
+    this._sendHistory();
+  }
+
+  /**
+   * C7：彻底删一条的真动作 —— 从存储摘掉 + 清掉内存里的 DSH 身份缓存 + **删掉磁盘上的 DSH 日志**。
+   *
+   * ⚠️ 顺序是承重的：`dsh` 必须在 `purge()` **之前**读。purge 把对象摘出数组后 `get(id)` 就返回
+   * undefined 了，`{id, cwd}` 再也拿不到 —— 日志会被**静默**漏删，而这正是 C7 的验收项
+   * 「删除后磁盘无残留」。
+   */
+  private _purgeOne(id: string): void {
+    const dsh = this._store.get(id)?.dsh;
+    if (!this._store.purge(id)) {
+      return;
+    }
+    this._dshSessions.delete(id);
+    if (!dsh || this._dshStillReferenced(dsh, id)) {
+      return;
+    }
+    const r = removeDshSessionDir(this._dshRoot(), dsh.cwd, dsh.id);
+    if (!r.removed && r.reason !== 'missing') {
+      // missing 是正常的（该会话从没在盘上落过日志）；其余情况说明日志**没删掉**，得让人能看见。
+      console.warn('C7：DSH 日志未清理 ——', id, r.reason, r.detail ?? '');
+    }
+  }
+
+  /**
+   * C7：还有**别的**会话引用这份 DSH 日志吗？（判据本体在 `sessionStore.dshStillReferenced`，
+   * 与自检共用一份 —— 这里只负责把**两个 store 都**拼进来。）
+   *
+   * **两个 store 都要扫**：依据是引用关系，不是「这条会话住在哪个库」。
+   * 逐条判定而不是批量开工前算一次：一对共享会话都被清空时，日志恰好被删一次。
+   */
+  private _dshStillReferenced(dsh: { id: string; cwd: string }, excludingId: string): boolean {
+    return dshStillReferenced([...this._stores.chat.all(), ...this._stores.harness.all()], dsh, excludingId);
+  }
+
+  /** C7：DSH 会话日志根目录。`_dshEnv` 与实际删除**共用这一处** —— 两份表达式迟早会漂移。 */
+  private _dshRoot(): string {
+    return path.join(this._storageDir, 'dsh-sessions');
   }
 
   /**
@@ -2674,7 +2794,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       .trashed()
       .sort((a, b) => (b.deletedAt ?? 0) - (a.deletedAt ?? 0))
       .map(summary);
-    this._post({ type: 'history-update', sessions, trashed, activeId: this._active.id });
+    // C7：留存天数与「有几条过期」一并下发 —— webview 只显示，**判据只在这一处算**。
+    // days 为 0（关闭）时 count 恒为 0：按钮据此隐藏/禁用。
+    const days = this._retentionDays();
+    this._post({
+      type: 'history-update',
+      sessions,
+      trashed,
+      activeId: this._active.id,
+      retention: { days, count: days > 0 ? this._store.expired(days).length : 0 },
+    });
   }
 
   // ---------- 工具 ----------

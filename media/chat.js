@@ -22,6 +22,7 @@
   var historySearch = document.getElementById('history-search');
   var historyFoot = document.getElementById('history-foot');
   var purgeTrashBtn = document.getElementById('purge-trash-btn');
+  var purgeExpiredBtn = document.getElementById('purge-expired-btn');
   var historyQuery = ''; // 搜索框当前关键字（C6 起是**全文检索**词，不再是标题过滤词）
 
   // C6 检索与回收站状态
@@ -109,6 +110,9 @@
   // 历史会话：扩展下发的列表摘要 + 当前活动会话 id
   var sessions = [];
   var trashed = []; // C6 回收站（与 sessions 一起由 history-update 下发）
+  // C7 留存：{days, count}。**由扩展算好下发，这里绝不重算判据**（两份判据必然漂移，
+  // 而这条漂移的代价是删错东西）。null = 扩展没给（老版本）→ 「清理过期」按钮不出现。
+  var retention = null;
   var activeId = null;
 
   // ---------- 真 DSH 对话组件的懒加载桥（harness 专属；harness 恒为 DSH 直播） ----------
@@ -933,6 +937,13 @@
     historySearch.hidden = isTrash || sessions.length === 0;
     historyFoot.hidden = !isTrash;
     purgeTrashBtn.disabled = trashed.length === 0;
+    // C7：留存关闭（days<=0）或扩展没给这个字段 → 整个按钮藏起来（够不到模态）。
+    // 文案里的条数直接取扩展下发的 count —— 与扩展真正会删的那批**同一个数**。
+    var days = retention && retention.days > 0 ? retention.days : 0;
+    var expiring = days > 0 ? retention.count || 0 : 0;
+    purgeExpiredBtn.hidden = !isTrash || days <= 0;
+    purgeExpiredBtn.disabled = expiring === 0;
+    purgeExpiredBtn.textContent = '清理 ' + expiring + ' 个过期会话';
 
     var shown;
     if (isTrash) {
@@ -1745,6 +1756,10 @@
     purgeTrashBtn.addEventListener('click', function () {
       post({ type: 'purge-trash' });
     });
+    // C7：清理过期（同样不可逆，扩展侧按同一套判据再算一遍条数并弹模态）
+    purgeExpiredBtn.addEventListener('click', function () {
+      post({ type: 'purge-expired' });
+    });
     // 两个视图标签（点它不触发「点外面收起」：按钮在 #history-panel 内）
     var historyTabs = historyPanel.querySelectorAll('.history-tab');
     for (var ti = 0; ti < historyTabs.length; ti++) {
@@ -1901,6 +1916,7 @@
       case 'history-update':
         sessions = data.sessions;
         trashed = data.trashed || [];
+        retention = data.retention || null; // C7：判据在扩展侧，这里只存下来给 renderHistory 用
         activeId = data.activeId || null;
         // 活动会话若在列表里（如发首条消息后自动命名 / 重命名后回显），用它刷新顶栏标题
         if (activeId && !titleEditing) {

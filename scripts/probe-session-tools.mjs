@@ -577,7 +577,11 @@ try {
     ok(keep.id.length > 0);
   });
 
-  check('dsh-sessions/ 零改动（决策 4：彻底删除不动 DSH 日志，那是 C7 的事）', () => {
+  // C7 起「删会话要连 DSH 日志一起删」已经是现实 —— 但**不在这一层做**：SessionStore 只管
+  // 会话数组，碰磁盘日志是调用方 `chatViewProvider._purgeOne` 的职责（它才拿得到 `dsh`，
+  // 也才扫得动两个 store 的引用计数）。见 scripts/probe-purge.mjs。这条断言留着守的就是
+  // 「别把 fs 删除塞回 SessionStore」。
+  check('dsh-sessions/ 零改动（SessionStore 层不做任何 dsh 目录操作）', () => {
     const entries = readdirSync(dir);
     eq(entries.filter((e) => e.includes('dsh')), [], '存储目录里不该出现 dsh-* 目录：');
   });
