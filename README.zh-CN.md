@@ -180,6 +180,27 @@ Harness 页签顶部状态点依次显示连接：灰 未连接 → 蓝 连接�
 面板开着时改动任一路径 / 模型 / key，live 子进程会自动重启（状态点跟随）。历史存在扩展
 globalStorage；Harness 会话与内嵌聊天分开存放。
 
+### 会话历史
+
+**历史**面板列出当前模式的历史会话，现在不只按标题匹配：
+
+- **全文检索**：范围是消息正文 + 每张工具卡的**命令名与入参**（所以能按「我跑过什么命令」找会话，
+  例如 `rm test.py`）。工具的**输出**与那些灰色状态说明（note）**有意不搜** —— 对找会话来说是噪音。
+  命中会带一段上下文片段，命中词高亮。
+- **导出**单条会话（每行 ⬇，回收站里也能导）：**Markdown**（给人看的转写；工具入参/输出截到 4000 字符）
+  或 **JSON**（无损 —— 含附件正文、用量、DSH 会话身份）。
+- **删除改成了软删除**（✕ 移进**回收站**标签页，可恢复）。真要删干净得点**彻底删除**或**清空回收站**，
+  两者都有原生模态确认 —— 恢复会把该会话顶回列表最前。
+- **删除即彻底**：上面的「彻底删除 / 清空回收站」现在会**连磁盘上的 DSH 会话日志一起删掉**
+  （`<globalStorage>/dsh-sessions/…`）—— 以前那里什么都不删，删掉的对话其实还完整躺在盘上。
+  分支与源**共享**同一份日志，所以还留着引用时日志会保留（确认框里会如实说明是哪一种）。
+- **回收站留存清理**（可选，默认关）：把 `hello.chat.retention.days` 设成天数后，回收站页多出一个
+  「清理 N 个过期会话」按钮。判据是**删除时间**，而且**只清回收站** —— 从没被删过的会话哪怕很久没动
+  也不入选（确认框会告诉你有多少条属于这种情况）。**没有任何自动清理**，不点就一直留着。
+
+检索范围与回收站都是 per-mode 的，跟列表本身一致。**多窗口注意**：会话存储按 profile 共享，
+每个窗口各持一份内存列表，A 窗口删掉的条目可能被 B 窗口的下一次保存推回磁盘 —— 建议单窗口使用。
+
 另一组键在 `hello.chat` 下，`scope: window`（随工作区）：护栏与审阅。
 
 | 键 | 默认 | 作用 |
@@ -189,6 +210,7 @@ globalStorage；Harness 会话与内嵌聊天分开存放。
 | `hello.chat.approval.outsideWorkspace` | `true` | **工作区外写确认**。关掉只是**不再问** —— 只要 `enabled` 还开着，区外改动仍会照旧出现在本轮审阅里。平台临时目录（`%TEMP%` / `/tmp`）两边都豁免。改动即时生效。 |
 | `hello.chat.approval.timeoutSec` | `540` | 等确认的秒数；超时按**拒绝**处理。 |
 | `hello.chat.reviewChanges` | `true` | 每轮结束后对比文件改动并显示审阅条（增/改/删 + 行级 diff + 保留/还原）。工作区**外**的改动也会一并列出（标出所在目录）。 |
+| `hello.chat.retention.days` | `0` | 回收站留存天数。`0`（默认）= 关闭，按钮不出现。设了天数后回收站页多一个「清理 N 个过期会话」，把删除时间早于 N 天的条目**连 DSH 日志一起彻底删除**（不可撤销）。只清回收站，且**不会自动跑**。 |
 
 **已知局限（不是 bug）**：护栏只看 `write`/`edit` 工具的目标路径，**不解析 bash 命令串里的路径**。所以 agent 用 `cp`/`mv`/`>` 写到工作区外时，既不弹确认条、**也不会出现在审阅里**。另外扩展不可达时 fs 侧一律放行（护栏降级，可见性同时停摆）。
 
@@ -224,11 +246,16 @@ Harness 才是完成态。
 |---|---|
 | `src/chatViewProvider.ts` | 聊天 webview 宿主：拉起 DSH 运行时、握手、消息/工具流转发、模式与配置条逻辑 |
 | `src/dshRuntime.ts` | DSH JSON-RPC 子进程生命周期（spawn/握手/心跳/事件分发） |
-| `src/sessionStore.ts` | 会话标题/续聊落盘（globalStorage） |
+| `src/sessionStore.ts` | 会话标题、软删除/回收站、留存判据、续聊落盘（globalStorage） |
+| `src/sessionSearch.ts` | 存下来的转写做全文检索（纯函数，不引 `vscode`） |
+| `src/sessionExport.ts` | 转写 → Markdown / JSON，以及安全的默认文件名（纯函数，不引 `vscode`） |
+| `src/dshPaths.ts` | DSH 会话日志的路径算法（**逐字复刻持久化插件**）+ 受控删除（纯函数，不引 `vscode`） |
 | `src/extension.ts` | 插件入口：命令 + 视图注册 |
 | `media/chat.{html,js,css}` | 侧栏前端（模式胶囊 + harness 状态点；DSH 令牌 + VS Code 双兜底） |
 | `media/dsh-live/` | **gitignore** —— DSH 单文件前端产物（见上） |
 | `scripts/capture-dsh-frames.mjs` | DSH 运行时抓帧工具（`DSH_CAP_*`） |
+| `scripts/probe-session-tools.mjs` | 检索/导出/软删除自检（先 `npm run compile`；不需要 VS Code、不需要 key） |
+| `scripts/probe-purge.mjs` | 路径复刻对账/受控删除/留存边界自检（同上；**路径对账需 Node ≥ 22.15**，太老时会让你改用 `dist-runtime/node/node.exe`） |
 | `scripts/update-dsh.mjs` | 运行时依赖治理：把 DSH 检出锁到 tag、查漂移、跑升级仪式 + 冒烟（见 `docs/runtime-dependency.md`） |
 | `docs/runtime-dependency.md` | 治理决策依据：把 DSH 检出当「版本化运行时依赖」、升级仪式、「何时切官方 npm」观察清单 |
 

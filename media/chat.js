@@ -20,7 +20,17 @@
   var historyList = document.getElementById('history-list');
   var historyEmpty = document.getElementById('history-empty');
   var historySearch = document.getElementById('history-search');
-  var historyQuery = ''; // 搜索框当前关键字
+  var historyFoot = document.getElementById('history-foot');
+  var purgeTrashBtn = document.getElementById('purge-trash-btn');
+  var purgeExpiredBtn = document.getElementById('purge-expired-btn');
+  var historyQuery = ''; // 搜索框当前关键字（C6 起是**全文检索**词，不再是标题过滤词）
+
+  // C6 检索与回收站状态
+  var historyTab = 'active'; // 'active' | 'trash'
+  var searchHits = []; // 最近一次检索的命中（仅 historyTab==='active' 且 historyQuery 非空时用）
+  var searchSeq = 0; // **全局单调**：绝不在开关面板/切标签时归零，否则关闭前在途的 seq=1
+  // 会撞上重开后的 seq=1，过期响应被当新结果收下
+  var searchTimer = null; // 输入去抖句柄
 
   // Harness 连接状态点：仅 harness 模式可见（applyMode 切 hidden）
   var harnessStatusEl = document.getElementById('harness-status');
@@ -99,6 +109,10 @@
 
   // 历史会话：扩展下发的列表摘要 + 当前活动会话 id
   var sessions = [];
+  var trashed = []; // C6 回收站（与 sessions 一起由 history-update 下发）
+  // C7 留存：{days, count}。**由扩展算好下发，这里绝不重算判据**（两份判据必然漂移，
+  // 而这条漂移的代价是删错东西）。null = 扩展没给（老版本）→ 「清理过期」按钮不出现。
+  var retention = null;
   var activeId = null;
 
   // ---------- 真 DSH 对话组件的懒加载桥（harness 专属；harness 恒为 DSH 直播） ----------
@@ -730,6 +744,17 @@
     // mode-set 后必跟 snapshot）；没带就说明该模式无数据（内嵌聊天）→ 保持隐藏。
     usageState = null;
     renderUsageBar();
+    // C6：检索态属于「上一条模式的历史」，必须整片清掉。不清的话 chat 模式搜出的命中会挂在
+    // harness 面板上不动（切模式后紧跟的 snapshot 会 renderHistory()，而它按 historyQuery 分叉）。
+    // searchSeq **不**归零（见变量声明处）。
+    historyQuery = '';
+    searchHits = [];
+    historyTab = 'active';
+    historySearch.value = '';
+    if (searchTimer) {
+      clearTimeout(searchTimer);
+      searchTimer = null;
+    }
     syncReactLive(); // 模式一变先重算真组件显隐，updateBusy 才能据此锁按钮
     updateBusy();
     toggleEmptyHint();
@@ -866,35 +891,94 @@
     usageBar.hidden = false;
   }
 
+  /**
+   * C6：发起检索。`immediate` 用于「列表变了但查询词没变」的场景（软删/恢复/重命名后）——
+   * 那种时候必须**跳过去抖立刻重发**，否则新结果要等 120ms 才回来，中间那段时间面板上
+   * 显示的是一份已经过期的命中。
+   */
+  function requestSearch(immediate) {
+    if (!historyQuery.trim()) {
+      return;
+    }
+    if (searchTimer) {
+      clearTimeout(searchTimer);
+      searchTimer = null;
+    }
+    if (immediate) {
+      runSearch();
+    } else {
+      searchTimer = setTimeout(runSearch, 120);
+    }
+  }
+
+  function runSearch() {
+    searchTimer = null;
+    searchSeq += 1; // 单调递增，过期响应靠它丢弃
+    post({ type: 'search-sessions', query: historyQuery, seq: searchSeq });
+  }
+
+  /** C6：切「会话 / 回收站」视图。两个 tab 的显隐与 aria 一起对齐。 */
+  function setHistoryTab(tab) {
+    historyTab = tab === 'trash' ? 'trash' : 'active';
+    var tabs = historyPanel.querySelectorAll('.history-tab');
+    for (var i = 0; i < tabs.length; i++) {
+      var on = tabs[i].getAttribute('data-tab') === historyTab;
+      tabs[i].classList.toggle('active', on);
+      tabs[i].setAttribute('aria-selected', on ? 'true' : 'false');
+    }
+    renderHistory();
+  }
+
   function renderHistory() {
     historyList.textContent = '';
-    historySearch.hidden = sessions.length === 0; // 没会话时搜索框没意义
+    var isTrash = historyTab === 'trash';
 
-    // 按标题关键字过滤（不区分大小写）
-    var q = historyQuery.trim().toLowerCase();
-    var shown = sessions;
-    if (q) {
-      shown = [];
-      for (var i = 0; i < sessions.length; i++) {
-        if ((sessions[i].title || '').toLowerCase().indexOf(q) !== -1) {
-          shown.push(sessions[i]);
-        }
+    // 回收站页不检索（检索只在在列会话里做），也不显示搜索框
+    historySearch.hidden = isTrash || sessions.length === 0;
+    historyFoot.hidden = !isTrash;
+    purgeTrashBtn.disabled = trashed.length === 0;
+    // C7：留存关闭（days<=0）或扩展没给这个字段 → 整个按钮藏起来（够不到模态）。
+    // 文案里的条数直接取扩展下发的 count —— 与扩展真正会删的那批**同一个数**。
+    var days = retention && retention.days > 0 ? retention.days : 0;
+    var expiring = days > 0 ? retention.count || 0 : 0;
+    purgeExpiredBtn.hidden = !isTrash || days <= 0;
+    purgeExpiredBtn.disabled = expiring === 0;
+    purgeExpiredBtn.textContent = '清理 ' + expiring + ' 个过期会话';
+
+    var shown;
+    if (isTrash) {
+      shown = trashed;
+      if (shown.length === 0) {
+        historyEmpty.textContent = '回收站是空的';
+        historyEmpty.hidden = false;
+      } else {
+        historyEmpty.hidden = true;
+      }
+    } else if (historyQuery.trim()) {
+      // C6：查询非空 → 渲染**扩展回传的命中**（正文匹配，本地拿不到正文，无从过滤）
+      shown = searchHits;
+      if (shown.length === 0) {
+        historyEmpty.textContent = '没有匹配「' + historyQuery.trim() + '」的内容';
+        historyEmpty.hidden = false;
+      } else {
+        historyEmpty.hidden = true;
+      }
+    } else {
+      shown = sessions;
+      if (shown.length === 0) {
+        historyEmpty.textContent = '暂无历史会话';
+        historyEmpty.hidden = false;
+      } else {
+        historyEmpty.hidden = true;
       }
     }
 
-    // 空态分两种提示：真的没有会话 / 有会话但没搜到
-    if (sessions.length === 0) {
-      historyEmpty.textContent = '暂无历史会话';
-      historyEmpty.hidden = false;
-    } else if (shown.length === 0) {
-      historyEmpty.textContent = '没有匹配「' + historyQuery.trim() + '」的会话';
-      historyEmpty.hidden = false;
-    } else {
-      historyEmpty.hidden = true;
-    }
-
     for (var k = 0; k < shown.length; k++) {
-      buildHistoryItem(shown[k]);
+      if (isTrash) {
+        buildTrashItem(shown[k]);
+      } else {
+        buildHistoryItem(shown[k]);
+      }
     }
   }
 
@@ -905,7 +989,7 @@
   function buildHistoryItem(s) {
     var li = document.createElement('li');
     li.className = 'history-item' + (s.id === activeId ? ' active' : '');
-    var sid = s.id; // 本次调用专属，供下面两个监听器稳定引用
+    var sid = s.id; // 本次调用专属，供下面几个监听器稳定引用
 
     var open = document.createElement('button');
     open.className = 'history-open';
@@ -921,21 +1005,106 @@
     time.textContent = fmtTime(s.updatedAt);
     open.appendChild(time);
 
+    // C6：检索命中 → 附一段上下文（三段分开落 textContent，只有 match 挂高亮类；
+    // 全程不碰 innerHTML，正文里有什么标签都只是文字）
+    if (s.snippet) {
+      var sn = document.createElement('span');
+      sn.className = 'history-snippet';
+      sn.appendChild(document.createTextNode(s.snippet.before));
+      var mark = document.createElement('mark');
+      mark.className = 'search-hit';
+      mark.textContent = s.snippet.match;
+      sn.appendChild(mark);
+      sn.appendChild(document.createTextNode(s.snippet.after));
+      open.appendChild(sn);
+      if (s.count > 0) {
+        var count = document.createElement('span');
+        count.className = 'history-count';
+        count.textContent = '命中 ' + s.count + ' 处';
+        open.appendChild(count);
+      }
+    }
+
     open.addEventListener('click', function () {
       post({ type: 'open-session', sessionId: sid });
       closeHistoryPanel();
     });
 
+    var exp = document.createElement('button');
+    exp.className = 'history-export';
+    exp.title = '导出这个会话（Markdown / JSON）';
+    exp.textContent = '⬇'; // ⬇
+    exp.addEventListener('click', function () {
+      post({ type: 'export-session', sessionId: sid });
+    });
+
     var del = document.createElement('button');
     del.className = 'history-delete';
-    del.title = '删除这个会话';
+    del.title = '移到回收站（可恢复）';
     del.textContent = '✕'; // ✕
     del.addEventListener('click', function () {
-      post({ type: 'delete-session', sessionId: sid });
+      post({ type: 'trash-session', sessionId: sid });
     });
 
     li.appendChild(open);
+    li.appendChild(exp);
     li.appendChild(del);
+    historyList.appendChild(li);
+  }
+
+  /** C6 回收站条目：同样的主体 + 「恢复」/「彻底删除」。回收站里也允许导出（软删的照样能救出来）。 */
+  function buildTrashItem(s) {
+    var li = document.createElement('li');
+    li.className = 'history-item';
+    var sid = s.id;
+
+    var open = document.createElement('button');
+    open.className = 'history-open';
+    open.title = '先从回收站恢复才能打开';
+
+    var title = document.createElement('span');
+    title.className = 'history-title';
+    title.textContent = s.title || '（无标题会话）';
+    open.appendChild(title);
+
+    var time = document.createElement('span');
+    time.className = 'history-time';
+    time.textContent = '删除于 ' + fmtTime(s.deletedAt);
+    open.appendChild(time);
+
+    // 点主体 = 恢复（不是打开）：这是回收站里最常做的动作
+    open.addEventListener('click', function () {
+      post({ type: 'restore-session', sessionId: sid });
+    });
+
+    var exp = document.createElement('button');
+    exp.className = 'history-export';
+    exp.title = '导出这个会话（Markdown / JSON）';
+    exp.textContent = '⬇';
+    exp.addEventListener('click', function () {
+      post({ type: 'export-session', sessionId: sid });
+    });
+
+    var restore = document.createElement('button');
+    restore.className = 'history-restore';
+    restore.title = '恢复这个会话';
+    restore.textContent = '↩'; // ↩
+    restore.addEventListener('click', function () {
+      post({ type: 'restore-session', sessionId: sid });
+    });
+
+    var purge = document.createElement('button');
+    purge.className = 'history-delete';
+    purge.title = '彻底删除（不可撤销）';
+    purge.textContent = '✕';
+    purge.addEventListener('click', function () {
+      post({ type: 'purge-session', sessionId: sid });
+    });
+
+    li.appendChild(open);
+    li.appendChild(exp);
+    li.appendChild(restore);
+    li.appendChild(purge);
     historyList.appendChild(li);
   }
 
@@ -948,6 +1117,12 @@
     post({ type: 'list-sessions' }); // 打开时向扩展要最新列表
     historySearch.value = '';
     historyQuery = ''; // 每次打开从完整列表开始
+    searchHits = [];
+    if (searchTimer) {
+      clearTimeout(searchTimer);
+      searchTimer = null;
+    }
+    setHistoryTab('active'); // 每次打开落在「会话」页（searchSeq **不**归零，见顶部声明）
     historyPanel.classList.add('open');
     renderHistory();
     historySearch.focus();
@@ -1561,11 +1736,37 @@
       console.log('[chat.js] 点了「历史」按钮');
       toggleHistory();
     });
-    // 搜索框输入 → 按标题即时过滤（搜索框在面板内，点它不会触发「点外面收起」）
+    // C6 搜索框输入 → 去抖 120ms 后向扩展发起全文检索（搜索框在面板内，点它不会触发「点外面收起」）
     historySearch.addEventListener('input', function () {
       historyQuery = historySearch.value;
-      renderHistory();
+      if (!historyQuery.trim()) {
+        // 清空立刻回完整列表，别让上一次的命中和空白查询的输入打架
+        searchHits = [];
+        if (searchTimer) {
+          clearTimeout(searchTimer);
+          searchTimer = null;
+        }
+        renderHistory();
+        return;
+      }
+      requestSearch(false);
     });
+
+    // 回收站页按钮：清空回收站（不可逆 → 扩展侧会弹原生模态确认）
+    purgeTrashBtn.addEventListener('click', function () {
+      post({ type: 'purge-trash' });
+    });
+    // C7：清理过期（同样不可逆，扩展侧按同一套判据再算一遍条数并弹模态）
+    purgeExpiredBtn.addEventListener('click', function () {
+      post({ type: 'purge-expired' });
+    });
+    // 两个视图标签（点它不触发「点外面收起」：按钮在 #history-panel 内）
+    var historyTabs = historyPanel.querySelectorAll('.history-tab');
+    for (var ti = 0; ti < historyTabs.length; ti++) {
+      historyTabs[ti].addEventListener('click', function () {
+        setHistoryTab(this.getAttribute('data-tab'));
+      });
+    }
     // Esc 收起历史面板
     historySearch.addEventListener('keydown', function (e) {
       if (e.key === 'Escape') {
@@ -1691,6 +1892,10 @@
           refreshTitleDisplay();
         }
         renderSnapshot(data.messages);
+        // C6：切会话/删掉活动会话都会送来 snapshot，而此时查询词还是老样子 —— 结果集却变了
+        // （活动会话的正文/存在与否都不同）。不重发的话 renderHistory() 会把命中集整片冲掉，
+        // 用户看到的是「删一条，搜索结果就没了」。
+        requestSearch(true);
         renderHistory();
         // C3a：读数随快照整帧重放（切会话/切模式/重开窗口）。没带就是真没有 → 藏起来，
         // 免得带着上个会话的数字留在条上。
@@ -1710,6 +1915,8 @@
 
       case 'history-update':
         sessions = data.sessions;
+        trashed = data.trashed || [];
+        retention = data.retention || null; // C7：判据在扩展侧，这里只存下来给 renderHistory 用
         activeId = data.activeId || null;
         // 活动会话若在列表里（如发首条消息后自动命名 / 重命名后回显），用它刷新顶栏标题
         if (activeId && !titleEditing) {
@@ -1721,6 +1928,17 @@
             }
           }
         }
+        // C6：列表一变，正在显示的命中就可能是过期的（软删/恢复/重命名都会走到这里）→ 立刻重发
+        requestSearch(true);
+        renderHistory();
+        break;
+
+      case 'search-results':
+        // C6：丢弃过期响应。双重校验 —— seq 对不上（已有更新的请求发出），或词已改（去抖窗口内）
+        if (data.seq !== searchSeq || data.query !== historyQuery) {
+          break;
+        }
+        searchHits = data.hits || [];
         renderHistory();
         break;
 

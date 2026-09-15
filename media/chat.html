@@ -48,11 +48,25 @@
     </div>
     <!-- 必须挂在 header 内：absolute 的定位基准是最近的 position:relative 祖先 -->
     <div id="history-panel" class="history-panel">
+      <!-- C6：会话 / 回收站两个视图共用一个面板（回收站页不显示搜索框 —— 检索只在在列会话里做） -->
+      <div class="history-tabs" role="tablist" aria-label="历史视图">
+        <button type="button" id="history-tab-active" class="history-tab active"
+                data-tab="active" role="tab" aria-selected="true">会话</button>
+        <button type="button" id="history-tab-trash" class="history-tab"
+                data-tab="trash" role="tab" aria-selected="false">回收站</button>
+      </div>
+      <!-- C6：搜索框改为**全文检索**（正文 + 工具的命令名与入参），不再是本地标题过滤 -->
       <input id="history-search" class="history-search" type="text"
-             placeholder="搜索历史标题…" spellcheck="false">
+             placeholder="搜索全部对话内容…" spellcheck="false">
       <div class="history-scroll">
         <div class="history-empty" id="history-empty">暂无历史会话</div>
         <ul id="history-list" class="history-list"></ul>
+      </div>
+      <!-- 清空回收站 + C7 清理过期：只在回收站页出现；无可清条目时禁用，
+           留存设为 0（关闭）时「清理过期」整个隐藏 -->
+      <div id="history-foot" class="history-foot" hidden>
+        <button id="purge-trash-btn" class="history-clear" type="button">清空回收站</button>
+        <button id="purge-expired-btn" class="history-clear" type="button" hidden></button>
       </div>
     </div>
   </header>
