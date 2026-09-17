@@ -277,6 +277,28 @@ full wire-method inventory this rests on.
 
 ---
 
+## Run inspector: what this turn actually did
+
+In Harness mode a run readout sits above the composer: `本轮 4 工具 · 11.2s`. Click **查看** for the
+full timeline of the turn — every step's duration, every tool call's name and duration, which one
+failed, and this turn's error text.
+
+- **Timing costs nothing to collect.** Every event envelope already carries `time` (epoch ms);
+  durations are a subtraction, so tool timings are exact rather than sampled.
+- **Tools are grouped by step.** DSH runs one model call per step (possibly with one tool), and a
+  step's duration = model latency + tool latency, so the two are not redundant. A step that called no
+  tool is still listed — those are often the slowest ones.
+- **Three states, kept apart.** A finished call is 成功/失败; a call whose result never arrived
+  because you stopped the turn is **未知 (unknown)**, not "failed" — it may well have run, and
+  reporting it as a failure sends you chasing a problem that does not exist.
+- **Memory only, last 20 turns.** Reloading the window clears it (which is also why it does not span
+  sessions). Nothing is persisted, nothing enters the transcript, and **no bodies are kept** — tool
+  inputs/outputs are dropped so this can never become a second path around the `toolInput` fuse.
+  819 streaming-text frames are not recorded either: what you need here is a timeline, not a second
+  copy of the transcript.
+
+---
+
 ## Real DSH components (react-live, optional)
 
 When the harness transcript is rendered with DSH's own React components, the panel pulls in the
@@ -312,6 +334,7 @@ finished path.
 | `src/dshRuntime.ts` | DSH JSON-RPC child-process lifecycle (spawn/handshake/heartbeat/events) |
 | `src/sessionStore.ts` | Session titles, soft delete/trash, retention rules & continuation persisted under global storage; atomic write with a one-generation `.bak` and a load report (`source`/`reason`) that tells "first run" apart from "corrupt" |
 | `src/turnState.ts` | Turn-state verdicts: whether a session needs a “Continue”, and whether the DSH side is known to be running (pure, no `vscode`) |
+| `src/runInspector.ts` | Run inspector: the per-turn frame timeline (tool sequence / turn·step·tool durations / this turn's error). **Memory only, last 20 turns**, every duration is a subtraction of the `time` the envelope already carries (pure, zero imports) |
 | `src/sessionSearch.ts` | Full-text search over stored transcripts (pure, no `vscode`) |
 | `src/sessionExport.ts` | Transcript → Markdown / JSON, and safe default file names (pure, no `vscode`) |
 | `src/dshPaths.ts` | DSH session-log path algorithm (**copied verbatim from the persistence plugin**) + guarded removal (pure, no `vscode`) |
@@ -323,6 +346,7 @@ finished path.
 | `scripts/probe-purge.mjs` | Self-check for path parity / guarded removal / retention boundaries (same; **path parity needs Node ≥ 22.15** and points you at `dist-runtime/node/node.exe` otherwise) |
 | `scripts/probe-turn-state.mjs` | Self-check for the Continue-button verdict + online status tracking (same; no VS Code, no API key) |
 | `scripts/probe-approval-shell.mjs` | Self-check for the C1 approval hook's shell-form verdict: at least one form runs, the two are mutually exclusive, and the second form rescues a wrong first guess (same; no VS Code, no API key) |
+| `scripts/probe-run-inspector.mjs` | Self-check for the C9 run inspector: frame filtering (5000 `assistant/chunk` must change nothing), call/result pairing, the outcome precedence table, ring/dropped caps, and a replay of the newest capture in `logs/dsh-frames/` cross-checked against an independently derived oracle (same; no VS Code, no API key) |
 | `scripts/probe-c8-runtime.mjs` | Runtime spike for C8: queued second prompt, kill-then-resume turn repair, graceful vs hard kill. **Needs an API key** and spends real model turns |
 | `scripts/update-dsh.mjs` | Runtime-dependency governance: lock the DSH checkout to a tag, check drift, run the upgrade ritual + smoke (see `docs/runtime-dependency.md`) |
 | `docs/runtime-dependency.md` | Governance decision for treating the DSH checkout as a versioned runtime dependency, the upgrade ritual, and the “when to switch to official npm” checklist |

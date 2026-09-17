@@ -118,6 +118,15 @@
     <div id="usage-bar" class="usage-bar" hidden>
       <span id="usage-summary" class="usage-summary"></span>
     </div>
+    <!-- C9 运行检查器条：本轮的工具调用次数 / 耗时 / 失败数，点「查看」开浮层看完整时间线。
+         同 usage-bar 挂在 composer 内 → react-live 只藏 #messages，两种画面都可见。
+         与 usage-bar 的差别：harness 下**从没跑过也显示**（「本轮尚无」）—— 调试面板要等第一轮
+         跑完才有入口，就等于没有入口。内嵌聊天则整条隐藏（没有 DSH 帧，永远不会有内容）。
+         文案由 chat.js 用 textContent 落进这一个 span（全仓零 innerHTML）；判据一律在扩展侧算。 -->
+    <div id="runs-bar" class="runs-bar" hidden>
+      <span id="runs-summary" class="runs-summary"></span>
+      <button id="runs-view" class="link-button" type="button">查看</button>
+    </div>
     <!-- C8「继续」条：上一轮以中断/出错收场时出现，点一下把上一条消息重发、接着这个 DSH 会话跑。
          同 review-bar / approval-bar 挂在 composer 内 —— react-live 只藏 #messages，两种画面都可见
          （消息区尾部反而在真组件画面下看不见，所以不放那儿）。显隐由扩展 retry-offer 驱动：
@@ -193,6 +202,22 @@
     <div class="rp-actions">
       <button id="review-panel-keep-all" class="button button-secondary" type="button">全部保留</button>
       <button id="review-panel-revert-all" class="button button-primary" type="button">全部还原</button>
+    </div>
+  </div>
+
+  <!-- C9 运行检查器浮层：body 直系子元素（绝不放进 #messages —— react-live 时被 display:none）。
+       容器与内部结构**复用 .review-panel / .rp-* 的配方**：同一种「铺满视口、.open 展开」的浮层，
+       复制一份 CSS 只会让两处将来各自漂移（z-index 40 也一样）。
+       ⚠️ 与审阅浮层互斥：两个同层满屏浮层没有视觉仲裁，chat.js 在 open 时互相 close。 -->
+  <div id="runs-panel" class="review-panel">
+    <div class="rp-head">
+      <span class="rp-title">运行检查器</span>
+      <span id="runs-panel-sub" class="rp-sub"></span>
+      <button id="runs-panel-close" class="link-button" type="button" title="关闭">✕</button>
+    </div>
+    <div id="runs-list" class="rp-scroll"></div>
+    <div class="rp-actions">
+      <span id="runs-panel-note" class="runs-note"></span>
     </div>
   </div>
 

@@ -3,6 +3,9 @@
  * 所有 id 常量、消息类型都只在这里定义一次，避免字符串拼写不一致导致静默失效。
  */
 import type { DshEventFrame } from './dshRuntime';
+// C9：运行检查器的读数形状。纯类型导入（编译后不留 require），且 runInspector.ts 零依赖 →
+// 既不成环，也不影响任何探针加载（现有探针都不加载 protocol.js）。
+import type { RunReadout, RunRecord } from './runInspector';
 
 /** 活动栏容器 id（package.json 里 viewsContainers.activitybar 的 id） */
 export const CONTAINER_ID = 'hello-chat';
@@ -165,7 +168,16 @@ export type ExtToWebview =
   /** 本帧当前应处于的模式（回复 ready，或在 set-mode 后确认切换完成） */
   | { type: 'mode-set'; mode: Mode }
   /** usage 可选：重开/重载会话时用它把读数条恢复出来（旧会话没存过则为缺省） */
-  | { type: 'snapshot'; messages: ChatMessage[]; sessionId?: string; sessionTitle?: string; usage?: UsageReadout }
+  | {
+      type: 'snapshot';
+      messages: ChatMessage[];
+      sessionId?: string;
+      sessionTitle?: string;
+      usage?: UsageReadout;
+      /** C9：视图重建（重挂 webview / 切会话）时把运行读数恢复出来。
+       *  纯内存、不落盘 → 窗口重载后是缺省，条上显示「本轮尚无」（旧 webview 收不到字段 = 条隐藏，不炸）。 */
+      runs?: RunReadout;
+    }
   /** C3a：用量读数变化（每个 usage 样本一次 + 轮尾定稿一次），webview 整条重绘 */
   | { type: 'usage'; usage: UsageReadout }
   /** C6：`trashed` = 回收站内容，与 `sessions` 一起下发 —— 每次软删/恢复/彻底删都要重刷两个列表，
@@ -218,6 +230,11 @@ export type ExtToWebview =
   /** C8：这条会话该不该显示「继续」按钮（判据只有一条：上一轮以 interrupted/error 收场，
    *  见 turnState.ts）。随 snapshot 之后、以及每轮终态之后下发。 */
   | { type: 'retry-offer'; on: boolean }
+  /** C9 运行检查器：本轮帧时间线（工具序列 / 轮·步·工具耗时 / 本轮错误）。
+   *  `readout` 是每轮摘要（条与面板头部用，约 1 KB）；`details` 是完整记录，**只在面板开着时才有**
+   *  —— 详情是 O(轮数 × 工具数)，每收一帧都发等于把最近 20 轮的工具表反复推给前端。
+   *  条数/耗时/成败一律扩展侧算好，webview 只排版（同 C3a 的分工）。 */
+  | { type: 'runs'; readout: RunReadout; details?: RunRecord[] }
   // --- C1 事前审批：破坏性 bash 命令在执行前弹确认条（DSH hook 阻塞整轮等用户） ---
   /** 有命令待确认：webview 弹确认条（挂在 composer 内，react-live 下也可见）。
    *  `command` 是**扩展预格式化好的展示串**：bash 调用是命令原文，C4 的 write/edit 调用是
@@ -266,4 +283,6 @@ export type WebviewToExt =
   // fork 整份当前会话 → 新会话保留全部转写并切换过去，记忆沿用源 DSH 会话）。
   | { type: 'fork-session' }
   /** C1：用户在确认条上拍了板（allow=true 允许执行；对失效的 id 扩展会静默忽略） */
-  | { type: 'approval-answer'; id: string; allow: boolean };
+  | { type: 'approval-answer'; id: string; allow: boolean }
+  /** C9：运行检查器浮层开/关。开着才把 `details` 随 `runs` 一起下发（体积控制）。 */
+  | { type: 'run-panel'; open: boolean };

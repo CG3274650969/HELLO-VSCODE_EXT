@@ -243,6 +243,24 @@ DSH 侧还在跑的时候想发新消息会被拦下并提示先停止（wire �
 
 ---
 
+## 运行检查器：这一轮到底跑了什么
+
+Harness 模式下输入框上方有一条**运行读数**：`本轮 4 工具 · 11.2s`。点「查看」开浮层，看到这一轮的
+完整时间线 —— 每一步的耗时、每次工具调用的名字与耗时、哪次失败了、以及本轮的错误原文。
+
+- **耗时不需要额外计时。** 每个事件信封本来就带 `time`（epoch ms），相减即得；所以工具耗时是精确的，
+  没有采样误差。
+- **工具按「步」分组。** DSH 一步做一次模型调用（可能带一次工具），步耗时 = 模型延迟 + 工具延迟，
+  两者不冗余。一步没调工具也会单列出来 —— 那往往正是最慢的一步。
+- **三种状态分得清。** 跑完是「成功/失败」；被停止时还没回结果的工具是**「未知」**而**不是**「失败」
+  （它可能跑了，只是我们不知道结果 —— 谎报成失败会让人去排查一个不存在的问题）。
+- **只在内存里，留最近 20 轮。** 重载窗口即清空（这也是它不跨会话的原因），不落盘、不进转写、
+  **不记正文**（工具入参/输出一概不留，避免成为绕过 `toolInput` 保险丝的另一条路）。819 条流式
+  文本帧一条都不记 —— 需要的是时间线，不是第二份转写。
+
+---
+
+
 ## 真 DSH 组件画面（react-live，可选）
 
 当 harness 转写用 DSH 自带 React 组件渲染时，面板会加载 `media/dsh-live/` 的单文件产物
@@ -275,6 +293,7 @@ Harness 才是完成态。
 | `src/dshRuntime.ts` | DSH JSON-RPC 子进程生命周期（spawn/握手/心跳/事件分发） |
 | `src/sessionStore.ts` | 会话标题、软删除/回收站、留存判据、续聊落盘（globalStorage）；原子写 + 留一代 `.bak`，加载结局（`source`/`reason`）能把「首次运行」与「真损坏」分开 |
 | `src/turnState.ts` | 轮次状态判据：这条会话要不要显示「继续」、DSH 侧是否已知在跑（纯函数，不引 `vscode`） |
+| `src/runInspector.ts` | 运行检查器：每轮的帧时间线（工具序列 / 轮·步·工具耗时 / 本轮错误）。**纯内存、只留最近 20 轮**，耗时全靠信封自带的 `time` 相减（纯函数，零 import） |
 | `src/sessionSearch.ts` | 存下来的转写做全文检索（纯函数，不引 `vscode`） |
 | `src/sessionExport.ts` | 转写 → Markdown / JSON，以及安全的默认文件名（纯函数，不引 `vscode`） |
 | `src/dshPaths.ts` | DSH 会话日志的路径算法（**逐字复刻持久化插件**）+ 受控删除（纯函数，不引 `vscode`） |
@@ -286,6 +305,7 @@ Harness 才是完成态。
 | `scripts/probe-purge.mjs` | 路径复刻对账/受控删除/留存边界自检（同上；**路径对账需 Node ≥ 22.15**，太老时会让你改用 `dist-runtime/node/node.exe`） |
 | `scripts/probe-turn-state.mjs` | 「继续」判据 + 在线状态跟踪自检（同上；不需 VS Code、不需 key） |
 | `scripts/probe-approval-shell.mjs` | C1 审批 hook 的 shell 形态判据自检：至少一种形态跑得通、两种互斥、首猜猜错能被另一种救回来（同上；不需 VS Code、不需 key） |
+| `scripts/probe-run-inspector.mjs` | C9 运行检查器自检：帧过滤（灌 5000 条 `assistant/chunk` 记录必须逐字节不变）、调用/结果配对、终态优先级表、环与各项上限，以及把 `logs/dsh-frames/` 最新一份抓帧与一条独立推导的直算式 oracle 对拍（同上；不需 VS Code、不需 key） |
 | `scripts/probe-c8-runtime.mjs` | C8 的运行时前提 spike：第二条 prompt 排队、杀后 resume 补平、优雅 vs 硬杀。**需 API key**、会花掉真实模型轮 |
 | `scripts/update-dsh.mjs` | 运行时依赖治理：把 DSH 检出锁到 tag、查漂移、跑升级仪式 + 冒烟（见 `docs/runtime-dependency.md`） |
 | `docs/runtime-dependency.md` | 治理决策依据：把 DSH 检出当「版本化运行时依赖」、升级仪式、「何时切官方 npm」观察清单 |

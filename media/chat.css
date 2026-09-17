@@ -1460,3 +1460,137 @@ body.react-live #empty-hint {
   color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
   font-size: 12px;
 }
+
+/* ---------- C9 运行检查器（本轮帧时间线：工具序列 / 轮·步·工具耗时） ---------- */
+/* 条：同 retry-bar 的体例（composer 内、两画面可见、右侧带按钮）。 */
+.runs-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px 3px 10px;
+  border: 1px solid var(--dsw-alias-border-l2, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.25)));
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-1, var(--vscode-editor-inactiveSelectionBackground, rgba(128, 128, 128, 0.12)));
+  font-size: 11px;
+}
+.runs-summary {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  /* 耗时逐帧刷新（12.4s → 12.5s），等宽数字让整行不左右抖（同 usage-summary） */
+  font-variant-numeric: tabular-nums;
+}
+/* 浮层底部的说明行（左对齐，与 .rp-actions 的右对齐按钮列区分开） */
+.runs-note {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  font-size: 11px;
+}
+
+/* 单轮：同 .rp-file 的软卡片配方 */
+.ri-run {
+  border: 1px solid var(--dsw-alias-border-l1, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.35)));
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-base, transparent);
+  padding: 6px;
+}
+.ri-run-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+.ri-run-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+/* 状态徽章：与 .rp-op 同一套状态色令牌。令牌缺失时 var() 会一路 fallback，不会破版 */
+.ri-badge {
+  flex: none;
+  padding: 0 6px;
+  border-radius: 8px;
+  font-size: 10px;
+  line-height: 1.7;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  background: var(--dsw-alias-bg-layer-2, rgba(128, 128, 128, 0.15));
+}
+.ri-badge.completed {
+  color: var(--dsw-alias-state-success-primary, #3fb950);
+}
+.ri-badge.aborted,
+.ri-badge.interrupted {
+  color: var(--dsw-alias-state-warning-primary, #d29922);
+}
+.ri-badge.error {
+  color: var(--dsw-alias-state-error-primary, #f85149);
+}
+.ri-badge.running {
+  color: var(--dsw-alias-state-business-primary, #3794ff);
+}
+
+/* 一步：缩进的小标题 */
+.ri-step {
+  margin: 4px 0 1px 2px;
+  font-size: 11px;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  font-variant-numeric: tabular-nums;
+}
+/* 一条工具调用行：序号 + 名字靠左，耗时 + 状态靠右 */
+.ri-tool {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 4px 1px 12px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.ri-tool-index {
+  flex: none;
+  width: 16px;
+  text-align: right;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+}
+.ri-tool-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--dsw-code-font-family, var(--vscode-editor-font-family, Consolas, monospace));
+}
+.ri-tool-time {
+  flex: none;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+}
+.ri-tool-state {
+  flex: none;
+  width: 46px;
+  text-align: right;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+}
+.ri-tool.error .ri-tool-state {
+  color: var(--dsw-alias-state-error-primary, #f85149);
+}
+.ri-tool.ok .ri-tool-state {
+  color: var(--dsw-alias-state-success-primary, #3fb950);
+}
+/* 错误行 / 截断说明行 */
+.ri-err {
+  margin: 3px 0 0 2px;
+  font-size: 11px;
+  color: var(--dsw-alias-state-error-primary, #f85149);
+  word-break: break-word;
+}
+.ri-note {
+  margin: 3px 0 0 2px;
+  font-size: 11px;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+}

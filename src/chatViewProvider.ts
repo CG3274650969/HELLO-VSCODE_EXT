@@ -58,6 +58,10 @@ import {
 } from './dshRuntime';
 // C8：轮次状态判据（纯模块，零 vscode 依赖，scripts/probe-turn-state.mjs 直接加载编译产物自检）
 import { needsContinue, TurnStatus } from './turnState';
+// C9：运行时间线累积器 + 配对/失败判据（纯模块，零 vscode 依赖，
+// scripts/probe-run-inspector.mjs 直接加载编译产物自检）。后两个导出是**唯一的一份实现** ——
+// 本文件里 `_toolKey` 与 `tool/result` 的失败判定都改成调用它们，免得检查器与转写对同一件事各说一套。
+import { RunInspector, toolKeyFrom, toolResultFailed, type RunReadout } from './runInspector';
 
 /** 附件内容上限：超过这个字节数的文件不读；超过这个字符数的内容截断。 */
 const MAX_FILE_BYTES = 10 * 1024; // 单文件最多 10KB
@@ -390,6 +394,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** 本次请求的上下文窗口（占用率分母），来自 request/context；换子进程要重取 */
   private _contextWindow?: number;
 
+  // ---------- C9 运行检查器（本轮帧时间线）状态 ----------
+
+  /**
+   * 运行时间线累积器。**纯内存、最近 20 轮、不落盘**（用户 2026-09-17 的决策）——
+   * 所以它**不需要**跟着 `_resetTurnUsage()` 的五个调用点走：模块里没有「当前会话」这个状态，
+   * 会话身份是 `apply(frame, this._active.id)` 的**入参**，永远取当下的值。
+   */
+  private readonly _runs = new RunInspector();
+  /** 运行浮层是否开着。开着才把 `details` 随 `runs` 一起下发（体积控制） */
+  private _runsPanelOpen = false;
+
   constructor(
     private readonly _extensionUri: vscode.Uri,
     storageDir: string,
@@ -495,6 +510,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._approval?.dispose(); // C1：关掉本机审批服务，挂起的按取消结算
     this._approval = undefined;
     this._dropReview(false); // 清掉本轮审阅内存（视图已销毁，不必再发 clear）
+    this._runs.reset(); // C9：运行时间线是纯内存的，随视图一起还回去
+    this._runsPanelOpen = false;
     this._disposeViewListeners();
     for (const d of this._globalDisposables) d.dispose();
     this._globalDisposables.length = 0;
@@ -563,6 +580,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'approval-answer':
         // C1：确认条上的允许/拒绝；对已失效的 id 静默忽略（超时/已答过）
         this._approval?.answer(msg.id, msg.allow);
+        break;
+      case 'run-panel':
+        // C9：浮层开着才把详情随读数一起发（关掉时不必回发 —— 前端自己就把面板收了）
+        this._runsPanelOpen = msg.open;
+        if (msg.open) this._postRuns();
         break;
       case 'clear':
         this.startNewSession();
@@ -902,6 +924,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // 是"没经过 _finishTurn 的出错轮"——那些 token 是真的，同样计入。
       // 必须在 _afterTurn 之前：由它落盘。
       this._foldTurnUsage();
+      // C9：兜底（正路已在 _finishTurn / _surfaceLiveError 里收过，幂等）。剩下唯一会走到
+      // 这里的是「没经过那两处的轮」。**必须在 _afterTurn 之前还是之后都行** —— 它不落盘、
+      // 不读 `_active.messages`，只是把时间线封口。
+      if (this._runs.endRun(this._turnNormalDone ? 'done' : 'interrupted', this._active.id)) {
+        this._postRuns();
+      }
       this._afterTurn();
       // 2.1：正常走完（done）→ 退栈后异步对比工作区、算 diff 推审阅条；
       // interrupted / error / abort → 清掉本轮的 baseline（不做审阅）
@@ -938,6 +966,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // finally 跑到时 _active 已经换人了，半轮的 token 会记到新会话头上。
     // 此处是同步的、_active 还是本轮那个。_foldTurnUsage 自带幂等，finally 里那次只作兜底。
     this._foldTurnUsage();
+    // C9：本轮时间线收尾。与折账同一个理由放在这里 —— 同步、`_active` 还是本轮那个
+    // （「运行中切会话」那条路上 `_cancelActiveRun` 会先同步走到这儿）。
+    if (this._runs.endRun(outcome === 'done' ? 'done' : 'interrupted', this._active.id)) this._postRuns();
     this._finalizeOpenAssistant(outcome);
     if (outcome === 'interrupted') {
       // 停止时还挂着的 running 工具卡 → error，不留转圈残留
@@ -1041,6 +1072,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._dsh = undefined;
     this._turnStatus.reset(); // 进程没了 → 线上状态不可信（同 onAbort）
     this._active.lastTurn = 'error';
+    // C9：本轮时间线的错误**只在这里写**（`turn/end` 那条 case 刻意不写 —— 非白名单 kind
+    // 会走到这儿来，两边都写就是每条错误在面板里显示两遍）。没有开着的轮时（spawn 失败、
+    // prompt RPC 失败：一帧都没来过）它会补一条记录，那种失败恰恰最需要被看见。
+    if (this._runs.endRun('error', this._active.id, message)) this._postRuns();
     this._sendTurnState();
     this._postBackendStatus();
     const resolve = this._endTurnResolve;
@@ -1553,6 +1588,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _onDshEvent(frame: DshEventFrame): void {
     if (!this._liveRunning) return;
     if (this._currentDshId !== undefined && frame.sessionId !== this._currentDshId) return;
+    // C9：本轮时间线。**插在两个闸之后、switch 之前** —— 一处咽喉，下面六个 case 一个不用改，
+    // 将来新加 case 也不会「忘了记一笔」。chunk 帧由模块按 type 早退，不入账，也不产生下发。
+    // ⚠️ 别为了多抓几帧把它挪到 `_liveRunning` 闸之前：闸内丢的帧本来就不属于这一轮
+    // （C8 ② 正是靠它让被杀进程的迟到帧不能复活界面），放宽它是 reopening 一个已修的 bug。
+    if (this._runs.apply(frame, this._active.id)) this._postRuns();
     if (this._reactLive) {
       // 真组件画面：把原始帧转给 webview 增量装配（ChatView）。DOM 气泡仍照发
       // （chat.js 在 react 画面下忽略），SessionStore 转写因此保持完整。
@@ -1629,11 +1669,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             .find((m) => m.role === 'tool' && m.toolState === 'running');
         }
         if (!target) return;
-        let failed = d.error !== undefined && d.error !== null;
+        // C9：判据抽到 runInspector.ts，与检查器**共用同一份实现**（那边不再自己判一遍，
+        // 免得转写里是红卡、检查器里是绿行）。
+        const failed = toolResultFailed(d);
         const outParts: string[] = [];
         for (const b of d.message?.content ?? []) {
           if (!b || b.type !== 'tool-result') continue;
-          if (b.isError) failed = true;
           for (const c of b.content ?? []) {
             if (c && c.type === 'text' && typeof c.text === 'string') outParts.push(c.text);
           }
@@ -1763,20 +1804,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._turnUsage = undefined;
   }
 
+  // ---------- C9 运行检查器 ----------
+
+  /**
+   * 组装运行读数。**内嵌聊天返回 undefined**（同 `_usageReadout` 的守卫）——
+   * mock 模式根本没有 DSH 帧，条上永远不会有东西，与其显示一排 0 不如整条藏起来。
+   *
+   * 与 `_usageReadout` 的关键差别：harness 下**从没跑过也返回读数**（`{runs: []}`），
+   * 因为「还没跑过」本身就是调试时要看的一条信息，而条也是这个功能的入口 ——
+   * 一个要等第一轮跑完才出现的入口，等于没有入口。
+   */
+  private _runsReadout(): RunReadout | undefined {
+    if (this._mode !== 'harness') return undefined;
+    return this._runs.readout(this._active.id);
+  }
+
+  /**
+   * 下发运行读数。`details` **只在浮层开着时才带** —— 它是 O(轮数 × 工具数) 的，
+   * 每收一帧都发等于把最近 20 轮的工具表反复推给前端；摘要（约 1 KB）才是每帧要发的东西。
+   */
+  private _postRuns(): void {
+    const readout = this._runsReadout();
+    if (!readout) return;
+    this._post(
+      this._runsPanelOpen
+        ? { type: 'runs', readout, details: this._runs.details(this._active.id) }
+        : { type: 'runs', readout }
+    );
+  }
+
   /**
    * tool/call 与 tool/result 对齐用的键：优先 callId。
-   * call 的 callId 在 data.callId；result 的嵌在 data.message.content[0].toolCallId，
-   * 两边都取不到才退而用 turn:step。
+   *
+   * C9 起只是 `toolKeyFrom` 的一行委托 —— 配对键在检查器里也要用，两份实现漂移的代价是
+   * 「检查器把结果算到 A 行、转写把它画到 B 卡」。实现与注释都在 src/runInspector.ts。
    */
   private _toolKey(d: DshEventData): string {
-    let callId = d.callId;
-    if (typeof callId !== 'string' || !callId) {
-      const block = d.message?.content?.find((b) => b && b.toolCallId);
-      if (block && typeof block.toolCallId === 'string') callId = block.toolCallId;
-    }
-    return typeof callId === 'string' && callId
-      ? `c:${callId}`
-      : `ts:${String(d.turn ?? '')}:${String(d.step ?? '')}`;
+    return toolKeyFrom(d);
   }
 
   /** 子进程意外退出（非用户 kill）。live 中 → 上浮错误收尾；空闲 → 状态标 error。 */
@@ -3328,6 +3392,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // C3a：读数随整帧一起下发 —— 它本身就是会话级状态，跟 snapshot 同生共死，
       // 既能把重开会话的累计恢复出来，也保证"切到没有用量的会话"时细条被清掉。
       usage: this._usageReadout(),
+      // C9：同理。运行记录是**纯内存**的，所以重载窗口后这里是空的 ——
+      // 切会话则能立刻恢复该会话这一轮的记录（它还在环里），这是要点。
+      runs: this._runsReadout(),
     });
     // C8：按钮状态跟会话走（切会话/重开会话/窗口重载后由这一条纠偏）。
     // 判据是**已落盘**的 lastTurn，所以重载窗口甚至重启 VS Code 之后按钮照常在。
