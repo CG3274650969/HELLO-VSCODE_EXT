@@ -19,7 +19,9 @@ import {
 import { ApprovalAsk, ApprovalOutcome, ApprovalServer, matchesAnyPattern } from './approvalServer';
 import {
   ApprovalHookFiles,
+  nextShellCheck,
   probeShell,
+  ShellCheckAttempt,
   ShellKind,
   testApprovalHook,
   writeApprovalHookFiles,
@@ -383,6 +385,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private readonly _approvalCmds = new Map<string, string>();
   /** 审批相关告警是否已弹过（每次 activation 最多烦用户一次） */
   private _approvalWarned = false;
+  /**
+   * 「不可判的失败」那次重试是否已用掉（每次 activation 一次）。冷启动只发生一次，
+   * 重试也只该给一次 —— 否则每发一条消息都要先干等两轮自检超时。
+   */
+  private _approvalRetried = false;
   /** C8c：存储相关告警是否已弹过。**独立旗标** —— 与审批共用一个的话，先到的那个会把后到的整条吞掉 */
   private _storageWarned = false;
   /** 与视图无关的订阅（全局配置变更监听），dispose 时统一清 */
@@ -2112,16 +2119,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     // hook 由 DSH 用 `bash -c` 跑，而 bash 既可能是 WSL 也可能是 Git Bash —— 命令里的路径形态
     // 完全不同（WSL 下 `D:\…\node.exe` 连可执行文件都算不上，直接 command not found）。
-    // probeShell 只是**首猜**：它只采一次样、超时就回落 posix，而 VS Code 重载那一刻恰恰是
-    // WSL 最冷的时候 —— 猜错的代价是审批静默失效。所以真正的判据是**自检本身**：首猜不过就
-    // 换另一种形态再跑一遍自检，哪个跑得通用哪个。两种形态互斥（A 形态的命令在 B 里必然
-    // command not found），所以「谁过」是无歧义的。
+    // probeShell 只是**首猜**（超时会按平台先验落到 wsl，见 shellGuessOnTimeout），真正的判据是
+    // **自检本身**：哪种形态的命令在同一把 shell 里跑得起来，就是它。两种形态互斥（A 形态的
+    // 命令在 B 里必然 command not found），所以「谁过」是无歧义的。
+    //
+    // 排程交给 nextShellCheck（纯函数，探针钉着）：它额外负责**冷启动那次不算数** —— 重载那一刻
+    // WSL 可能还在开机，超时/空手退出这两种「不可判」的失败不判形态死刑，排到队尾再验一次。
+    // 线上症状就是这么来的：posix 形态自检超时(15s) + wsl 形态 `bash 退出码 1`（两边空），
+    // 两条都不说明形态写错了，却把审批整个关掉了。
     const runCwd = this._dshRunCwd();
     const guess = await probeShell(runCwd);
     const order: ShellKind[] = guess === 'wsl' ? ['wsl', 'posix'] : ['posix', 'wsl'];
 
-    let failure = '';
-    for (const shellKind of order) {
+    const attempts: ShellCheckAttempt[] = [];
+    // 重试每次 activation 只给一次：冷启动只发生一次，下一次 spawn 时 WSL 已经热了（那时首轮就过）。
+    // 不这么闸住的话，真接不上的场景会变成「每发一条消息先干等两轮超时」。
+    let retriesUsed = this._approvalRetried ? 1 : 0;
+    const failure: string[] = [];
+    for (;;) {
+      const shellKind = nextShellCheck(order, attempts, retriesUsed);
+      if (!shellKind) break;
+      const isRetry = attempts.some((a) => a.kind === shellKind);
+      if (isRetry) {
+        retriesUsed += 1;
+        this._approvalRetried = true;
+      }
       let files: ApprovalHookFiles;
       try {
         files = this._writeApprovalFiles(shellKind, nodePath, server);
@@ -2133,24 +2155,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
       // 自检：这条 hook 命令在**同一个 shell**（DSH 也是 bash -c）里跑得起来吗？
       const test = await testApprovalHook(files.hookCommand, runCwd);
+      attempts.push({ kind: shellKind, retriable: test.retriable });
       if (test.ok) {
         this._approval = server;
         this._approvalFiles = files;
         console.log(
-          `[approval] 事前审批已就绪（shell=${shellKind}${shellKind === guess ? '' : `，首猜 ${guess} 猜错了`}，hook 自检通过）`
+          `[approval] 事前审批已就绪（shell=${shellKind}${shellKind === guess ? '' : `，首猜 ${guess} 猜错了`}` +
+            `${isRetry ? '，第一次是「不可判」的失败，重试才过 —— 那多半是 WSL 冷启动' : ''}，hook 自检通过）`
         );
         return;
       }
-      failure += `${failure ? '；' : ''}${shellKind} 形态：${test.detail}`;
+      failure.push(`${shellKind} 形态${isRetry ? '（重试）' : ''}：${test.detail}`);
     }
 
-    // 两种形态都跑不起来 = 审批**确实**接不进去。这里要「干净地不启用」而不是留着半套：
+    // 两种形态、连重试都跑不起来 = 这一轮审批**确实**接不进去。这里要「干净地不启用」而不是留着半套：
     // 丢掉派生配置（下次 spawn 回到用户原配置，不往他们的 DSH 里塞一条跑不起来的 hook），
     // 同时清掉 _approval —— 于是 _ensureApproval 下次 spawn 会重试一次（重载时 WSL 冷启动
     // 失败是暂时的，热了之后自愈），弹窗有 _approvalWarned 兜着，不会刷屏。
     server.dispose();
     this._approvalFiles = undefined;
-    this._approvalWarn(`审批 hook 自检未通过，审批不会生效：${failure.slice(0, 400)}`);
+    // 话术要点：说清「什么时候会再试」，否则用户会以为这个功能坏了、去翻设置（线上那条告警就
+    // 只说了「审批不会生效」，没说下一条消息会自动重来）。
+    this._approvalWarn(
+      `审批 hook 自检没通过（下一条消息会自动再试一次）：${failure.join('；').slice(0, 400)}`
+    );
   }
 
   /** 按指定 shell 形态生成三件套（hook 脚本 / hooks.json / 派生 cordis.yml）。 */
