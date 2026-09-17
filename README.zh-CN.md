@@ -233,6 +233,10 @@ globalStorage；Harness 会话与内嵌聊天分开存放。
   界面会继续等下去，不再直接判 error。
 - **停止更温和。** `kill()` 改成先关 stdin、2 秒后才强杀，给运行时留出它自己的干净退出路径
   （`disposeAndExit(0)` → flush → fsync）—— 写盘是 200 ms 攒批的，同一 tick 里做完这两件事等于把那批扔掉。
+- **转写是原子写 + 留一代备份。** C7 的「彻底删除」会连会话的 DSH 日志一起删，于是 globalStorage
+  下那份可能成了**唯一副本**。现在先写 tmp、fsync，再 rename 盖过去（不再可能出现半截文件）；覆盖
+  **之前**把上一代滚成 `<file>.bak`；读不出来时回退到那份备份，而不是静默从零开始。真损坏会弹**一条**
+  告警；首次运行（文件还没建）保持安静。
 
 DSH 侧还在跑的时候想发新消息会被拦下并提示先停止（wire 没有 cancel，那一轮抢占不了）。
 这些判断依据的 wire 方法全量清单见 `docs/wire-vocabulary.md`。
@@ -269,7 +273,7 @@ Harness 才是完成态。
 |---|---|
 | `src/chatViewProvider.ts` | 聊天 webview 宿主：拉起 DSH 运行时、握手、消息/工具流转发、模式与配置条逻辑 |
 | `src/dshRuntime.ts` | DSH JSON-RPC 子进程生命周期（spawn/握手/心跳/事件分发） |
-| `src/sessionStore.ts` | 会话标题、软删除/回收站、留存判据、续聊落盘（globalStorage） |
+| `src/sessionStore.ts` | 会话标题、软删除/回收站、留存判据、续聊落盘（globalStorage）；原子写 + 留一代 `.bak`，加载结局（`source`/`reason`）能把「首次运行」与「真损坏」分开 |
 | `src/turnState.ts` | 轮次状态判据：这条会话要不要显示「继续」、DSH 侧是否已知在跑（纯函数，不引 `vscode`） |
 | `src/sessionSearch.ts` | 存下来的转写做全文检索（纯函数，不引 `vscode`） |
 | `src/sessionExport.ts` | 转写 → Markdown / JSON，以及安全的默认文件名（纯函数，不引 `vscode`） |
@@ -278,7 +282,7 @@ Harness 才是完成态。
 | `media/chat.{html,js,css}` | 侧栏前端（模式胶囊 + harness 状态点；DSH 令牌 + VS Code 双兜底） |
 | `media/dsh-live/` | **gitignore** —— DSH 单文件前端产物（见上） |
 | `scripts/capture-dsh-frames.mjs` | DSH 运行时抓帧工具（`DSH_CAP_*`） |
-| `scripts/probe-session-tools.mjs` | 检索/导出/软删除自检（先 `npm run compile`；不需要 VS Code、不需要 key） |
+| `scripts/probe-session-tools.mjs` | 检索/导出/软删除自检，外加落盘加固（原子写、`.bak` 滚动、备份回退、`toolInput` 熔断）（先 `npm run compile`；不需要 VS Code、不需要 key） |
 | `scripts/probe-purge.mjs` | 路径复刻对账/受控删除/留存边界自检（同上；**路径对账需 Node ≥ 22.15**，太老时会让你改用 `dist-runtime/node/node.exe`） |
 | `scripts/probe-turn-state.mjs` | 「继续」判据 + 在线状态跟踪自检（同上；不需 VS Code、不需 key） |
 | `scripts/probe-approval-shell.mjs` | C1 审批 hook 的 shell 形态判据自检：至少一种形态跑得通、两种互斥、首猜猜错能被另一种救回来（同上；不需 VS Code、不需 key） |

@@ -26,7 +26,9 @@ import {
 } from './dshHooks';
 import { isAbortError, streamMockReply } from './mockAssistant';
 import {
+  capToolInput,
   dshStillReferenced,
+  LoadReport,
   RETENTION_DAY_MS,
   SessionStore,
   StoredSession,
@@ -376,6 +378,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private readonly _approvalCmds = new Map<string, string>();
   /** 审批相关告警是否已弹过（每次 activation 最多烦用户一次） */
   private _approvalWarned = false;
+  /** C8c：存储相关告警是否已弹过。**独立旗标** —— 与审批共用一个的话，先到的那个会把后到的整条吞掉 */
+  private _storageWarned = false;
   /** 与视图无关的订阅（全局配置变更监听），dispose 时统一清 */
   private readonly _globalDisposables: vscode.Disposable[] = [];
 
@@ -525,6 +529,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         // 尝试解析一次 API key（有则缓存），让配置条的 API 灯如实点亮
         void this._refreshApiKeyStatus();
+        // C8c：转写加载异常要让人看见。挂这儿而不是构造函数 —— 那时面板还没开，弹窗没人看。
+        this._checkStorageHealth();
         break;
       case 'set-model': {
         const model = String(msg.model ?? '').trim();
@@ -1599,7 +1605,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           text: '',
           status: 'done',
           toolName: typeof d.name === 'string' && d.name ? d.name : 'tool',
-          toolInput: prettyValue(d.arguments),
+          // C8c 保险丝：**截在消息产生处**，内存 / webview / 盘上 / 导出 / 检索读到的才是同一串字符
+          // （放存储层会让内存留全文 ⇒「同一个工具卡，重载窗口前后不一样」这种难复现的 bug）。
+          toolInput: capToolInput(prettyValue(d.arguments)),
           toolState: 'running',
         };
         this._active.messages.push(msg);
@@ -2146,6 +2154,49 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (this._approvalWarned) return;
     this._approvalWarned = true;
     void vscode.window.showWarningMessage(`事前审批未生效：${text}`);
+  }
+
+  /**
+   * C8c：存储告警，体例同上（控制台始终留痕、每次 activation 只弹一条）。
+   *
+   * 不并入 `_approvalWarn` 的两个理由：旗标要独立（否则先到的吞掉后到的）；前缀要是 `[storage]`
+   * —— 用户贴日志来排查时，前缀就是「去哪看」。
+   */
+  private _storageWarn(text: string, detail: string = ''): void {
+    console.warn('[storage]', text, detail); // detail 只进控制台：那是给排查用的，不该糊到弹窗上
+    if (this._storageWarned) return;
+    this._storageWarned = true;
+    void vscode.window.showWarningMessage(`历史会话：${text}`);
+  }
+
+  /**
+   * C8c：把两个 store 的加载结局翻成用户能懂的一句话。挂在 `case 'ready'`。
+   *
+   * 静默的两条：`source === 'file'`（一切正常），以及 **`empty` + `missing`**（首次运行，文件还没建）。
+   * 后者报出来就是误报，而误报会让真正的损坏告警被用户当噪音忽略掉。
+   *
+   * ⚠️ 注意**不是**「`reason === 'missing'` 一律跳过」：主文件不见了、却从备份捞回来的话，
+   * `reason` 也是 `missing`，但那是一次货真价实的恢复，必须说（从前真有可能是被人手删了、
+   * 被安全软件隔离了）。判据挂在 `source` 上才切得干净。
+   */
+  private _checkStorageHealth(): void {
+    for (const [mode, store] of Object.entries(this._stores) as [Mode, SessionStore][]) {
+      const r: LoadReport = store.loadReport;
+      if (r.source === 'file' || (r.source === 'empty' && r.reason === 'missing')) {
+        continue;
+      }
+      if (r.source === 'backup') {
+        this._storageWarn(
+          `上次的转写文件没能用上，已从备份恢复（${mode}）。明细见「输出 → 扩展宿主」里的 [storage]。`,
+          r.detail
+        );
+      } else {
+        this._storageWarn(
+          `转写文件损坏且没有可用备份，历史列表暂时是空的（${mode}）。明细见「输出 → 扩展宿主」里的 [storage]。`,
+          r.detail
+        );
+      }
+    }
   }
 
   // ----- 配置 / 子进程构建（全部来自 hello.dsh.*，可被用户覆盖） -----

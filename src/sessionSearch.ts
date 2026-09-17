@@ -18,10 +18,13 @@ const SNIPPET_AFTER = 60;
 /**
  * `toolInput` 参与检索的长度上限。
  *
- * **必须截断**：`toolInput` 由 `prettyValue()` 生成、**没有任何长度上限**（对比 `toolOutput`
- * 有 4000 的上限），而 write/edit 的入参里带着整份文件正文 —— 不截就是「搜文件内容」，
- * 噪音比搜 `toolOutput` 还大，且每次检索都要重扫几 MB。
+ * **必须截断**：`toolInput` 由 `prettyValue()` 生成，write/edit 的入参里可能带着整份文件正文
+ * —— 不截就是「搜文件内容」，噪音比搜 `toolOutput` 还大，且每次检索都要重扫一大段。
  * 前 400 字符足以覆盖 bash 命令原文与 fs 工具的路径参数，正是用户要搜的那部分。
+ *
+ * C8c 之后入参另有 2 万字符的**保险丝**（`sessionStore.capToolInput`，截在消息产生处）。两者
+ * 不重叠、也不是一回事：那条兜的是「别让一条调用把盘撑爆」的病态输入，本常量兜的是「检索别被
+ * 正文噪音淹掉」—— 真实数据里入参中位数才几百字符，2 万那条几乎永不触发，所以这里**照旧截 400**。
  */
 export const SEARCH_TOOL_INPUT_CHARS = 400;
 
