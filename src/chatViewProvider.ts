@@ -58,10 +58,11 @@ import {
 } from './dshRuntime';
 // C8：轮次状态判据（纯模块，零 vscode 依赖，scripts/probe-turn-state.mjs 直接加载编译产物自检）
 import { needsContinue, TurnStatus } from './turnState';
-// C9：运行时间线累积器 + 配对/失败判据（纯模块，零 vscode 依赖，
+// C9：运行时间线累积器 + 配对/成败判据（纯模块，零 vscode 依赖，
 // scripts/probe-run-inspector.mjs 直接加载编译产物自检）。后两个导出是**唯一的一份实现** ——
-// 本文件里 `_toolKey` 与 `tool/result` 的失败判定都改成调用它们，免得检查器与转写对同一件事各说一套。
-import { RunInspector, toolKeyFrom, toolResultFailed, type RunReadout } from './runInspector';
+// 本文件里 `_toolKey` 与 `tool/result` 的三态判定（ok / error / **unknown**）都改成调用它们，
+// 免得检查器与转写对同一件事各说一套。
+import { RunInspector, toolKeyFrom, toolResultVerdict, type RunReadout } from './runInspector';
 
 /** 附件内容上限：超过这个字节数的文件不读；超过这个字符数的内容截断。 */
 const MAX_FILE_BYTES = 10 * 1024; // 单文件最多 10KB
@@ -971,11 +972,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (this._runs.endRun(outcome === 'done' ? 'done' : 'interrupted', this._active.id)) this._postRuns();
     this._finalizeOpenAssistant(outcome);
     if (outcome === 'interrupted') {
-      // 停止时还挂着的 running 工具卡 → error，不留转圈残留
+      // 停止时还挂着的 running 工具卡 → **unknown**，不留转圈残留。
+      // ⚠️ 2026-09-17 由 'error' 改过来：运行时对同一件事的措辞是「Its outcome is unknown」，
+      // 而 C8 插的那行 note 本来也写着「结果未知」—— 卡上画红叉、note 说未知，是自相矛盾。
+      // 未知 ≠ 失败：判成失败会让人去重试一个可能有副作用的命令。
       for (const m of this._active.messages) {
         if (m.role === 'tool' && m.toolState === 'running') {
-          m.toolState = 'error';
-          this._post({ type: 'tool-result', id: m.id, toolState: 'error' });
+          m.toolState = 'unknown';
+          this._post({ type: 'tool-result', id: m.id, toolState: 'unknown' });
         }
       }
     }
@@ -1052,8 +1056,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     for (const m of this._active.messages) {
       if (m.role === 'tool' && m.toolState === 'running') {
-        m.toolState = 'error';
-        this._post({ type: 'tool-result', id: m.id, toolState: 'error' });
+        // 进程被杀 → 那次调用到底跑没跑完**无法区分**（同 _finishTurn 那条，见那里的注释）
+        m.toolState = 'unknown';
+        this._post({ type: 'tool-result', id: m.id, toolState: 'unknown' });
       }
     }
     this._backendState = 'error';
@@ -1669,9 +1674,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             .find((m) => m.role === 'tool' && m.toolState === 'running');
         }
         if (!target) return;
-        // C9：判据抽到 runInspector.ts，与检查器**共用同一份实现**（那边不再自己判一遍，
-        // 免得转写里是红卡、检查器里是绿行）。
-        const failed = toolResultFailed(d);
+        // C9：判据抽到 runInspector.ts，与检查器**共用同一份实现**（免得转写里是红卡、
+        // 检查器里是绿行）。**三态**：补平帧正文说「结果未知」而帧上带 isError，
+        // 判成 error 就是谎报（见 toolResultVerdict 的注释）。
+        const verdict = toolResultVerdict(d);
         const outParts: string[] = [];
         for (const b of d.message?.content ?? []) {
           if (!b || b.type !== 'tool-result') continue;
@@ -1683,7 +1689,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (output.length > MAX_TOOL_OUTPUT_CHARS) {
           output = output.slice(0, MAX_TOOL_OUTPUT_CHARS) + '\n…（输出过长，已截断）';
         }
-        target.toolState = failed ? 'error' : 'ok';
+        target.toolState = verdict;
         target.toolOutput = output;
         this._post({ type: 'tool-result', id: target.id, toolState: target.toolState, output });
         return;
@@ -2674,10 +2680,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (msg && msg.status === 'streaming') {
       msg.status = 'interrupted';
     }
-    // 工具卡的"running"残留一并清掉，避免 snapshot 回放时转圈
+    // 工具卡的"running"残留一并清掉，避免 snapshot 回放时转圈（未知，不是失败 —— 同 _finishTurn）
     for (const m of this._active.messages) {
       if (m.role === 'tool' && m.toolState === 'running') {
-        m.toolState = 'error';
+        m.toolState = 'unknown';
       }
     }
     this._abort = undefined;
@@ -2706,7 +2712,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         m.status = 'interrupted';
       }
       if (m.role === 'tool' && m.toolState === 'running') {
-        m.toolState = 'error';
+        // 落盘的 running = 那条 result 从没到过（进程被杀 / 窗口关掉），跑没跑完**不可知**。
+        // 判成失败是谎报：会让人去重试一个可能已经生效的命令（同 _finishTurn 那条注释）
+        m.toolState = 'unknown';
       }
     }
     target.updatedAt = Date.now();

@@ -281,16 +281,24 @@ full wire-method inventory this rests on.
 
 In Harness mode a run readout sits above the composer: `本轮 4 工具 · 11.2s`. Click **查看** for the
 full timeline of the turn — every step's duration, every tool call's name and duration, which one
-failed, and this turn's error text.
+failed, and this turn's error text. Once earlier turns are still on record the bar says
+**最新一轮** ("latest turn") and each overlay row says **第 N 轮** ("turn N") — the readout itself is
+word-for-word the same in both places.
 
 - **Timing costs nothing to collect.** Every event envelope already carries `time` (epoch ms);
   durations are a subtraction, so tool timings are exact rather than sampled.
-- **Tools are grouped by step.** DSH runs one model call per step (possibly with one tool), and a
-  step's duration = model latency + tool latency, so the two are not redundant. A step that called no
-  tool is still listed — those are often the slowest ones.
-- **Three states, kept apart.** A finished call is 成功/失败; a call whose result never arrived
-  because you stopped the turn is **未知 (unknown)**, not "failed" — it may well have run, and
-  reporting it as a failure sends you chasing a problem that does not exist.
+- **Tools are grouped by step, and every step gets its own row.** DSH runs one model call per step
+  (possibly with one tool), and a step's duration = model latency + tool latency, so the two are not
+  redundant. A step that called no tool is **still a row** rather than a footnote — folding it away
+  made the step numbers skip, and those steps are often the slowest ones.
+- **Four states, kept apart.** 成功 / 失败 / 运行中, plus **未知 (unknown)**: a call whose result never
+  arrived because you stopped the turn, the process was killed, or DSH itself repaired an interrupted
+  turn. It may well have run, and reporting it as a failure sends you chasing a problem that does not
+  exist — or worse, retrying a command that already took effect.
+- **DSH's turn repair is not blamed on us.** Repair frames (`TOOL_NOT_STARTED` / "outcome is unknown")
+  **say "unknown" in their body while carrying `isError: true`**, so the verdict has to be three-state
+  rather than a boolean; and they match no call at all, which the overlay reports as
+  「Harness 代写的，不是故障」 separately from a genuine pairing-key failure.
 - **Memory only, last 20 turns.** Reloading the window clears it (which is also why it does not span
   sessions). Nothing is persisted, nothing enters the transcript, and **no bodies are kept** — tool
   inputs/outputs are dropped so this can never become a second path around the `toolInput` fuse.
@@ -346,7 +354,7 @@ finished path.
 | `scripts/probe-purge.mjs` | Self-check for path parity / guarded removal / retention boundaries (same; **path parity needs Node ≥ 22.15** and points you at `dist-runtime/node/node.exe` otherwise) |
 | `scripts/probe-turn-state.mjs` | Self-check for the Continue-button verdict + online status tracking (same; no VS Code, no API key) |
 | `scripts/probe-approval-shell.mjs` | Self-check for the C1 approval hook's shell-form verdict: at least one form runs, the two are mutually exclusive, and the second form rescues a wrong first guess (same; no VS Code, no API key) |
-| `scripts/probe-run-inspector.mjs` | Self-check for the C9 run inspector: frame filtering (5000 `assistant/chunk` must change nothing), call/result pairing, the outcome precedence table, ring/dropped caps, and a replay of the newest capture in `logs/dsh-frames/` cross-checked against an independently derived oracle (same; no VS Code, no API key) |
+| `scripts/probe-run-inspector.mjs` | Self-check for the C9 run inspector: frame filtering (5000 `assistant/chunk` must change nothing), call/result pairing (including DSH repair frames' three-state verdict and a conservation law over them), the outcome precedence table, ring/dropped caps, and a replay of both the newest capture in `logs/dsh-frames/` **and** a real `session.jsonl.zstd` cross-checked against independently derived oracles (same; no VS Code, no API key) |
 | `scripts/probe-c8-runtime.mjs` | Runtime spike for C8: queued second prompt, kill-then-resume turn repair, graceful vs hard kill. **Needs an API key** and spends real model turns |
 | `scripts/update-dsh.mjs` | Runtime-dependency governance: lock the DSH checkout to a tag, check drift, run the upgrade ritual + smoke (see `docs/runtime-dependency.md`) |
 | `docs/runtime-dependency.md` | Governance decision for treating the DSH checkout as a versioned runtime dependency, the upgrade ritual, and the “when to switch to official npm” checklist |

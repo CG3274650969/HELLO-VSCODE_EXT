@@ -108,9 +108,11 @@ function normalize(session: StoredSession): StoredSession {
     if (m.status === 'streaming') {
       m.status = 'interrupted';
     }
-    // 上次异常退出可能留下永远 running 的工具卡 → 落成 error，避免回放时转圈
+    // 上次异常退出可能留下永远 running 的工具卡 → 落成 **unknown**，避免回放时转圈。
+    // 判成 error 是谎报：那条 result 从没到过，命令跑没跑完不可知（与 chatViewProvider 的
+    // `_finishTurn` / `_openSession` 同一套理由）。
     if (m.role === 'tool' && m.toolState === 'running') {
-      m.toolState = 'error';
+      m.toolState = 'unknown';
     }
   }
   if (!session.title && session.messages[0]) {

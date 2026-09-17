@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * C9 运行检查器自检 —— `RunInspector` / `toolKeyFrom` / `toolResultFailed` 的边界，
+ * C9 运行检查器自检 —— `RunInspector` / `toolKeyFrom` / `toolResultVerdict` 的边界，
  * **不需要 VS Code、不需要 API key、不发任何模型调用**。
  *
  * 与 probe-turn-state.mjs 同一个道理：runInspector.ts 是有意做成零 `vscode` 依赖的纯模块，
@@ -18,6 +18,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } 
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { zstdDecompressSync } from 'node:zlib';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const outDir = join(repoRoot, 'out');
@@ -38,7 +39,8 @@ const {
   MAX_STEPS,
   MAX_ERRORS,
   toolKeyFrom,
-  toolResultFailed,
+  toolResultVerdict,
+  isRepairResult,
 } = await load('runInspector.js');
 
 // ---------- 断言小工具 ----------
@@ -90,6 +92,88 @@ const resultFrame = (callId, t, isError = false, step = 1, turn = 1) =>
       message: {
         source: { kind: 'tool', callId },
         content: [{ type: 'tool-result', toolCallId: callId, content: [], isError }],
+      },
+    },
+    t
+  );
+
+/**
+ * DSH **补平中断轮**时补写的两条结果帧，逐字取自 2026-09-17 那份真实会话日志
+ * （`…sessions\--d-metabase-8.31~6570~636E~5904~7406--\eb8ff021-…~003A~003Aa9973f52\session.jsonl.zstd`，
+ * turn 1 的 seq 242 / 243；只有正文长句掐了尾巴）。**别改成「编一个像的」** —— 这两个变体的
+ * 可识别特征（`message.id` 前缀、`error.code`）就是从那两份原文里逐字读出来的，
+ * 而它们**都带 `isError: true`**，正是三态判据存在的唯一理由。
+ *
+ * 两个变体的关键差别（决定了它们会不会配上调用行）：
+ *   · repairedAfterRecorded：`toolCallId` 与真 `tool/call` **逐字相同** → 那一行还在就配得上；
+ *   · repairedNotStarted：  那个 `call_01_…` 从来没有过 `tool/call` → 必然配不上。
+ */
+const REPAIR_TEXT_RECORDED =
+  'The tool call was interrupted after it was recorded, but no result was durably recorded. Its outcome is unknown.';
+const REPAIR_PAYLOAD_RECORDED = {
+  turn: 1,
+  step: 1,
+  message: {
+    id: 'interrupted-tool-result-call_00_xxx-242',
+    role: 'user',
+    source: { kind: 'tool', callId: 'call_00_xxx' },
+    content: [
+      {
+        type: 'tool-result',
+        toolCallId: 'call_00_xxx',
+        isError: true, // ← 帧上说是错，正文说是未知
+        content: [{ type: 'text', text: REPAIR_TEXT_RECORDED }],
+      },
+    ],
+  },
+};
+const REPAIR_PAYLOAD_NOT_STARTED = {
+  turn: 1,
+  step: 1,
+  message: {
+    id: 'interrupted-tool-result-call_01_yyy-243',
+    role: 'user',
+    source: { kind: 'tool', callId: 'call_01_yyy' },
+    content: [
+      {
+        type: 'tool-result',
+        toolCallId: 'call_01_yyy',
+        isError: true,
+        content: [{ type: 'text', text: 'The tool call was interrupted before the Harness recorded it as started.' }],
+      },
+    ],
+  },
+  error: { name: 'ToolNotStartedError', code: 'TOOL_NOT_STARTED' },
+};
+/** 把载荷换成帧；`callId` 用来模拟「换一次调用」（默认用载荷里原样的那个）。 */
+const repairedAfterRecorded = (callId, t, turn = 1, step = 1) =>
+  f(
+    'tool/result',
+    {
+      ...REPAIR_PAYLOAD_RECORDED,
+      turn,
+      step,
+      message: {
+        ...REPAIR_PAYLOAD_RECORDED.message,
+        id: `interrupted-tool-result-${callId}-${t}`,
+        source: { kind: 'tool', callId },
+        content: REPAIR_PAYLOAD_RECORDED.message.content.map((b) => ({ ...b, toolCallId: callId })),
+      },
+    },
+    t
+  );
+const repairedNotStarted = (callId, t, turn = 1, step = 1) =>
+  f(
+    'tool/result',
+    {
+      ...REPAIR_PAYLOAD_NOT_STARTED,
+      turn,
+      step,
+      message: {
+        ...REPAIR_PAYLOAD_NOT_STARTED.message,
+        id: `interrupted-tool-result-${callId}-${t}`,
+        source: { kind: 'tool', callId },
+        content: REPAIR_PAYLOAD_NOT_STARTED.message.content.map((b) => ({ ...b, toolCallId: callId })),
       },
     },
     t
@@ -222,8 +306,60 @@ check('孤零零的 tool/result → unmatched++，不建行、不报错', () => 
   const insp = feed([f('turn/start', { turn: 1 }, 0), resultFrame('ghost', 500)]);
   const run = insp.details(UI)[0];
   eq(run.unmatched, 1);
+  eq(run.repaired, 0, '这不是补平帧，别混进 repaired：');
   eq(run.tools.length, 0);
   eq(run.errors.length, 0, '不该上浮成错误：');
+});
+
+// ---- 补平帧（2026-09-17 实测推翻「unmatched 恒 0」的那条）----
+
+check('★★ 补平帧的状态判据是三态：正文说未知、帧上 isError:true → unknown，不是 error', () => {
+  // 这条是本模块最值钱的一条断言：只按 isError 判，会把「未知」画成红色「失败」，
+  // 而失败会让人去重试一个可能已经生效过的命令。
+  eq(toolResultVerdict(REPAIR_PAYLOAD_RECORDED), 'unknown', '已记录但结果没落盘：');
+  eq(toolResultVerdict(REPAIR_PAYLOAD_NOT_STARTED), 'unknown', '从未被记录为开始：');
+  // 反证：去掉补平标记，同一份载荷就该判成 error —— 证明 unknown 只来自 isRepairResult
+  eq(toolResultVerdict({ message: { content: [{ type: 'tool-result', isError: true }] } }), 'error', '普通 isError：');
+});
+
+check('isRepairResult 只认那两个特征，不误伤普通结果帧', () => {
+  ok(isRepairResult(REPAIR_PAYLOAD_RECORDED), 'message.id 前缀：');
+  ok(isRepairResult(REPAIR_PAYLOAD_NOT_STARTED), 'error.code：');
+  ok(!isRepairResult({ message: { content: [{ type: 'tool-result', isError: true }] } }), '普通失败结果不该算补平：');
+  ok(!isRepairResult({ message: { id: 'msg-1', content: [] } }), '别的 id：');
+  ok(!isRepairResult({ error: { code: 'OTHER' } }), '别的 error.code：');
+  ok(!isRepairResult({}), '空对象：');
+  ok(!isRepairResult(undefined));
+  ok(!isRepairResult(null));
+});
+
+check('补平帧配得上那一行（toolCallId 逐字相同）→ 该行落 unknown，不进 repaired', () => {
+  const insp = feed([
+    f('turn/start', { turn: 1 }, 0),
+    callFrame('call_00_xxx', 1000, 1),
+    repairedAfterRecorded('call_00_xxx', 6000, 1, 1),
+  ]);
+  const run = insp.details(UI)[0];
+  eq(run.tools.length, 1, '不该多建行：');
+  eq(run.tools[0].state, 'unknown');
+  eq(run.tools[0].durationMs, 5000, '补平帧的 time 仍是终点，耗时照算：');
+  eq([run.unmatched, run.repaired], [0, 0], '配上了就两个计数都不动：');
+  const sum = insp.readout(UI).runs[0];
+  eq([sum.toolUnknown, sum.toolErrors], [1, 0]);
+});
+
+check('补平帧没有可配的行（TOOL_NOT_STARTED）→ repaired++，unmatched 保持 0', () => {
+  const insp = feed([
+    f('turn/start', { turn: 1 }, 0),
+    callFrame('call_00_xxx', 1000, 1),
+    resultFrame('call_00_xxx', 2000, false, 1), // 真调用正常收尾
+    repairedNotStarted('call_01_yyy', 3000, 1, 2), // 那个 call_01 从来没有过 tool/call
+  ]);
+  const run = insp.details(UI)[0];
+  eq(run.tools.length, 1, '不该给补平帧建行：');
+  eq(run.tools[0].state, 'ok', '不许错关留存的行：');
+  eq([run.unmatched, run.repaired], [0, 1], '「运行时写的」与「我们的键失效」必须分开数：');
+  eq(insp.readout(UI).runs[0].toolErrors, 0, '补平帧不该让面板多出一个失败：');
 });
 
 check('★ call 有、result 没有 → unknown，且不折成 error', () => {
@@ -249,6 +385,7 @@ check('★★ 150 次调用 → 留 100 行，被丢掉的 result 绝不许错�
   eq(run.tools.length, MAX_TOOL_ROWS, '留存行数：');
   eq(run.toolsDropped, 50, '丢掉的次数：');
   eq(run.unmatched, 50, '被丢掉的 50 条结果应当落进 unmatched：');
+  eq(run.repaired, 0, '它们是普通结果帧，不是补平帧 —— 不许拿 repaired 当垃圾桶：');
   // 留存的 100 行必须各自配到自己那条 —— 键逐一对上，耗时全是 5000+i-(1000+i)=4000
   for (let i = 0; i < MAX_TOOL_ROWS; i++) {
     eq(run.tools[i].key, `c:c${i + 1}`, `第 ${i + 1} 行键：`);
@@ -259,18 +396,19 @@ check('★★ 150 次调用 → 留 100 行，被丢掉的 result 绝不许错�
   eq(insp.readout(UI).runs[0].truncated, true);
 });
 
-check('toolKeyFrom / toolResultFailed 与 provider 的判据同源', () => {
+check('toolKeyFrom / toolResultVerdict 与 provider 的判据同源', () => {
   eq(toolKeyFrom({ callId: 'a' }), 'c:a');
   eq(toolKeyFrom({ message: { content: [{ type: 'tool-result', toolCallId: 'b' }] } }), 'c:b');
   eq(toolKeyFrom({ turn: 2, step: 3 }), 'ts:2:3');
   eq(toolKeyFrom({}), 'ts::');
   eq(toolKeyFrom(undefined), 'ts::');
-  eq(toolResultFailed({ error: { name: 'x' } }), true, '结构性 error：');
-  eq(toolResultFailed({ message: { content: [{ type: 'tool-result', isError: true }] } }), true, 'isError：');
-  eq(toolResultFailed({ message: { content: [{ type: 'tool-result', isError: false }] } }), false);
-  eq(toolResultFailed({ message: { content: [{ type: 'text' }] } }), false, '非 tool-result 块不算：');
-  eq(toolResultFailed({}), false);
-  eq(toolResultFailed(undefined), false);
+  eq(toolResultVerdict({ error: { name: 'x' } }), 'error', '结构性 error：');
+  eq(toolResultVerdict({ message: { content: [{ type: 'tool-result', isError: true }] } }), 'error', 'isError：');
+  eq(toolResultVerdict({ message: { content: [{ type: 'tool-result', isError: false }] } }), 'ok');
+  eq(toolResultVerdict({ message: { content: [{ type: 'text' }] } }), 'ok', '非 tool-result 块不算失败：');
+  eq(toolResultVerdict({}), 'ok');
+  eq(toolResultVerdict(undefined), 'ok');
+  eq(toolResultVerdict(null), 'ok', 'null 不许抛：');
 });
 
 // ---------- D. 终态 ----------
@@ -626,6 +764,134 @@ check('★ 最新一份抓帧：RunInspector 与直算式 oracle 全等', () => 
   console.log(
     `    对拍通过：${mine.length} 轮 / ${totalTools} 次工具 / ` +
       `轮耗时 ${mine.map((r) => r.durationMs ?? '—').join(', ')} ms（真帧 ${file.split(/[\\/]/).pop()}）`
+  );
+  return true;
+});
+
+// ---------- G. 真实会话日志回放（补平帧的真身） ----------
+console.log('\n· 真实 DSH 会话日志（zstd）：补平帧不许被算成我们的 bug');
+
+/**
+ * 找最新的 `session.jsonl.zstd`。**不硬编码机器路径** —— 从 globalStorage 根往下走，
+ * 也允许 `HELLO_DSH_SESSIONS_DIR` 覆盖（别的机器 / CI 上跑就有路子）。
+ * logs/ 与 globalStorage 都不在仓库里，缺了要**响亮地跳过**，别把通过当成验过了。
+ */
+function findLatestSessionLog() {
+  const override = process.env.HELLO_DSH_SESSIONS_DIR;
+  const roots = [];
+  if (override) roots.push(override);
+  if (process.env.APPDATA) {
+    roots.push(join(process.env.APPDATA, 'Code', 'User', 'globalStorage', 'starmerx-local.hello-vscode-ext', 'dsh-sessions'));
+  }
+  roots.push(join(repoRoot, 'logs', 'dsh-sessions'));
+  const found = [];
+  const walk = (dir, depth) => {
+    if (depth > 4) return;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) walk(p, depth + 1);
+      else if (e.name.endsWith('.jsonl.zstd')) {
+        try {
+          found.push({ p, m: statSync(p).mtimeMs });
+        } catch {
+          /* 读不到就跳过 */
+        }
+      }
+    }
+  };
+  for (const r of roots) walk(r, 0);
+  found.sort((a, b) => a.m - b.m);
+  return found.length ? found[found.length - 1].p : undefined;
+}
+
+/**
+ * 会话日志是**首尾相接的 zstd 帧**（magic `28 b5 2f fd`），`zstdDecompressSync` 只认第一帧 ——
+ * 所以按 magic 切段、每段往后多要一帧再试。同一份实现在 probe-c8-runtime.mjs 里也有一份，
+ * 两处都别各改各的：这里炸了先去看那份的行为是不是也变了。
+ */
+function readZstdFrames(file) {
+  const buf = readFileSync(file);
+  const magic = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
+  const offs = [];
+  for (let i = 0; ; ) {
+    const j = buf.indexOf(magic, i);
+    if (j < 0) break;
+    offs.push(j);
+    i = j + 1;
+  }
+  const text = [];
+  for (let k = 0; k < offs.length; k += 1) {
+    let done = false;
+    for (let span = 1; span <= 4 && k + span <= offs.length && !done; span += 1) {
+      const end = k + span < offs.length ? offs[k + span] : buf.length;
+      try {
+        text.push(zstdDecompressSync(buf.subarray(offs[k], end)).toString('utf8'));
+        k += span - 1;
+        done = true;
+      } catch {
+        /* 往后多要一帧再试 */
+      }
+    }
+  }
+  return text.join('');
+}
+
+check('★★ 真日志回放：补平帧既不许算成 unmatched，也不许被静默吞掉', () => {
+  const log = findLatestSessionLog();
+  if (!log) {
+    console.log('    ⚠ 跳过：本机没有 DSH 会话日志（设 HELLO_DSH_SESSIONS_DIR 可指定），别把这次通过当成验过了');
+    return 'skipped';
+  }
+  const events = readZstdFrames(log)
+    .split('\n')
+    .filter(Boolean)
+    .flatMap((l) => {
+      try {
+        return [JSON.parse(l)];
+      } catch {
+        return [];
+      }
+    });
+  ok(events.length > 0, '日志解出来 0 条事件（格式变了？）');
+
+  const insp = new RunInspector();
+  for (const ev of events) insp.apply({ sessionId: 'real', event: ev }, UI);
+  const runs = insp.details(UI);
+  ok(runs.length > 0, '这份日志里没有完整的轮');
+
+  // ---- oracle：独立地按帧面特征数补平帧（不调 isRepairResult）----
+  let repairFrames = 0;
+  for (const ev of events) {
+    if (ev.type !== 'tool/result') continue;
+    const d = ev.data ?? {};
+    const idOk = typeof d.message?.id === 'string' && d.message.id.startsWith('interrupted-tool-result-');
+    const codeOk = d.error?.code === 'TOOL_NOT_STARTED';
+    if (idOk || codeOk) repairFrames += 1;
+  }
+  ok(repairFrames > 0, '这份日志里没有补平帧 —— 换个日志，或这份样本已经不是当初那份了');
+
+  const totalUnmatched = runs.reduce((a, r) => a + r.unmatched, 0);
+  const totalRepaired = runs.reduce((a, r) => a + r.repaired, 0);
+  // 被补平帧收掉的行：unknown **且**有耗时（只有收到了结果帧的行才有终点；悬挂行没有）
+  let closedByRepair = 0;
+  for (const r of runs) {
+    for (const t of r.tools) if (t.state === 'unknown' && t.durationMs !== undefined) closedByRepair += 1;
+  }
+
+  eq(totalUnmatched, 0, '真实运行时行为被算成了我们的 bug（unmatched）：');
+  ok(totalRepaired > 0, 'repaired 是 0：补平帧要么被吞了，要么被算去别处了');
+  // ★ 守恒律：每条补平帧**恰好**落在某一处 —— 收掉一行，或记一次 repaired。既不许多、也不许少。
+  eq(closedByRepair + totalRepaired, repairFrames, '补平帧去向不守恒：');
+  ok(!hasNonFinite(runs), '真帧回放产出了 NaN / Infinity');
+  console.log(
+    `    真帧 ${events.length} 条 / ${runs.length} 轮 / 补平帧 ${repairFrames} 条 → ` +
+      `收掉 ${closedByRepair} 行 + 记 ${totalRepaired} 次（${log.split(/[\\/]/).pop()}）`
   );
   return true;
 });

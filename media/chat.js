@@ -1000,11 +1000,16 @@
   /**
    * 一轮摘要的一句话。判据全在扩展侧，这里只排版。
    * 条与浮层头**共用这一句** —— 同一轮在两处说法不一致，用户不知道信哪个。
+   *
+   * `who` 是「这一轮」的称呼，缺省「本轮」（条上永远只有一轮，说「本轮」最自然）。
+   * 浮层里多轮并排，全写「本轮」等于每行都在说自己是当前轮 —— 那里传「第 N 轮」。
+   * 前缀换称呼、**后缀一个字不动**，所以同一轮在两处的读数仍然逐字可比。
    */
-  function runLine(r) {
+  function runLine(r, who) {
     if (!r) return '';
     var c = runCounts(r);
-    var prefix = r.outcome === 'running' ? '本轮运行中' : '本轮' + (RUN_OUTCOME_LABEL[r.outcome] || r.outcome);
+    var self = who || '本轮';
+    var prefix = r.outcome === 'running' ? self + '运行中' : self + (RUN_OUTCOME_LABEL[r.outcome] || r.outcome);
     var line = prefix + ' · ' + (c.toolCount > 0 ? c.toolCount + ' 工具' : '无工具调用') + ' · ' + fmtDuration(runDuration(r));
     if (r.outcome !== 'running') {
       if (c.errorCount > 0) line += ' · ' + c.errorCount + ' 错误';
@@ -1030,7 +1035,8 @@
     }
     var runs = st.runs || [];
     var cur = runs.length ? runs[0] : null;
-    var line = cur ? runLine(cur) : '运行记录 · 本轮尚无';
+    // 留着历史的轮次时，「本轮」会被读成「我屏幕上那条对话」；它其实只是**最新**那一轮
+    var line = cur ? runLine(cur, runs.length > 1 ? '最新一轮' : '本轮') : '运行记录 · 本轮尚无';
     runsSummary.textContent = line;
     // title 给全量 + 口径：侧栏一窄，行尾就被 ellipsis 吃掉
     runsSummary.title =
@@ -1089,16 +1095,18 @@
       runsList.scrollTop = keep;
       return;
     }
+    // 序号按**列表位置**数（最新一轮在最上 = 第 runs.length 轮），不取 wire 的 turn：
+    // DSH 身份丢失后新会话的 turn 会从 1 重数，用它当标题会出现两行都叫「第 1 轮」。
     for (var i = 0; i < runs.length; i++) {
-      runsList.appendChild(buildRunNode(runs[i]));
+      runsList.appendChild(buildRunNode(runs[i], runs.length - i));
     }
     runsPanelSub.textContent = '共 ' + runs.length + ' 轮';
     runsPanelNote.textContent = '只在内存里，重载窗口即清空 · 只保留最近 20 轮';
     runsList.scrollTop = keep;
   }
 
-  /** 一轮 → DOM 子树。全部 createElement/textContent。 */
-  function buildRunNode(r) {
+  /** 一轮 → DOM 子树。全部 createElement/textContent。`nth` 是浮层里的轮次序号（最新 = 共 N 轮）。 */
+  function buildRunNode(r, nth) {
     var box = document.createElement('div');
     box.className = 'ri-run';
 
@@ -1106,7 +1114,7 @@
     head.className = 'ri-run-head';
     var title = document.createElement('span');
     title.className = 'ri-run-title';
-    title.textContent = runLine(r);
+    title.textContent = runLine(r, nth ? '第 ' + nth + ' 轮' : undefined);
     head.appendChild(title);
     if (r.truncated) {
       var trunc = document.createElement('span');
@@ -1134,50 +1142,37 @@
       box.appendChild(more);
     }
 
-    // 工具按 step 分组：DSH 一步一次模型调用（可能带一次工具），步是天然的分节线
+    // 工具按 step 分组：DSH 一步一次模型调用（可能带一次工具），步是天然的分节线。
+    // **每个步骤都占一行**，工具挂在自己那一步下面。原先把「不含工具调用的步」折成一行脚注，
+    // 代价是步骤号在列表里跳号（1、3、5 看着像丢了两步）—— 而纯模型步恰恰常是最慢的那一步，
+    // 恰恰最该在时间线上占一格。判据（步数、耗时）一个字没变，只是不再折叠。
     var byStep = {};
-    var order = [];
+    var stepMap = {};
+    for (var s = 0; s < (r.steps || []).length; s++) stepMap[String(r.steps[s].step)] = r.steps[s];
     for (var t = 0; t < (r.tools || []).length; t++) {
       var tool = r.tools[t];
       var k = String(tool.step);
-      if (!byStep[k]) {
-        byStep[k] = [];
-        order.push(tool.step);
-      }
+      if (!byStep[k]) byStep[k] = [];
       byStep[k].push(tool);
     }
-    order.sort(function (a, b) {
-      return a - b;
-    });
-    var stepMap = {};
-    for (var s = 0; s < (r.steps || []).length; s++) stepMap[String(r.steps[s].step)] = r.steps[s];
+    // 取并集：工具的 step 未必出现在 steps 里（步超上限被丢、step/start 帧缺失），两边的号都得露出来
+    var order = [];
+    for (var k1 in stepMap) order.push(Number(k1));
+    for (var k2 in byStep) if (order.indexOf(Number(k2)) < 0) order.push(Number(k2));
+    order.sort(function (a, b) { return a - b; });
 
     for (var oi = 0; oi < order.length; oi++) {
       var stepNo = order[oi];
       var st = stepMap[String(stepNo)];
       var stepRow = document.createElement('div');
       stepRow.className = 'ri-step';
-      stepRow.textContent = '步骤 ' + stepNo + ' · ' + (st ? fmtDuration(st.durationMs) : '—');
+      // 有步无耗时 = 那一步还没结束（轮被中断）→ fmtDuration 给「—」，不编数
+      stepRow.textContent = '步骤 ' + stepNo + ' · ' + fmtDuration(st && st.durationMs);
       box.appendChild(stepRow);
-      var rows = byStep[String(stepNo)];
+      var rows = byStep[String(stepNo)] || [];
       for (var ri = 0; ri < rows.length; ri++) {
         box.appendChild(buildToolNode(rows[ri]));
       }
-    }
-    // 一步工具都没有的步（纯模型步）也要露出来 —— 它往往正是最慢的那一步
-    var stepOnly = [];
-    for (var s2 = 0; s2 < (r.steps || []).length; s2++) {
-      if (!byStep[String(r.steps[s2].step)]) stepOnly.push(r.steps[s2]);
-    }
-    if (stepOnly.length) {
-      var many = stepOnly.length > 1;
-      var note = document.createElement('div');
-      note.className = 'ri-note';
-      note.textContent = many
-        ? '另有 ' + stepOnly.length + ' 个不含工具调用的步骤（模型思考，耗时 ' +
-          stepOnly.map(function (x) { return fmtDuration(x.durationMs); }).join(' / ') + '）'
-        : '另有 1 个不含工具调用的步骤（模型思考，耗时 ' + fmtDuration(stepOnly[0].durationMs) + '）';
-      box.appendChild(note);
     }
     if (r.toolsDropped > 0) {
       var dropNote = document.createElement('div');
@@ -1191,11 +1186,18 @@
       dropStep.textContent = '另有 ' + r.stepsDropped + ' 个步骤未记录';
       box.appendChild(dropStep);
     }
-    // 配对键失效的探针：正常恒为 0，非 0 就是我们的 bug，明说而不是装作没发生
+    // 这两条是探针，措辞必须分清「运行时的账」与「我们的 bug」——
+    // 原先只有 unmatched 一条、文案写「配对键失效」，把 DSH 正常补平的帧说成了我们的故障。
+    if (r.repaired > 0) {
+      var reps = document.createElement('div');
+      reps.className = 'ri-note';
+      reps.textContent = '另有 ' + r.repaired + ' 条中断补平的结果没配上调用（Harness 代写的，不是故障）';
+      box.appendChild(reps);
+    }
     if (r.unmatched > 0) {
       var un = document.createElement('div');
       un.className = 'ri-note';
-      un.textContent = '有 ' + r.unmatched + ' 条工具结果没配上调用（配对键失效）';
+      un.textContent = '有 ' + r.unmatched + ' 条工具结果没配上调用（配对键失效，正常应为 0）';
       box.appendChild(un);
     }
     return box;
@@ -1662,12 +1664,17 @@
 
   /**
    * 构建/更新一张工具调用卡（role:'tool'）。入参与输出一律 textContent（防 XSS）。
-   * running 只转圈不出输出；ok/error 时把输出文本放进 pre。
+   * running 只转圈不出输出；ok/error/unknown 时把输出文本放进 pre。
+   *
+   * `unknown` 是第四态，不是「还没到」：那次调用**没能收到结果**（被杀进程、轮被中断），
+   * 跑没跑完不可知。用中性色 + 「?」而**不是**红叉 —— 判成失败会让人去重试一个可能已经
+   * 生效过的命令（`runInspector.toolResultVerdict` 与 `_finishTurn` 的注释是同一套理由）。
    */
   function applyToolState(rec) {
     rec.card.classList.toggle('running', rec.toolState === 'running');
     rec.card.classList.toggle('ok', rec.toolState === 'ok');
     rec.card.classList.toggle('error', rec.toolState === 'error');
+    rec.card.classList.toggle('unknown', rec.toolState === 'unknown');
     rec.stateEl.textContent =
       rec.toolState === 'running'
         ? '运行中…'
@@ -1675,7 +1682,9 @@
           ? '✓ 成功'
           : rec.toolState === 'error'
             ? '✗ 失败'
-            : rec.toolState || '';
+            : rec.toolState === 'unknown'
+              ? '? 无结果'
+              : rec.toolState || '';
     var showOutput = rec.toolState !== 'running' && !!rec.outputText;
     rec.outputEl.hidden = !showOutput;
     rec.outputEl.textContent = rec.outputText || '';
