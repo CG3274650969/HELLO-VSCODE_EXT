@@ -118,6 +118,14 @@
     <div id="usage-bar" class="usage-bar" hidden>
       <span id="usage-summary" class="usage-summary"></span>
     </div>
+    <!-- C8「继续」条：上一轮以中断/出错收场时出现，点一下把上一条消息重发、接着这个 DSH 会话跑。
+         同 review-bar / approval-bar 挂在 composer 内 —— react-live 只藏 #messages，两种画面都可见
+         （消息区尾部反而在真组件画面下看不见，所以不放那儿）。显隐由扩展 retry-offer 驱动：
+         判据是**已落盘**的 lastTurn，所以重载窗口、重启 VS Code 之后它照常在。 -->
+    <div id="retry-bar" class="retry-bar" hidden>
+      <span class="retry-hint">上一轮没有正常结束 —— 可以接着这个会话继续跑。</span>
+      <button id="retry-btn" class="button button-secondary" type="button">继续</button>
+    </div>
     <!-- CC 桌面式整卡 composer：输入区与下方工具行并入同一张圆角卡片（输入透明、无自身边框），
          卡片 hover/focus 整圈出环；内嵌聊天 / harness 共用这一张卡，只是中间簇显隐不同。 -->
     <div id="composer-card" class="composer-card">

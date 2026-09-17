@@ -215,6 +215,9 @@ export type ExtToWebview =
   | { type: 'review-set'; changes: ReviewChange[] }
   /** 2.1：清空并隐藏审阅条与面板（新一轮开始 / 模式切换 / 全部处理完） */
   | { type: 'review-clear' }
+  /** C8：这条会话该不该显示「继续」按钮（判据只有一条：上一轮以 interrupted/error 收场，
+   *  见 turnState.ts）。随 snapshot 之后、以及每轮终态之后下发。 */
+  | { type: 'retry-offer'; on: boolean }
   // --- C1 事前审批：破坏性 bash 命令在执行前弹确认条（DSH hook 阻塞整轮等用户） ---
   /** 有命令待确认：webview 弹确认条（挂在 composer 内，react-live 下也可见）。
    *  `command` 是**扩展预格式化好的展示串**：bash 调用是命令原文，C4 的 write/edit 调用是
@@ -231,6 +234,8 @@ export type WebviewToExt =
   | { type: 'ready' }
   | { type: 'user-message'; text: string; attachments?: FileRef[] }
   | { type: 'stop' }
+  /** C8：点「继续」= 把上一条用户消息**逐字重发**，接着同一个 DSH 会话再跑一轮 */
+  | { type: 'retry-last' }
   | { type: 'clear' } // 新建对话
   | { type: 'list-sessions' } // 打开历史面板时刷新列表
   | { type: 'open-session'; sessionId: string }

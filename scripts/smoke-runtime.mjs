@@ -166,4 +166,7 @@ if (!values['keep-session']) {
   }
 }
 
-process.exit(failed.length > 0 ? 1 : 0);
+// ⚠️ 不用 process.exit()：Windows 上被管道/文件重定向的 stdout 是**异步**写，退出会把还没
+// 冲出去的结论行整段丢掉 —— 表现就是「只打印了前半段、退出码却是 0」，一份会吞掉自己结论的
+// 报告比不跑还坏。设 exitCode 让事件循环自然走完即可（子进程在 runTurn 里已收干净）。
+process.exitCode = failed.length > 0 ? 1 : 0;

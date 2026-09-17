@@ -5,11 +5,16 @@
  * 只存「有内容的会话」（messages 非空）；正在输入的空新会话不入列。
  * 消息里的 status 若是遗留的 streaming（上次异常退出），加载时一律改成 interrupted，
  * 避免某条永远"生成中"把输入锁死。
+ *
+ * C8 起另存 `lastTurn`（上一轮的终态），它是「继续」按钮的判据 —— 见 turnState.ts。
  */
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { ChatMessage, UsageBuckets } from './protocol';
+// 只取类型：编译后不留 require，与 turnState.ts 的 `import type { StoredSession }` 相抵，
+// 运行时没有环。C8 的「继续」按钮判据就靠这个字段（见 turnState.ts）。
+import type { LastTurn } from './turnState';
 
 /** C7 留存：一天。 */
 export const RETENTION_DAY_MS = 24 * 60 * 60 * 1000;
@@ -34,6 +39,12 @@ export interface StoredSession {
    *  回收站只认这一个标志，别再引入并行的旁路状态（`deleted: true` 之类）——两套标志一定会打架。
    *  旧数据没有本字段 → 视为未删除，向后兼容。 */
   deletedAt?: number;
+  /** C8：**上一轮是怎么结束的**。只有异常终态才落值（`interrupted` = 用户停止或窗口重载，
+   *  `error` = 出错了），正常跑完一律删掉这个字段 —— 于是「有没有值」本身就是「要不要给
+   *  用户一个『继续』按钮」的判据，不必再去猜消息的形状（理由见 turnState.ts）。
+   *
+   *  用户一发新消息就清掉；所以按钮的失效不需要额外逻辑。旧数据没有本字段 → 向后兼容。 */
+  lastTurn?: LastTurn;
 }
 
 /** 由首条用户消息生成一句话标题（单行、截断）。 */
@@ -63,6 +74,13 @@ function normalize(session: StoredSession): StoredSession {
   // 一个损坏的时间戳（"yes" / {} / 0 / 负数）绝不能把会话永久藏进回收站里。
   if (typeof session.deletedAt !== 'number' || !Number.isFinite(session.deletedAt) || session.deletedAt <= 0) {
     delete session.deletedAt;
+  }
+
+  // C8：`lastTurn` 只认那两个值，别的一律当没有。方向与 deletedAt 相反 —— 那边一律朝
+  // 「看得见」倒，这边一律朝「不打扰」倒：一个坏值最多让「继续」按钮不出现（用户重发一条
+  // 就是了），而一个不该出现的按钮会把「上一轮其实跑完了」这种正常状态说成中断。
+  if (session.lastTurn !== 'interrupted' && session.lastTurn !== 'error') {
+    delete session.lastTurn;
   }
   return session;
 }
