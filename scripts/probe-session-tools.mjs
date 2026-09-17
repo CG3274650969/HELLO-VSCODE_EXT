@@ -10,7 +10,7 @@
  *
  * `out/` 是 gitignored 的编译产物，先 tsc 再跑（缺文件会给一句人话）。
  */
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -30,7 +30,7 @@ async function load(moduleName) {
 
 const { searchSessions, SEARCH_TOOL_INPUT_CHARS } = await load('sessionSearch.js');
 const { sessionToMarkdown, sessionToJson, suggestedFileName, MD_EMBED_MAX_CHARS } = await load('sessionExport.js');
-const { SessionStore } = await load('sessionStore.js');
+const { capToolInput, MAX_TOOL_INPUT_CHARS, SessionStore, STALE_TMP_MS } = await load('sessionStore.js');
 
 // ---------- 断言小工具 ----------
 
@@ -441,9 +441,17 @@ function newStore() {
 }
 
 /** 从干净状态起步的 store。**每条用例都要用它** —— 直接 newStore() 会把上一条用例落盘的数据
- *  一起读进来（曾经因此让 purgeTrashed 少清出 2 条而假失败）。 reopened/直接写文件的用例才用 newStore()。 */
+ *  一起读进来（曾经因此让 purgeTrashed 少清出 2 条而假失败）。 reopened/直接写文件的用例才用 newStore()。
+ *
+ *  ⚠️ C8c 起**必须连 `.bak` 与 `.tmp` 一起清**：有了上一代备份之后，「主文件不存在」不再等于
+ *  「没有历史」—— 构造会回退到备份，把上一条用例的数据原样读回来，于是一整片用例连环假失败。
+ *  `FILE + '.'` 前缀一把罩住 `.bak`、`<hex>.tmp`、`bak.<hex>.tmp` 三种名字。 */
 function scratchStore() {
-  rmSync(join(dir, FILE), { force: true });
+  for (const name of readdirSync(dir)) {
+    if (name === FILE || name.startsWith(FILE + '.')) {
+      rmSync(join(dir, name), { force: true });
+    }
+  }
   return newStore();
 }
 
@@ -584,6 +592,204 @@ try {
   check('dsh-sessions/ 零改动（SessionStore 层不做任何 dsh 目录操作）', () => {
     const entries = readdirSync(dir);
     eq(entries.filter((e) => e.includes('dsh')), [], '存储目录里不该出现 dsh-* 目录：');
+  });
+
+  // ============================================================
+  console.log('\n【C8c 落盘加固 · sessionStore.ts】');
+  // ============================================================
+
+  // 为什么值得这一整节：C7 的「彻底删除」会把会话的 DSH 日志一起删掉，于是主文件里那份转写
+  // 成了**删除后的唯一副本** —— 从前它是 `writeFileSync` 直接覆盖、`_load` 遇坏文件 catch 成
+  // 空数组，一次写崩 = 历史全失且无人察觉。这一节守的就是「那条路已经不存在」。
+
+  const MAIN_P = join(dir, FILE);
+  const BAK_P = MAIN_P + '.bak';
+  const OTHER_FILE = 'probe-other.json';
+  const OTHER_MAIN = join(dir, OTHER_FILE);
+  const OTHER_BAK = OTHER_MAIN + '.bak';
+
+  const readMain = () => readFileSync(MAIN_P, 'utf8');
+  const readBak = () => readFileSync(BAK_P, 'utf8');
+  const tmpLeftovers = () => readdirSync(dir).filter((n) => n.startsWith(FILE + '.') && n.endsWith('.tmp'));
+  /** 落两代：主 = 第二代，`.bak` = 第一代（含 title 那条会话）。 */
+  function twoGenerations(title = '要救的') {
+    const store = scratchStore();
+    withMessage(store, title);
+    store.persist();
+    withMessage(store, '第二代');
+    store.persist();
+    return store;
+  }
+
+  check('★ persist 不留 .tmp 残骸（原子写的中间态必须自己收干净）', () => {
+    const store = scratchStore();
+    withMessage(store, 'A');
+    store.persist();
+    eq(tmpLeftovers(), [], '主文件之外不该有 tmp：');
+  });
+
+  check('连续两次 persist 字节完全相同（序列化稳定，不掺时间戳之类的抖动）', () => {
+    const store = scratchStore();
+    withMessage(store, 'A');
+    store.persist();
+    const first = readMain();
+    store.persist();
+    ok(readMain() === first, '第二次写出来的字节应当和第一次逐字节相同：');
+  });
+
+  check('首次写不产生 .bak（盘上还没有「上一代」可备）', () => {
+    const store = scratchStore();
+    withMessage(store, 'A');
+    store.persist();
+    eq(existsSync(BAK_P), false, '.bak 不该存在：');
+  });
+
+  check('★ .bak 恒为上一代（必须在 rename **之前**滚动；写后再复制就等于没有备份）', () => {
+    const store = scratchStore();
+    withMessage(store, '第一代');
+    store.persist();
+    const gen1 = readMain();
+    withMessage(store, '第二代');
+    store.persist();
+    ok(readBak() === gen1, '备份应当逐字节等于上一代的主文件：');
+    ok(readMain() !== gen1, '主文件应当已经换成新一代：');
+  });
+
+  check('★ 主文件损坏 → 回退备份，报告 source=backup / reason=corrupt', () => {
+    twoGenerations();
+    writeFileSync(MAIN_P, '{"半截的 JSON', 'utf8');
+    const reopened = newStore();
+    eq(reopened.loadReport.source, 'backup', '来源：');
+    eq(reopened.loadReport.reason, 'corrupt', '原因：');
+    eq(reopened.active().map((x) => x.title), ['要救的'], '救回来的内容：');
+  });
+
+  check('顶层是合法 JSON 但不是数组 → notArray（别和「JSON 语法坏了」混为一谈）', () => {
+    twoGenerations();
+    writeFileSync(MAIN_P, '{"sessions":[]}', 'utf8');
+    const reopened = newStore();
+    eq(reopened.loadReport.source, 'backup', '来源：');
+    eq(reopened.loadReport.reason, 'notArray', '原因：');
+  });
+
+  check('主文件与备份都坏 → 空列表且不抛（构造绝不能把扩展宿主带崩）', () => {
+    twoGenerations();
+    writeFileSync(MAIN_P, 'x', 'utf8');
+    writeFileSync(BAK_P, 'y', 'utf8');
+    const reopened = newStore();
+    eq(reopened.all(), [], '列表：');
+    eq(reopened.loadReport.source, 'empty', '来源：');
+  });
+
+  check('★ 文件不存在 → missing（首次运行必须与损坏分开，否则干净 profile 一开就误报）', () => {
+    const store = scratchStore();
+    eq(store.loadReport.source, 'empty', '来源：');
+    eq(store.loadReport.reason, 'missing', '原因：');
+    eq(store.all(), []);
+  });
+
+  // 这一条钉的是**告警接线**的判据：主文件没了、却从备份捞回来时 `reason` 同样是 `missing`，
+  // 所以「reason === 'missing' 就静默」会把一次货真价实的恢复吞掉（被人手删了/被安全软件隔离了
+  // 都长这样）。判据必须挂在 `source` 上：`empty + missing` 才是「首次运行」。
+  check('★ 主文件不存在但有备份 → source=backup / reason=missing（别把它误当首次运行而静默）', () => {
+    twoGenerations();
+    rmSync(MAIN_P, { force: true });
+    const reopened = newStore();
+    eq(reopened.loadReport.source, 'backup', '来源：');
+    eq(reopened.loadReport.reason, 'missing', '原因：');
+    eq(reopened.active().map((x) => x.title), ['要救的'], '内容照旧救得回来：');
+  });
+
+  check('★★ 从备份回退之后，第一次 persist 不许把备份冲掉（否则备份在最需要它的时刻自杀）', () => {
+    twoGenerations();
+    const goodBak = readBak(); // 含「要救的」，是现在唯一一份好数据
+    writeFileSync(MAIN_P, '坏掉的字节', 'utf8');
+
+    const reopened = newStore();
+    eq(reopened.loadReport.source, 'backup', '先确认确实走了回退：');
+    withMessage(reopened, '新加的');
+    reopened.persist(); // ⚠️ 此刻盘上主文件仍是坏字节，滚动备份会把好数据覆盖成坏字节
+
+    ok(readBak() === goodBak, '备份必须原封不动：');
+    eq(JSON.parse(readMain()).map((x) => x.title), ['要救的', '新加的'], '主文件已是新内容：');
+  });
+
+  check('回退后的**第二次** persist 恢复正常滚动（写成功即解除「别滚备份」）', () => {
+    twoGenerations();
+    writeFileSync(MAIN_P, '坏掉的字节', 'utf8');
+    const reopened = newStore();
+    withMessage(reopened, '新加的');
+    reopened.persist(); // 跳过滚动
+    const afterFirst = readMain();
+    withMessage(reopened, '再加一条');
+    reopened.persist(); // 这次该滚了
+    ok(readBak() === afterFirst, '第二次写之前的那一代应当已经进备份：');
+  });
+
+  check('.bak 不跨文件串（chat / harness 共处一目录也各备各的）', () => {
+    for (const f of [OTHER_MAIN, OTHER_BAK]) rmSync(f, { force: true });
+    const a = scratchStore(); // FILE
+    withMessage(a, 'A 的');
+    a.persist();
+    withMessage(a, 'A 的第二代');
+    a.persist();
+
+    const b = new SessionStore(dir, OTHER_FILE);
+    withMessage(b, 'B 的');
+    b.persist();
+    withMessage(b, 'B 的第二代');
+    b.persist();
+
+    ok(readBak().includes('A 的') && !readBak().includes('B 的'), 'FILE 的备份里只该有 A 的数据：');
+    ok(readFileSync(OTHER_BAK, 'utf8').includes('B 的'), '另一个 store 有自己的备份：');
+  });
+
+  check('构造时清掉**陈旧**的 .tmp，新鲜的一个不碰（另一个 VS Code 窗口可能正写着）', () => {
+    const store = scratchStore();
+    withMessage(store, 'A');
+    store.persist();
+    const stale = join(dir, `${FILE}.aaaabbbbcccc.tmp`);
+    const fresh = join(dir, `${FILE}.dddd11112222.tmp`);
+    writeFileSync(stale, '崩溃残骸', 'utf8');
+    writeFileSync(fresh, '可能有人在写', 'utf8');
+    const old = (Date.now() - STALE_TMP_MS - 60_000) / 1000;
+    utimesSync(stale, old, old);
+    newStore(); // 构造即扫
+    eq(existsSync(stale), false, '陈旧残骸该清：');
+    eq(existsSync(fresh), true, '新鲜的可能正被别的窗口写着，必须留下：');
+    rmSync(fresh, { force: true });
+  });
+
+  check('扫 .tmp 只认自己文件名的前缀（chat store 不许碰 harness store 的残骸）', () => {
+    const foreign = join(dir, `${OTHER_FILE}.aaaabbbbcccc.tmp`);
+    writeFileSync(foreign, '别人的残骸', 'utf8');
+    const old = (Date.now() - STALE_TMP_MS - 60_000) / 1000;
+    utimesSync(foreign, old, old);
+    newStore(); // 只扫 FILE.*
+    eq(existsSync(foreign), true, '别的 store 的残骸不归它管：');
+    rmSync(foreign, { force: true });
+  });
+
+  check('capToolInput：恰好等于上限原样通过，超一个字符才截（判据是 > 不是 >=）', () => {
+    const exact = 'x'.repeat(MAX_TOOL_INPUT_CHARS);
+    eq(capToolInput(exact), exact, '等于上限：');
+    const input = 'x'.repeat(MAX_TOOL_INPUT_CHARS + 1);
+    const over = capToolInput(input);
+    ok(over !== input, '超一个字符就该截：');
+    ok(over.startsWith(exact), '保留前 20000 字符原样：');
+    ok(over.includes('入参过长'), '要带上截断标记：');
+  });
+
+  // 注意别拿「刚过界」当有界性的证据：刚好超 1 个字符时，结果反而**更长**（标记本身要占字）。
+  // 保险丝要挡的是病态输入（几 MB 正文），不是省那几个字节。
+  check('capToolInput 有界：再长的入参也只留上限 + 标记那点长度（这才是「保险丝」的意思）', () => {
+    const huge = capToolInput('z'.repeat(MAX_TOOL_INPUT_CHARS * 100));
+    ok(huge.length - MAX_TOOL_INPUT_CHARS < 32, '结果长度应当只比上限多出一个标记：');
+  });
+
+  check('capToolInput 幂等：截断结果再喂进去不再变（否则每轮转写都要「再截一次」）', () => {
+    const once = capToolInput('y'.repeat(MAX_TOOL_INPUT_CHARS * 2));
+    eq(capToolInput(once), once, '第二次：');
   });
 } finally {
   rmSync(dir, { recursive: true, force: true });

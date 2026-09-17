@@ -100,6 +100,21 @@
   var usageSummary = document.getElementById('usage-summary');
   var usageState = null;
 
+  // C9 运行检查器：条（composer 内）+ 浮层（body 直系）。扩展下发摘要 + （面板开着时的）详情。
+  // 与 usage 的差别：harness 下**没跑过也显示**（「本轮尚无」），因为条是这个功能的入口；
+  // 内嵌聊天则 runsState 为 null → 整条隐藏（没有 DSH 帧，永远不会有内容）。
+  var runsBar = document.getElementById('runs-bar');
+  var runsSummary = document.getElementById('runs-summary');
+  var runsViewBtn = document.getElementById('runs-view');
+  var runsPanel = document.getElementById('runs-panel');
+  var runsPanelSub = document.getElementById('runs-panel-sub');
+  var runsList = document.getElementById('runs-list');
+  var runsPanelClose = document.getElementById('runs-panel-close');
+  var runsPanelNote = document.getElementById('runs-panel-note');
+  var runsState = null; // RunReadout（扩展算好的每轮摘要）
+  var runsDetails = null; // RunRecord[]；**只在面板开着时**扩展才下发
+  var runsPanelOpen = false;
+
   // 顶部模式：chat（内嵌聊天）/ harness（Agent）。两种模式各一套草稿与待发附件，互不串。
   var modeTabs = Array.prototype.slice.call(document.querySelectorAll('.mode-tab'));
   var currentMode = 'harness'; // mode-set 到达前的占位，扩展回执后纠正为真正模式（默认 harness）
@@ -295,6 +310,9 @@
   }
 
   function openReviewPanel() {
+    // C9：与运行检查器浮层互斥（两个同层满屏浮层同时开着没有视觉仲裁）。
+    // 函数声明会提升，这里直接调没问题；它自带 `!runsPanelOpen` 早退，重复调用无害。
+    closeRunsPanel();
     reviewPanelOpen = true;
     reviewPanel.classList.add('open');
     renderReviewList();
@@ -763,6 +781,11 @@
     // mode-set 后必跟 snapshot）；没带就说明该模式无数据（内嵌聊天）→ 保持隐藏。
     usageState = null;
     renderUsageBar();
+    // C9：运行读数同理。切到内嵌聊天时扩展不会带 runs → 整条隐藏（没有 DSH 帧，永远不会有内容）。
+    runsState = null;
+    runsDetails = null;
+    closeRunsPanel();
+    renderRunsBar();
     // C6：检索态属于「上一条模式的历史」，必须整片清掉。不清的话 chat 模式搜出的命中会挂在
     // harness 面板上不动（切模式后紧跟的 snapshot 会 renderHistory()，而它按 historyQuery 分叉）。
     // searchSeq **不**归零（见变量声明处）。
@@ -908,6 +931,303 @@
       line + '\n↑ 计费输入（未命中 + 缓存读）· ↓ 输出（含 reasoning）· 缓存 = 缓存读占输入比';
     usageSummary.textContent = line;
     usageBar.hidden = false;
+  }
+
+  // ---------- C9 运行检查器 ----------
+
+  /**
+   * 耗时紧凑化：<1s 给毫秒、<60s 给一位小数秒、再往上给分秒。
+   * 只做排版，**不做判据** —— 耗时本身是扩展算好的（同 fmtTokens 的分工）。
+   */
+  function fmtDuration(ms) {
+    if (typeof ms !== 'number' || !isFinite(ms) || ms < 0) return '—';
+    if (ms < 1000) return Math.round(ms) + 'ms';
+    if (ms < 60000) return (ms / 1000).toFixed(1) + 's';
+    var s = Math.round(ms / 1000);
+    return Math.floor(s / 60) + 'm ' + (s % 60 < 10 ? '0' : '') + (s % 60) + 's';
+  }
+
+  var RUN_OUTCOME_LABEL = {
+    running: '运行中',
+    completed: '已完成',
+    aborted: '已中止',
+    interrupted: '已中断',
+    error: '出错',
+  };
+  var RUN_TOOL_LABEL = { running: '运行中', ok: '成功', error: '失败', unknown: '未知' };
+
+  /**
+   * 一轮显示用的耗时。
+   *
+   * 跑着的时候扩展**不给** `durationMs`（它不编一个「到现在为止」，那样前端就会拿它当判据）。
+   * 这里用 `startedAt` 现算一个**纯展示**的值 —— 它随每一帧刷新，所以单次长工具调用期间数字会
+   * 停住（全仓零 setInterval，不为一个装饰性秒数开这个口）。判据（终态、计数、成败）一律不碰它。
+   */
+  function runDuration(r) {
+    if (typeof r.durationMs === 'number') return r.durationMs;
+    if (r.outcome === 'running' && typeof r.startedAt === 'number') return Date.now() - r.startedAt;
+    return undefined;
+  }
+
+  /**
+   * 一轮的四个计数。**两种输入形状**：条上喂的是 `RunSummary`（扩展算好的计数，T 只有摘要），
+   * 浮层里喂的是完整 `RunRecord`（**没有**那四个计数字段，只有 tools/errors 数组本身）。
+   * 不给完整记录补这几个字段是刻意的：计数是 O(工具数) 的派生物，让它跟数组各存一份就是等着两份漂移。
+   *
+   * 派生口径**必须与扩展侧 `_summary()` 逐字一致**（`tools.length + toolsDropped`）——
+   * 否则同一条记录在条上和浮层里会给出两个数。超过 100 次工具时派生值只是下限（被丢掉的调用没有
+   * 状态可数），届时浮层另有「另有 N 次未记录」一行把差额说清。
+   */
+  function runCounts(r) {
+    if (typeof r.toolCount === 'number') {
+      return { toolCount: r.toolCount, toolErrors: r.toolErrors || 0, toolUnknown: r.toolUnknown || 0, errorCount: r.errorCount || 0 };
+    }
+    var tools = r.tools || [];
+    var toolErrors = 0;
+    var toolUnknown = 0;
+    for (var i = 0; i < tools.length; i++) {
+      if (tools[i].state === 'error') toolErrors++;
+      else if (tools[i].state === 'unknown') toolUnknown++;
+    }
+    return {
+      toolCount: tools.length + (r.toolsDropped || 0),
+      toolErrors: toolErrors,
+      toolUnknown: toolUnknown,
+      errorCount: (r.errors || []).length + (r.errorsDropped || 0),
+    };
+  }
+
+  /**
+   * 一轮摘要的一句话。判据全在扩展侧，这里只排版。
+   * 条与浮层头**共用这一句** —— 同一轮在两处说法不一致，用户不知道信哪个。
+   */
+  function runLine(r) {
+    if (!r) return '';
+    var c = runCounts(r);
+    var prefix = r.outcome === 'running' ? '本轮运行中' : '本轮' + (RUN_OUTCOME_LABEL[r.outcome] || r.outcome);
+    var line = prefix + ' · ' + (c.toolCount > 0 ? c.toolCount + ' 工具' : '无工具调用') + ' · ' + fmtDuration(runDuration(r));
+    if (r.outcome !== 'running') {
+      if (c.errorCount > 0) line += ' · ' + c.errorCount + ' 错误';
+      else if (c.toolErrors > 0) line += ' · ' + c.toolErrors + ' 失败';
+      else if (c.toolUnknown > 0) line += ' · ' + c.toolUnknown + ' 结果未知';
+    }
+    return line;
+  }
+
+  /**
+   * 整条重绘运行条。runsState 为 null（内嵌聊天 / 切模式前）时整条隐藏。
+   *
+   * 与 usage-bar 的关键差别：**harness 下没跑过也显示**（「本轮尚无」）—— 条是这个功能的入口，
+   * 藏起来等于没人找得到。
+   */
+  function renderRunsBar() {
+    var st = runsState;
+    if (!st) {
+      runsBar.hidden = true;
+      runsSummary.textContent = '';
+      runsSummary.title = '';
+      return;
+    }
+    var runs = st.runs || [];
+    var cur = runs.length ? runs[0] : null;
+    var line = cur ? runLine(cur) : '运行记录 · 本轮尚无';
+    runsSummary.textContent = line;
+    // title 给全量 + 口径：侧栏一窄，行尾就被 ellipsis 吃掉
+    runsSummary.title =
+      line +
+      (runs.length > 1 ? '\n最近 ' + runs.length + ' 轮' : '') +
+      '\n只在内存里，重载窗口即清空 · 点「查看」看完整时间线';
+    runsBar.hidden = false;
+  }
+
+  function openRunsPanel() {
+    // 与审阅浮层互斥：两个同层（z-index 40）满屏浮层同时开着没有视觉仲裁
+    closeReviewPanel();
+    runsPanelOpen = true;
+    runsPanel.classList.add('open');
+    post({ type: 'run-panel', open: true }); // 扩展据此把 details 一起发下来
+    renderRunsPanel();
+  }
+
+  function closeRunsPanel() {
+    if (!runsPanelOpen) return;
+    runsPanelOpen = false;
+    runsPanel.classList.remove('open');
+    post({ type: 'run-panel', open: false });
+  }
+
+  /**
+   * 重建浮层内容（逐条 createElement/textContent，防 XSS）。
+   *
+   * ⚠️ **必须存还 scrollTop**：这个面板在一轮里每收一帧就被重绘一次（run/tool 帧都算），
+   * 朴素重渲染会把滚动位置每秒打回顶部好几次，用户永远读不到第 12 行。
+   * `.review-list` 只在离散变化时重绘，没这个问题 —— 别照抄它这个省略。
+   */
+  function renderRunsPanel() {
+    var keep = runsList.scrollTop;
+    runsList.textContent = '';
+    if (runsDetails === null) {
+      // 刚点开、扩展的详情还没回来（postMessage 是异步的）。**必须与「确实没有记录」区分开** ——
+      // 把这几毫秒画成「没有本会话的运行记录」，用户会当成真的没数据。
+      var loading = document.createElement('div');
+      loading.className = 'rp-empty';
+      loading.textContent = '载入中…';
+      runsList.appendChild(loading);
+      runsPanelSub.textContent = '';
+      runsPanelNote.textContent = '';
+      runsList.scrollTop = keep;
+      return;
+    }
+    var runs = runsDetails;
+    if (!runs.length) {
+      var empty = document.createElement('div');
+      empty.className = 'rp-empty';
+      empty.textContent = '没有本会话的运行记录。跑一轮后回来看。';
+      runsList.appendChild(empty);
+      runsPanelSub.textContent = '';
+      runsPanelNote.textContent = '';
+      runsList.scrollTop = keep;
+      return;
+    }
+    for (var i = 0; i < runs.length; i++) {
+      runsList.appendChild(buildRunNode(runs[i]));
+    }
+    runsPanelSub.textContent = '共 ' + runs.length + ' 轮';
+    runsPanelNote.textContent = '只在内存里，重载窗口即清空 · 只保留最近 20 轮';
+    runsList.scrollTop = keep;
+  }
+
+  /** 一轮 → DOM 子树。全部 createElement/textContent。 */
+  function buildRunNode(r) {
+    var box = document.createElement('div');
+    box.className = 'ri-run';
+
+    var head = document.createElement('div');
+    head.className = 'ri-run-head';
+    var title = document.createElement('span');
+    title.className = 'ri-run-title';
+    title.textContent = runLine(r);
+    head.appendChild(title);
+    if (r.truncated) {
+      var trunc = document.createElement('span');
+      trunc.className = 'ri-badge';
+      trunc.textContent = '已截断';
+      head.appendChild(trunc);
+    }
+    var badge = document.createElement('span');
+    badge.className = 'ri-badge ' + r.outcome;
+    badge.textContent = RUN_OUTCOME_LABEL[r.outcome] || r.outcome;
+    head.appendChild(badge);
+    box.appendChild(head);
+
+    // 本轮错误（扩展只写一条，见 runInspector.endRun 的单写者约定）
+    for (var e = 0; e < (r.errors || []).length; e++) {
+      var err = document.createElement('div');
+      err.className = 'ri-err';
+      err.textContent = '错误：' + r.errors[e].message;
+      box.appendChild(err);
+    }
+    if (r.errorsDropped > 0) {
+      var more = document.createElement('div');
+      more.className = 'ri-note';
+      more.textContent = '另有 ' + r.errorsDropped + ' 条错误未记录';
+      box.appendChild(more);
+    }
+
+    // 工具按 step 分组：DSH 一步一次模型调用（可能带一次工具），步是天然的分节线
+    var byStep = {};
+    var order = [];
+    for (var t = 0; t < (r.tools || []).length; t++) {
+      var tool = r.tools[t];
+      var k = String(tool.step);
+      if (!byStep[k]) {
+        byStep[k] = [];
+        order.push(tool.step);
+      }
+      byStep[k].push(tool);
+    }
+    order.sort(function (a, b) {
+      return a - b;
+    });
+    var stepMap = {};
+    for (var s = 0; s < (r.steps || []).length; s++) stepMap[String(r.steps[s].step)] = r.steps[s];
+
+    for (var oi = 0; oi < order.length; oi++) {
+      var stepNo = order[oi];
+      var st = stepMap[String(stepNo)];
+      var stepRow = document.createElement('div');
+      stepRow.className = 'ri-step';
+      stepRow.textContent = '步骤 ' + stepNo + ' · ' + (st ? fmtDuration(st.durationMs) : '—');
+      box.appendChild(stepRow);
+      var rows = byStep[String(stepNo)];
+      for (var ri = 0; ri < rows.length; ri++) {
+        box.appendChild(buildToolNode(rows[ri]));
+      }
+    }
+    // 一步工具都没有的步（纯模型步）也要露出来 —— 它往往正是最慢的那一步
+    var stepOnly = [];
+    for (var s2 = 0; s2 < (r.steps || []).length; s2++) {
+      if (!byStep[String(r.steps[s2].step)]) stepOnly.push(r.steps[s2]);
+    }
+    if (stepOnly.length) {
+      var many = stepOnly.length > 1;
+      var note = document.createElement('div');
+      note.className = 'ri-note';
+      note.textContent = many
+        ? '另有 ' + stepOnly.length + ' 个不含工具调用的步骤（模型思考，耗时 ' +
+          stepOnly.map(function (x) { return fmtDuration(x.durationMs); }).join(' / ') + '）'
+        : '另有 1 个不含工具调用的步骤（模型思考，耗时 ' + fmtDuration(stepOnly[0].durationMs) + '）';
+      box.appendChild(note);
+    }
+    if (r.toolsDropped > 0) {
+      var dropNote = document.createElement('div');
+      dropNote.className = 'ri-note';
+      dropNote.textContent = '另有 ' + r.toolsDropped + ' 次工具调用未记录（每轮上限 100 条）';
+      box.appendChild(dropNote);
+    }
+    if (r.stepsDropped > 0) {
+      var dropStep = document.createElement('div');
+      dropStep.className = 'ri-note';
+      dropStep.textContent = '另有 ' + r.stepsDropped + ' 个步骤未记录';
+      box.appendChild(dropStep);
+    }
+    // 配对键失效的探针：正常恒为 0，非 0 就是我们的 bug，明说而不是装作没发生
+    if (r.unmatched > 0) {
+      var un = document.createElement('div');
+      un.className = 'ri-note';
+      un.textContent = '有 ' + r.unmatched + ' 条工具结果没配上调用（配对键失效）';
+      box.appendChild(un);
+    }
+    return box;
+  }
+
+  /** 一条工具调用行。 */
+  function buildToolNode(t) {
+    var row = document.createElement('div');
+    row.className = 'ri-tool ' + t.state;
+
+    var idx = document.createElement('span');
+    idx.className = 'ri-tool-index';
+    idx.textContent = String(t.index);
+
+    var name = document.createElement('span');
+    name.className = 'ri-tool-name';
+    name.textContent = t.name;
+
+    var time = document.createElement('span');
+    time.className = 'ri-tool-time';
+    time.textContent = fmtDuration(t.durationMs);
+
+    var state = document.createElement('span');
+    state.className = 'ri-tool-state';
+    // 「未知」是刻意的第四态：收尾时还没有结果 —— 可能跑了可能没跑，绝不折成「失败」（那是谎报）
+    state.textContent = RUN_TOOL_LABEL[t.state] || t.state;
+
+    row.appendChild(idx);
+    row.appendChild(name);
+    row.appendChild(time);
+    row.appendChild(state);
+    return row;
   }
 
   /**
@@ -1865,6 +2185,15 @@
     reviewPanelRevertAll.addEventListener('click', function () {
       post({ type: 'review-revert-all' });
     });
+
+    // ---- C9 运行检查器：条 / 浮层面板 ----
+    runsViewBtn.addEventListener('click', function () {
+      if (runsPanelOpen) closeRunsPanel();
+      else openRunsPanel();
+    });
+    runsPanelClose.addEventListener('click', function () {
+      closeRunsPanel();
+    });
     // Esc 收起浮层：审阅面板优先，否则历史面板。自带 Esc 的输入框（标题/历史搜索/自定义模型）
     // 各自处理并回焦，全局监听不抢（否则会二次触发）。
     document.addEventListener('keydown', function (e) {
@@ -1880,6 +2209,11 @@
       }
       if (reviewPanelOpen) {
         closeReviewPanel();
+        return;
+      }
+      if (runsPanelOpen) {
+        // C9：运行检查器浮层 —— 审阅面板之后、历史面板之前（层次顺序与 z-index 一致）
+        closeRunsPanel();
         return;
       }
       if (isHistoryOpen()) closeHistoryPanel();
@@ -1899,7 +2233,10 @@
       type === 'tool-start' || type === 'tool-result' ||
       type === 'note-message';
     var reactOnly = type === 'dsh-event' || type === 'dsh-replay';
-    if (type && !reactOnly && !(isReactLive() && domOnly)) {
+    // C9：runs 每收一条**被记录的**帧就发一次（一轮里几十条，C3a 的 usage 亦然），而它的结果
+    // 就摆在屏幕上那条里 —— 打进控制台只会把别的痕迹淹掉。要看实时读数就盯条本身。
+    var quiet = type === 'runs';
+    if (type && !reactOnly && !quiet && !(isReactLive() && domOnly)) {
       console.log('[chat.js] 收到消息 →', type);
     }
     switch (data.type) {
@@ -1926,6 +2263,12 @@
         // 免得带着上个会话的数字留在条上。
         usageState = data.usage || null;
         renderUsageBar();
+        // C9：运行读数随快照整帧重放。**并收起浮层** —— 面板内容是会话级的，
+        // 跨会话残留一份别人的时间线就是谎报（切回来时再点开即可，记录还在环里）。
+        runsState = data.runs || null;
+        runsDetails = null;
+        closeRunsPanel();
+        renderRunsBar();
         // react-live：把最新整幅消息中继给真 ChatView 作回放前缀（重建/切会话/清空/删除）。
         // 扩展不再直发 dsh-replay——快照可能早于 React 挂载，统一由此处按较晚者补发。
         lastSnapshotMessages = data.messages;
@@ -1936,6 +2279,15 @@
         // C3a：每个 usage 样本一条 + 轮尾定稿一条，整条重绘（数据由扩展算好，这里只格式化）。
         usageState = data.usage || null;
         renderUsageBar();
+        break;
+
+      case 'runs':
+        // C9：每条**被记录的**帧一条（chunk 帧一条都不发，这是全部的体积故事）。
+        // `details` 只在浮层开着时才有 —— 没带就别拿新的把旧的冲掉，否则每收一帧详情就空一次。
+        runsState = data.readout || null;
+        if (data.details) runsDetails = data.details;
+        renderRunsBar();
+        if (runsPanelOpen) renderRunsPanel();
         break;
 
       case 'history-update':

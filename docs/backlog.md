@@ -18,8 +18,8 @@
 | C6 | 会话全文检索 + 导出 + 软删除 | P1 | 无。**已实现、自检 47/47、构建冒烟无回归；F5 真机七项全过**（2026-09-14，含回收站跨重启）—— 逐条见正文 | [x] |
 | C7 | 删除即彻底 + 回收站留存（原「转写敏感内容治理」，**脱敏/加密已砍**） | P1 | 无。**已实现、自检 20/20、C6 自检 47/47 无回归；F5 真机八项全过**（2026-09-15）—— 逐条见正文 | [x] |
 | C8 | 运行可靠性：中断续跑 + 超时幂等（原「/ 重试 / 大转写分片」，收窄，见正文） | P1 | 受「无 cancel RPC」限制。**已实现、自检全绿；F5 真机全过**（2026-09-17，用户确认） | [x] |
-| C8c | 存储层写入：`persist()` 原子写 / 写入成本 / `toolInput` 上限（从 C8 ③ 拆出） | P1 | 无 | [ ] |
-| C9 | Run inspector（本轮帧时间线/耗时/工具统计） | P1 | 无（现有帧已够） | [ ] |
+| C8c | 存储层写入：`persist()` 原子写 / 写入成本 / `toolInput` 上限（从 C8 ③ 拆出） | P1 | 无。**已实现、自检 64/64 + 真实数据往返无回归；F5 待办** —— 实测推翻了「`toolInput` 无上限导致增长」与「需要写入防抖」两条预设，分片/异步/防抖按实测不做，见正文 | [ ] |
+| C9 | Run inspector（本轮帧时间线/耗时/工具统计） | P1 | 无（现有帧已够）。**已实现、自检 26/26 + DOM 影子自检、四项探针无回归；F5 待办** —— 耗时全靠信封自带 `time` 相减（零计时器），体积故事 = 丢弃 819/823 条 chunk，见正文 | [ ] |
 | C10 | 上下文窗口指示 + 超限压缩/归档 | P1 | 数据前置已解（C3a 已透出窗口/占用）；压缩动作本身待做 | [ ] |
 | C11 | 会话级推理档位（reasoningEffort） | P1 | **受限**：wire 下发不了，需 runtime 先支持 | [ ] |
 | C12 | 项目级 agent profile（工具白名单/默认模型/审批策略） | P1 | 与 C1 同源 | [ ] |
@@ -76,6 +76,7 @@
   两种都不过才是真接不上，此时**干净地不启用**：丢掉派生配置（不往用户 DSH 里塞一条跑不起来的 hook）、清掉 `_approval`,
   让下次 spawn 重试（冷启动失败是暂时的，热了会自愈；弹窗有 `_approvalWarned` 兜着不刷屏）。
   同时 `testApprovalHook` 的失败话术改成**同时带 stdout 与 stderr**（两边都空则明说），别再把可诊断性丢掉。
+  **真机确认（2026-09-17，用户）**：重载窗口后那条弹窗**不再出现** —— 修的是线上实际发生的那条路径，不是只让自检变绿。
 - **自检**：[`scripts/probe-approval-shell.mjs`](../scripts/probe-approval-shell.mjs) —— 用真实的 `probeShell()` + 真实生成物
   跑两种形态，钉住三个前提：至少一种能过（否则确实该弹窗）、两种互斥（所以判据无歧义）、首猜猜错时另一种能救回来；
   外加四条失败话术断言（带 stdout / 带 stderr / 两边都空要明说 / stdout 有内容却 exit 0 不能算通过）。
@@ -375,16 +376,92 @@ if (!this._abort || !this._reviewChangesOn()) return;  // 对
   - **两边的「中断」措辞不同**：DSH 记忆里是补平的 interrupted turn（含 `TOOL_OUTCOME_UNKNOWN` 结果），我们的转写里是一条 `status:'interrupted'` 的助手消息 + 一行 note —— 别指望逐字对齐。
   - **停止 = 杀进程**这条底层约束没变（wire 无 cancel）；本项只是把它做得**可见、可续、可解释**。
 
-### C8c · 存储层写入：`persist()` 原子写 + 写入成本
+### C8c · 存储层写入：`persist()` 原子写 + 写入成本（2026-09-17 完成，F5 待办）
 - **来源**：C8 收窄时从 ③ 拆出来（原话「大转写改增量写或分片」），并接住 C7 交接的两条：`persist()` **非原子**（C7 之后盘上那份是删除后的唯一副本）、**每轮同步全量覆盖写**且 `toolInput` 无长度上限 ⇒ 文件随使用单调增长、轮尾同步写耗时渐增（垃圾回收只是回收了空间，没省下每轮那次全量写）。
-- **补法（待定，先把范围钉住）**：`persist()` 改 tmp + rename；写入防抖 / 异步 / 分片；`toolInput` 长度上限。
-- **已知约束**：⚠️ 别顺手把探针的 `process.exit()` 也当成本项的一部分改掉 —— 那个已经单独修了（见下）。
-- **顺带修掉的（与本项相邻、已随手处理）**：`scripts/smoke-runtime.mjs` 与 `scripts/probe-c8-runtime.mjs` 结尾的 `process.exit(...)` → `process.exitCode = ...`。原因：Windows 上被重定向/管道的 stdout 是**异步**写，`process.exit()` 会把还没冲出去的**结论行整段丢掉** —— 表现为「只打印了前半段、退出码却是 0」，一份会吞掉自己结论的报告比不跑还坏（本轮 `smoke-runtime` 就是这么被发现的：exit=0 但只有第一行）。
+- **开工前先实测，推翻了上面两条预设的一半** —— 量的是本机真实数据（`sessions-harness.json`，20 会话 / 457 条消息 / 用了 9 天，366,242 字符 ≈ 427 KB）：
 
-### C9 · Run inspector
-- **现状**：调试只有 `hello.dsh.debug` 往输出通道打 stderr，用户看不到本轮发生了什么。
-- **补法**：本轮帧已在 `_onDshEvent` 流过 → 留一份 per-turn 事件时间线（类型/耗时/工具次数/错误），面板展示。
-- **验收**：每轮结束后可查看本轮工具调用序列与耗时。
+  | 项 | 实测 | 上面那句预设 |
+  |---|---|---|
+  | **`toolOutput`** | **占 50.4%** | （没提，它才是大头） |
+  | `toolInput` | 占 14.0%，**没有一条超过 3000 字符** | 「无长度上限 ⇒ 文件单调增长」—— **不成立** |
+  | 其它字段 | 其他 21.2% / assistant 12.0% / user 1.2% / note 0.7% / 附件 0.5% | — |
+  | `usage` | 599 字符（全 20 会话合计） | — |
+  | 一次全量写 | `stringify` **0.93 ms**（紧凑格式 0.81 ms，只省 9.9%）+ 写盘 ⇒ 约 **2–3 ms/轮**；数据 ×10 也才 9.47 ms | 「轮尾同步写耗时渐增」—— 量级远够不上问题 |
+
+  1. **「`toolInput` 无上限导致增长」在真实数据上不成立** —— write/edit 带整份文件正文那件事一次都没发生过（225 条 tool 消息，平均 `toolOutput` 733 字符、最大 4012）。上限照做，但定位改成**病态输入的保险丝**，不是成本优化。
+  2. **「写入防抖」是个空招**：`persist()` 只在轮尾（`_afterTurn`）与 9 处用户动作时调用，**轮中一个字节都不写** —— 没有高频写入可合并。
+- **拍板（2026-09-17，用户）**：**只做「不丢数据」这层**。分片 / 异步写 / 防抖**一律不做**，重启条件是「文件长到十 MB 级再评估」。
+- **补法**：
+  - [src/sessionStore.ts](../src/sessionStore.ts)：`persist()` 改**原子写**（`<file>.<12hex>.tmp` → 尽力 fsync → 滚动备份 → rename 盖主文件，rename 对瞬时 `EPERM/EACCES/EBUSY` 退避重试 3 次）；`_load()` 改**三级回退**（主文件 → `<file>.bak` → 空）并给出 `LoadReport { source, reason, detail }`。新增 `capToolInput()` / `MAX_TOOL_INPUT_CHARS = 20000`、`STALE_TMP_MS`、构造末尾一次性的陈旧 `.tmp` 清扫。
+    - 顺序即设计：**备份必须在 rename 之前滚** —— 写后再复制，`.bak` 就恒等于当前，坏内容会被立刻镜像进去，等于没有备份。备份自己也走 tmp + rename（`copyFileSync` 是「打开即截断」，半路 ENOSPC 会把上一份**好备份**毁成半截）。
+    - ⚠️ **`_holdBackup` 是全案最容易写错、也最值钱的一处**：主文件损坏、回退成功后，盘上主文件仍是坏字节；此时若下次 `persist()` 照常「copy main → bak」，就把**唯一那份好数据**覆盖成坏字节 —— 备份在最需要它的那一刻自杀。对策：加载期置位，**写成功之后**才清。
+    - ⚠️ **`reason: 'missing'` 与 `'corrupt'` 必须分开** —— 前者是首次运行（文件还没建），报给用户就是误报，而误报会让真正的损坏告警被当噪音忽略。这是唯一能区分二者的判据。
+    - ⚠️ 回退判据**到此为止**：不要因为「主文件 0 条、备份 40 条」就回退 —— 用户把会话全删光是合法状态，那样等于把删掉的东西复活。
+    - 扫 `.tmp` 两道闸缺一不可：**只扫自己文件名前缀**（chat store 永不碰 harness store 的）、**只扫够老的**（> 1 h —— 新鲜的可能正是**另一个 VS Code 窗口**在写的，删了就是把别人的原子写打断在半路）。
+    - `normalize()` 与那两条 filter **一字未改**（含「只按 messages 过滤、绝不补 `!s.deletedAt`」的注释）；`persist()` 签名与 10 个调用点**一行未动**。
+  - [src/chatViewProvider.ts](../src/chatViewProvider.ts)：保险丝接在**消息产生处**（`tool/call` 分支 `toolInput: capToolInput(prettyValue(d.arguments))`）—— 内存 / webview / 盘上 / 导出 / 检索读到的才是同一串字符（放存储层会让内存留全文 ⇒「同一个工具卡，重载窗口前后显示不一样」这种难复现的 bug）；新增 `_storageWarn()` / `_checkStorageHealth()`，照 `_approvalWarn` 的体例但**用独立旗标**（共用会让先到的告警吞掉后到的），挂在 `case 'ready'`（那时面板已开、弹窗有人看），`source === 'file'` 或 `reason === 'missing'` 一律跳过。
+  - [scripts/probe-session-tools.mjs](../scripts/probe-session-tools.mjs)：⚠️ **`scratchStore()` 必须同步改** —— 它从前只删主文件，「主文件不存在」等于「没有历史」；有了 `.bak` 之后构造会回退备份、把上一条用例的数据读回来，**一整片用例连环假失败**。改成清 `FILE` + `FILE.*`（一把罩住 `.bak` / `<hex>.tmp` / `bak.<hex>.tmp`）。新增「C8c 落盘加固」一节 17 条断言。
+  - [src/sessionSearch.ts](../src/sessionSearch.ts)：**只改注释** —— 它写着「`toolInput` 没有任何长度上限」，加熔断后不再成立；`SEARCH_TOOL_INPUT_CHARS = 400` 的理由换成「前 400 字符覆盖 bash 命令原文与路径参数，够了」，并说明它与 2 万那条**不重叠、也不是一回事**（真实数据里入参中位数才几百字符，2 万几乎永不触发）。
+- **自检（全绿）**：
+  - `scripts/probe-session-tools.mjs` **64/64**（原 47 + 新增 17）；其中两条是本次的核心回归闸门：**★ `.bak` 恒为上一代**、**★★ 从备份回退之后第一次 `persist` 不许把备份冲掉**。
+  - 不回归：`probe-purge.mjs` **20/20**、`probe-turn-state.mjs` **13/13**、`probe-approval-shell.mjs` **7/7**。
+  - 静态守卫：`grep "import \* as vscode" src/sessionStore.ts` 无输出。
+  - 真实数据往返（一次性脚本，跑在用户 globalStorage 的**副本**上）：`sessions-harness.json` 20 条、`sessions.json` 6 条，`persist()` 后**逐字节等于原文件**、无 `.tmp` 残留；把主文件截成半截重开 → 回退到备份、条数一致、主文件写回完整内容、且那份好备份**没被冲掉**。
+  - ⚠️ 途中一条自己写错的断言：拿「刚好超限 1 个字符」当有界性的证据 —— 那时结果反而**更长**（标记本身要占字）。保险丝要挡的是几 MB 的病态输入，不是省那几个字节；断言已改成量「上限 + 标记」的封顶。
+- **只能真机 F5 盖住**（盯盘上留痕，别盯界面元素 —— C4 的教训）：① 跑一轮后主文件在、同目录**无 `.tmp`**；再发一条消息 → `.bak` 出现且内容是**上一代**。② 手工把主文件截成半截 → 重载 → 历史**回来了**、**只弹一条**告警、console 有 `[storage]` 细节；再重载**不再弹**。③ 删掉 `.bak` 再把主文件写坏 → 重载 → 列表空 + 「没有可用备份」那条；**干净 profile 首次运行绝不能弹**。④ 正常一轮：工具卡显示、重启回放、Markdown/JSON 导出与检索均无变化。
+  - **部分真机确认（2026-09-17，用户 F5 + 盘上核对）**：①**通过** —— `sessions-harness.json` 与 `.bak` 都在、同为 20 条合法数组、**两者 md5 不同**（备份确实是上一代，不是「写后复制」的镜像，那会完全相同）、标题序列一致而 `updatedAt` 不同、同目录**无 `.tmp`**；且整轮日志里**没有任何 `[storage]` 行**，即正常加载路径不误报。② ③ ④ 的异常路径**尚未验**。同一份日志还顺带印证 `[approval] 事前审批已就绪（shell=wsl，hook 自检通过）`。
+  - ⚠️ **核盘时差点误判**：`.bak` 的 mtime 比主文件早，看着像「这次没滚动」。实测原因是 `copyFileSync`（Windows `CopyFileW`）**会连时间戳一起复制**，所以 `.bak` 的 mtime 恰好是它那份内容当初被写下的时间。**别拿 mtime 判断有没有滚过**，比对内容/md5 才算数（已把这条写进 `_rollBackup` 的注释）。
+- **本次不做**：按会话分片、异步写、写入防抖（按实测否掉）；不碰审阅快照（本就不落盘）、DSH 会话日志、C6 检索与 C7 删除的语义；不动 `persist()` 签名与 10 个调用点、不动 `normalize()`、**不回改盘上已有的超长 `toolInput`**；不加 `.corrupt` 留档文件；**不给 `persist()` 失败加弹窗**（轮尾高频，会成告警风暴）。
+- **已知局限**：
+  - **优雅写盘不是事务**：rename 保证「要么旧的完整、要么新的完整」，但崩溃丢失的是**本轮开始以来尚未落盘的那部分**（现状本来如此，本次不改变）。
+  - **双窗口并存时告警可能假阳性一次**：两个扩展宿主共写一个 globalStorage，另一个窗口 `writeFileSync` 截断的瞬间被读到会判成 `corrupt` 并去回退备份。随机 tmp 名 + rename 让这个窗口比从前小得多，但没消除；console 里留足细节以便排查。
+  - **磁盘占用翻倍**：一份 `.bak`（现在 427 K → 854 K），可忽略。
+  - **`persist()` 失败仍只有 console 可见**（既有行为，本次刻意不动）。
+- **顺带修掉的（与本项相邻、已随手处理，不属于本项范围）**：`scripts/smoke-runtime.mjs` 与 `scripts/probe-c8-runtime.mjs` 结尾的 `process.exit(...)` → `process.exitCode = ...`。原因：Windows 上被重定向/管道的 stdout 是**异步**写，`process.exit()` 会把还没冲出去的**结论行整段丢掉** —— 表现为「只打印了前半段、退出码却是 0」，一份会吞掉自己结论的报告比不跑还坏（本轮 `smoke-runtime` 就是这么被发现的：exit=0 但只有第一行）。
+
+### C9 · Run inspector（2026-09-17 完成，F5 待办）
+- **原文验收**：每轮结束后可查看本轮工具调用序列与耗时。
+- **缺口**：调试 DSH 直播只有 `hello.dsh.debug` 往输出通道打 stderr 原始帧 —— 用户看不到「这一轮到底跑了什么、慢在哪、哪次工具失败了」。
+- **关键发现（本项成立的前提）：数据本来就在流里，一个计时器都不用加。** 每个 `session.event` 信封都带 `seq` 与 `time`（epoch ms，与 `Date.now()` 同一口钟，见 [src/dshRuntime.ts](../src/dshRuntime.ts) 的 `DshEventFrame`），此前一个字都没读过。耗时 = 两个信封的 `time` 相减。
+- **用户拍板（2026-09-17）**：① **纯内存**，只留最近 20 轮（不落盘、不动 `StoredSession`）；② **composer 摘要条 + 点开全屏浮层**；③ **以工具为中心 + 轮/步耗时**。
+- **实测锚点**（`logs/dsh-frames/frames-2026-09-08T04-17-26-078Z.jsonl`，抓帧文件是 JSON-RPC 外层包装：首行是握手响应，会话 id 在 `params.sessionId`、帧在 `params.event`）：
+
+  | 帧类型 | 条数 | 记不记 |
+  |---|---|---|
+  | `assistant/chunk` | **819** | ✗ |
+  | `step/start` / `step/end` | 5 / 5 | ✓ |
+  | `tool/call` / `tool/result` | 4 / 4 | ✓ |
+  | `turn/start` / `turn/end` | 1 / 1 | ✓ |
+  | `user/message` / `request/header` / `session/title` / `agent/inbox/spliced` | 1/1/1/2 | ✗ |
+
+  这一份：1 轮 / 4 工具 / 5 步 / 轮耗时 **11226 ms** / 工具 1 = **2610 ms** / 步 1 = **5229 ms** / 步 5（无工具）= **1433 ms** / 配对失败 0 条。
+  → **丢弃 `assistant/chunk` 就是全部的体积故事**（819/823 帧）；而**步与工具不冗余**（步 = 模型延迟 + 工具延迟），所以两样都留。
+- **补法**：
+  - [src/runInspector.ts](../src/runInspector.ts)（新，**纯模块**：零 import，连 `dshRuntime` 都不 import，入参是结构型的 `RunFrameLike` —— 自检要在扩展宿主之外加载编译产物，同 `turnState.ts` 的理由）。三条写进文件头的约束：① **只留时间线，不留正文**（chunk 不入账，**工具入参也不留** —— 消息卡里那份已过 `capToolInput`，这里再存一份既是双份内存又是绕过保险丝的新路）；② **判据只此一处**（配对键与「这次工具算不算失败」由本模块导出，provider 改成调用它们）；③ **有界**（一个全局环 + 读取时过滤，**不建 `Map<sessionId, ring>`**，那会随「开过的会话数」无界增长；文件头点名 `_afterTurn()`，防后人「顺手」持久化）。
+    - 帧 → 记录：`turn/start`（建轮 + `startedAt`）/ `step/start` / `step/end` / `tool/call`（推 `running` 行）/ `tool/result`（配对收尾）/ `turn/end`（`reasonKind` 原样留档 + 临时终态），**其余一律 `return false`**。
+    - 配对：① 键相同且仍 `running` 的**最后一行**（实测 100% 命中）→ ② 否则最后一条 `running` 行 → ③ 否则 `unmatched++`（不建行、不报错）。①②分开是为了让「键没对上」这件事能被 `unmatched` 看见 —— provider 原有的兜底把它静默盖掉了。
+    - 轮的键是**三路** `(uiSessionId, dshSessionId, turn)`：DSH 身份丢失后新会话的 turn 会从 1 重数，两路键会撞。`RunRecord.id` 是我们自己的单调序号，**列表主键用它而不是 wire 的 turn**。
+  - [src/chatViewProvider.ts](../src/chatViewProvider.ts)：帧咽喉一处接线 `if (this._runs.apply(frame, this._active.id)) this._postRuns();`，插在 switch **之前** —— 一处咽喉，六个 case 一个不用改，将来新加 case 也不会「忘了记一笔」；⚠️ **不插在 `_liveRunning` 闸之前**（闸内丢的帧本就不属于这一轮，为记个时间戳去放宽它等于 re opening C8 ② 修掉的 bug）。`_finishTurn` / `_surfaceLiveError` / `_runLive` 的 `finally` 三处收尾各一行 `endRun`。`_toolKey` 与 `tool/result` 的 `failed` 计算改成委托模块导出的两个函数（行为不变的重构，消掉「转写里是红卡、检查器里是绿行」）。
+  - [src/protocol.ts](../src/protocol.ts)：`runs {readout, details?}` / `snapshot` 加可选 `runs` / `run-panel {open}`。`details` **只在浮层开着时**才随帧下发（详情是 O(轮数 × 工具数)，每收一帧都发等于把最近 20 轮的工具表反复推给前端）。
+  - `media/chat.{html,js,css}`：条挂在 **composer 内**（同 review-bar / usage-bar 的道理：react-live 只藏 `#messages`）；浮层是 body 直系元素并**复用 `.review-panel` / `.rp-*` 整套配方**（同一种「铺满视口、`.open` 展开」的浮层，复制一份 CSS 只会让两处将来各自漂移）。两处必须做对：**重绘要保 `scrollTop`**（这个面板在一轮里每收一帧就重绘一次，朴素重渲染会把滚动位置每秒打回顶部好几次 —— `renderReviewList` 只在离散变化时重绘，别照抄它这个省略）；**与审阅浮层互斥**（两个 `z-index:40` 的满屏浮层没有视觉仲裁）。
+- **⚠️ 调研中改掉的一条自相矛盾**：方案里那张终态优先级表写着「wire `completed` + 用户在此之前按了停止 → `completed`」，但同一张表的 `interrupted` 秩比 `completed` 高，实际行为是 **`interrupted` 赢**。**保留后者**：它与转写里那条气泡同一口径（`_finishTurn('interrupted')` → `_finalizeOpenAssistant`），面板说「已完成」而气泡说「已中断」是更坏的结果。秩表：`running` 0 < `completed` 1 < `aborted`/`interrupted` 2 < `error` 3，`endRun` **只在严格更大时**覆盖；`reasonKind` 无条件留原值 ⇒ 徽章看着不对时永远可诊断。
+- **单写者约定**：`turn/end` 那条 case **只记 `reasonKind` + 临时终态，绝不写 error 条目** —— 非白名单 kind 会走 `_surfaceLiveError`，两边都写就是每条错误显示两遍。唯一的 error 条目来自 `endRun('error', msg)`；`_errorClaimed` 旗标让重复调用安全，同时保留「一轮都没开始就出错」（spawn / prompt 回执失败）时的合成记录。
+- **自检**：
+  - [scripts/probe-run-inspector.mjs](../scripts/probe-run-inspector.mjs)（新，零依赖零 key）**26/26 通过**，五块：计时 / 帧过滤 / 配对 / 终态 / 有界·过滤·垃圾。
+    - 载荷最重的两条：**灌 5000 条 `assistant/chunk` → 每次 `apply` 都 `false` 且记录逐字节不变**（把「819 条 chunk」这件事编码进断言）；**150 call + 150 result → 留 100 行、`toolsDropped === 50`、`unmatched === 50`**（被丢掉的 call 的 result 绝不许去关留存的行）。
+    - **真帧回放（最值钱的一条）**：把最新那份抓帧喂进 `RunInspector`，**同时**用一条独立的、直接从原始 JSON 重算 per-(turn,step) min/max 的直算式 oracle 对拍（轮数/每条工具耗时/每步耗时/轮耗时全等）—— 用**另一条代码路径**验状态机，而不是硬编码一个数字。`logs/` 是 gitignored，缺失时打一行醒目的跳过提示（不把「没跑到」当「验过了」）。
+  - **探针抓到的两个真 bug**（这就是 oracle 存在的理由）：① `step/start` 与 `step/end` 各 `stepsDropped++` 一次 → 同一个步被数两遍（50 报成 100），改成 `Map<step, Set<stepNo>>` 去重；② 我自己的 oracle 里一个**缺花括号的 dangling-else** 让后续分支全绑到了内层 `if` 上，`res`/`steps` 永远空 —— **实现是对的，测试是错的**。
+  - 不回归：`probe-session-tools` **64/64**、`probe-purge` **20/20**、`probe-turn-state` **13/13**、`probe-approval-shell` **7/7**。
+  - 静态守卫：`grep "import \* as vscode" src/runInspector.ts` 无输出；`media/chat.js` 里 `innerHTML` 的 2 处命中**全是注释**（真实使用 0）。
+  - **DOM 影子自检（一次性脚本，跑在 `logs/`，不入库）**：用最小 DOM 影子把 `media/chat.js` 载进 Node（加载期依赖只有 `acquireVsCodeApi()` 与 `window.addEventListener('message')` 两处），喂 C9 消息断言文案/结构/状态类/scrollTop/浮层互斥 —— F5 之前唯一能跑通那 ~150 行 DOM 代码的路子。**它抓到一个真 bug**：`runLine` 同时喂 `RunSummary`（条上有 `toolCount`）与完整 `RunRecord`（**没有**那个字段，只有 `tools` 数组）⇒ 浮层头把 4 工具的轮写成「**无工具调用**」。修法是 `runCounts()` 按形状取数，**派生口径与扩展侧 `_summary()` 逐字一致**（`tools.length + toolsDropped`），否则同一条记录在条上和浮层里会给出两个数。
+- **只能真机 F5 盖住**（9 条清单见方案）：① 4 工具轮 → 条与面板的数字量级对上抓帧锚点；② 跑动中手动下滚，位置不被打回顶部；③ 停止 → 未回结果的工具行是「**未知（无结果）**」而**不是**「失败」（刻意的第四态，绝不折成 error —— 那是谎报）；④ 制造一次出错 → 错误原文**只显示一条**（不是两遍）；⑤ 切会话条回「本轮尚无」、切回来那一轮还在；⑥ 重载窗口清空（**这是决策不是 bug**）；⑦ react-live 画面下条与浮层都可见；⑧ 内嵌聊天整条隐藏、两个浮层不会同时开着；⑨ C8c/C8/C3a 抽查。
+- **本次不做**：不落盘（不碰 `persistedSession` / `_afterTurn`）；不记 `assistant/chunk` 与工具入参/输出正文；不做跨会话的历史运行记录；不做导出；不加速度计时器/折线图；不放宽 `_liveRunning` 闸去抓「轮外帧」。
+- **已知局限**：
+  - **只记轮内帧**：连接期、被杀进程的迟到帧一律不入账 —— 这是 C8 ② 的正确行为，不是缺口。
+  - **不跨会话、不跨窗口重载**：纯内存的直接代价（切会话即看不到，故意的）。
+  - **fork 出来的会话运行记录是空的**（`_forkSession` 给了新 UI id）。刻意如此：`usage` 是累计账（显示 0 像 bug），运行记录是「这段对话刚跑过什么」，而 fork 还没跑过。
+  - **单次长工具调用期间条上耗时是停住的** —— 全仓零 `setInterval` 是成文惯例，不为一个装饰性秒数开口。
+  - **同轮工具超 100 次、步超 100** 只留前 100，但计数继续涨、面板明说「另有 N 次未记录」（上限是为了在跑飞时不冻住面板）。此时浮层头的派生计数只是**下限**（被丢掉的调用没有状态可数），差额由那一行说清。
 
 ### C10 · 上下文窗口指示 + 超限压缩/归档
 - **现状**：无窗口占用感知，长对话无策略。
