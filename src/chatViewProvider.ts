@@ -17,7 +17,13 @@ import {
   WebviewToExt,
 } from './protocol';
 import { ApprovalAsk, ApprovalOutcome, ApprovalServer, matchesAnyPattern } from './approvalServer';
-import { ApprovalHookFiles, probeShell, testApprovalHook, writeApprovalHookFiles } from './dshHooks';
+import {
+  ApprovalHookFiles,
+  probeShell,
+  ShellKind,
+  testApprovalHook,
+  writeApprovalHookFiles,
+} from './dshHooks';
 import { isAbortError, streamMockReply } from './mockAssistant';
 import {
   dshStillReferenced,
@@ -1906,40 +1912,67 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    // hook 由 DSH 用 `bash -c` 跑，而 bash 可能是 WSL 也可能是 Git Bash —— 路径形态完全不同，
-    // 必须先探出来（同一台机器上两种都见过）。
+    // hook 由 DSH 用 `bash -c` 跑，而 bash 既可能是 WSL 也可能是 Git Bash —— 命令里的路径形态
+    // 完全不同（WSL 下 `D:\…\node.exe` 连可执行文件都算不上，直接 command not found）。
+    // probeShell 只是**首猜**：它只采一次样、超时就回落 posix，而 VS Code 重载那一刻恰恰是
+    // WSL 最冷的时候 —— 猜错的代价是审批静默失效。所以真正的判据是**自检本身**：首猜不过就
+    // 换另一种形态再跑一遍自检，哪个跑得通用哪个。两种形态互斥（A 形态的命令在 B 里必然
+    // command not found），所以「谁过」是无歧义的。
     const runCwd = this._dshRunCwd();
-    const shellKind = await probeShell(runCwd);
+    const guess = await probeShell(runCwd);
+    const order: ShellKind[] = guess === 'wsl' ? ['wsl', 'posix'] : ['posix', 'wsl'];
 
-    try {
-      const timeoutMs = this._approvalTimeoutMs();
-      const files = writeApprovalHookFiles({
-        storageDir: this._storageDir,
-        nodePath,
-        shellKind,
-        url: server.url,
-        token: server.token,
-        // 三层超时梯度：扩展先放弃并拒绝(540) < 脚本 socket 放弃(560) < DSH 杀 hook(580)
-        scriptTimeoutMs: timeoutMs + 20000,
-        hookTimeoutSec: Math.ceil((timeoutMs + 40000) / 1000),
-        baseConfigPath: this._baseConfigPathAbs(),
-      });
-      this._approval = server;
-      this._approvalFiles = files;
-    } catch (err) {
-      server.dispose();
-      this._approvalWarn(`审批 hook 生成失败：${err instanceof Error ? err.message : String(err)}`);
-      return;
+    let failure = '';
+    for (const shellKind of order) {
+      let files: ApprovalHookFiles;
+      try {
+        files = this._writeApprovalFiles(shellKind, nodePath, server);
+      } catch (err) {
+        // 生成失败（基础 cordis.yml 不是块状列表等）与 shell 形态无关 → 换一种也一样，不再试
+        server.dispose();
+        this._approvalWarn(`审批 hook 生成失败：${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
+      // 自检：这条 hook 命令在**同一个 shell**（DSH 也是 bash -c）里跑得起来吗？
+      const test = await testApprovalHook(files.hookCommand, runCwd);
+      if (test.ok) {
+        this._approval = server;
+        this._approvalFiles = files;
+        console.log(
+          `[approval] 事前审批已就绪（shell=${shellKind}${shellKind === guess ? '' : `，首猜 ${guess} 猜错了`}，hook 自检通过）`
+        );
+        return;
+      }
+      failure += `${failure ? '；' : ''}${shellKind} 形态：${test.detail}`;
     }
 
-    // 自检：这条 hook 命令在**同一个 shell**（DSH 也是 bash -c）里跑得起来吗？
-    // 起不来 = 审批不会生效 —— 这种情况必须让用户知道，而不是看起来配好了。
-    const test = await testApprovalHook(this._approvalFiles.hookCommand, runCwd);
-    if (test.ok) {
-      console.log(`[approval] 事前审批已就绪（shell=${shellKind}，hook 自检通过）`);
-    } else {
-      this._approvalWarn(`审批 hook 自检未通过，审批不会生效：${test.detail}`);
-    }
+    // 两种形态都跑不起来 = 审批**确实**接不进去。这里要「干净地不启用」而不是留着半套：
+    // 丢掉派生配置（下次 spawn 回到用户原配置，不往他们的 DSH 里塞一条跑不起来的 hook），
+    // 同时清掉 _approval —— 于是 _ensureApproval 下次 spawn 会重试一次（重载时 WSL 冷启动
+    // 失败是暂时的，热了之后自愈），弹窗有 _approvalWarned 兜着，不会刷屏。
+    server.dispose();
+    this._approvalFiles = undefined;
+    this._approvalWarn(`审批 hook 自检未通过，审批不会生效：${failure.slice(0, 400)}`);
+  }
+
+  /** 按指定 shell 形态生成三件套（hook 脚本 / hooks.json / 派生 cordis.yml）。 */
+  private _writeApprovalFiles(
+    shellKind: ShellKind,
+    nodePath: string,
+    server: ApprovalServer
+  ): ApprovalHookFiles {
+    const timeoutMs = this._approvalTimeoutMs();
+    return writeApprovalHookFiles({
+      storageDir: this._storageDir,
+      nodePath,
+      shellKind,
+      url: server.url,
+      token: server.token,
+      // 三层超时梯度：扩展先放弃并拒绝(540) < 脚本 socket 放弃(560) < DSH 杀 hook(580)
+      scriptTimeoutMs: timeoutMs + 20000,
+      hookTimeoutSec: Math.ceil((timeoutMs + 40000) / 1000),
+      baseConfigPath: this._baseConfigPathAbs(),
+    });
   }
 
   /**

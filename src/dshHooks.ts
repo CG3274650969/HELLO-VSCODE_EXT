@@ -149,7 +149,12 @@ export function testApprovalHook(hookCommand: string, cwd: string): Promise<{ ok
     child.on('close', (code) => {
       clearTimeout(timer);
       if (code !== 0) {
-        finish(false, `bash 退出码 ${code}${errOut.trim() ? '：' + errOut.trim().slice(0, 300) : ''}`);
+        // stdout 也要报 —— bash/Windows shim 的失败话术并不总是走 stderr（WSL 起不来时
+        // 它往往把话打在 stdout 上），只报 stderr 会得到一条「退出码 1」这种没法查的线索。
+        const bits: string[] = [];
+        if (errOut.trim()) bits.push(`stderr：${errOut.trim().slice(0, 300)}`);
+        if (out.trim()) bits.push(`stdout：${out.trim().slice(0, 300)}`);
+        finish(false, `bash 退出码 ${code}${bits.length ? '（' + bits.join('；') + '）' : '（stdout/stderr 都是空的）'}`);
         return;
       }
       if (out.trim()) {
@@ -168,6 +173,11 @@ export function testApprovalHook(hookCommand: string, cwd: string): Promise<{ ok
 /**
  * 用与 DSH 完全相同的方式（`bash -c <command>`，从扩展进程 spawn）探一次 shell。
  * DSH 子进程的 env 继承自扩展，所以这里的 `bash` 解析结果就是 hook 将要用的那个。
+ *
+ * ⚠️ **这只是首猜，不是判据。** 它只采一次样（8 s 超时），而任何失败（超时、WSL 尚未起来、
+ * uname 没输出）都会静默回落 `posix` —— 在「扩展宿主的 bash 其实是 WSL shim」的机器上，
+ * 猜错就等于 hook 里全是 Windows 形态路径、必然跑不起来。真正的判据是调用方拿自检结果定的
+ * （见 chatViewProvider 的 `_setupApproval`）：首猜不过就换另一种形态再自检一次。
  */
 export function probeShell(cwd: string): Promise<ShellKind> {
   return new Promise((resolve) => {

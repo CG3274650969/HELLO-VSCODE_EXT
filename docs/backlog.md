@@ -61,6 +61,28 @@
   现在起服务时先用扩展进程 spawn `bash -c 'uname -s'` **探 shell**，再决定路径形态：WSL 要 exe 用 `/mnt/d/…`
   + 脚本参数用 Windows 形式（混着写），Git Bash 两边都用 Windows 形式。**两种形态都已端到端实测**。
   顺带：不能在自己工具 shell 里判 shell 类型（PATH 被污染），必须由扩展进程探。
+
+- **踩到的坑之二（2026-09-17 已修）：探测本身是个竞态，「探 shell」不足以定形态。**
+  线上症状是一条弹窗：`审批 hook 自检未通过，审批不会生效：bash 退出码 1` —— 外加上当时**只收集了 stderr**，
+  而这条 bash 的话全打在 stdout 上，于是线索是一句查不下去的「退出码 1」。
+  根因是**扩展宿主的 `bash` 与你的工具 shell 里的 `bash` 不是同一个东西**：扩展宿主是 GUI 起的纯 Windows 进程，
+  合并 PATH 里 `%SystemRoot%\system32`（WSL shim `bash.exe`）**排在** `E:\Git\cmd` 之前 ⇒ `spawn('bash')` 命中的是 WSL shim；
+  而在 Git Bash 里跑 `where bash` 会被自己的 bin 抢到前头 —— 这也是当初「两种形态都已实测」却仍然线上翻车的原因（测的环境是偏的）。
+  更要命的是 `probeShell` **只采一次样**、超时 8 s 就静默回落 posix，而实测冷启动的 WSL shim 跑 `uname -s` 要 **4.8–5.5 s**
+  —— VS Code 重载那一刻恰好是 WSL 最冷的时候，猜错 = 用 Windows 形态的路径去喂 WSL = `command not found` = 审批静默失效。
+  **修法：`probeShell` 降级成「首猜」而非判据；真正的判据是自检本身** —— 首猜那个形态自检不过就换另一种再自检一遍，
+  哪个过用哪个（两种形态互斥：A 形态的命令在 B 里必然 `command not found`，所以「谁过」无歧义）。
+  两种都不过才是真接不上，此时**干净地不启用**：丢掉派生配置（不往用户 DSH 里塞一条跑不起来的 hook）、清掉 `_approval`,
+  让下次 spawn 重试（冷启动失败是暂时的，热了会自愈；弹窗有 `_approvalWarned` 兜着不刷屏）。
+  同时 `testApprovalHook` 的失败话术改成**同时带 stdout 与 stderr**（两边都空则明说），别再把可诊断性丢掉。
+- **自检**：[`scripts/probe-approval-shell.mjs`](../scripts/probe-approval-shell.mjs) —— 用真实的 `probeShell()` + 真实生成物
+  跑两种形态，钉住三个前提：至少一种能过（否则确实该弹窗）、两种互斥（所以判据无歧义）、首猜猜错时另一种能救回来；
+  外加四条失败话术断言（带 stdout / 带 stderr / 两边都空要明说 / stdout 有内容却 exit 0 不能算通过）。
+  `npm run compile && node scripts/probe-approval-shell.mjs` → **7/7**（本机 Git Bash 环境下跑出「posix 过、wsl 不过」，
+  正是扩展宿主那边的镜像）。不需要 VS Code、不需要 API key。
+  ⚠️ backlog 早先写的「由 `probe-approval.cjs` 双形态端到端自检 16/16」**不准确**：那个 `probe-approval.cjs` 只存在于当时的
+  `$TEMP`，从未进过仓库（`git log --all` 无此路径），16/16 是按一次性脚本的结果记的。现以仓内这份为准。
+
 - **默认策略放宽**：原默认只拦 `rm -f`/`rm -rf`，**漏掉裸 `rm <文件>`**（正是最常见的那种删）→ 改为 `\brm\b`（任何 rm）。
 - **状态**：**已完成（运行态实测通过）**。代码 `tsc` 通过；生成物与 hook 命令由 `probe-approval.cjs` 双形态端到端自检 16/16
   （放行/拒绝/兜底/留痕/自检全过）；真机 F5 实测：开 `hello.chat.approval.enabled` + 重载窗口后，让 agent 删
