@@ -616,6 +616,10 @@ body.vscode-high-contrast .brand-mark {
 .tool-card.error {
   border-left-color: var(--dsw-alias-state-error-primary, #f85149);
 }
+/* unknown：结果没到，既不是成功也不是失败 → 中性灰，刻意**不用**红（红会让人当成失败去重试） */
+.tool-card.unknown {
+  border-left-color: var(--dsw-alias-state-warning-primary, var(--vscode-editorWarning-foreground, #d29922));
+}
 
 .tool-head {
   display: flex;
@@ -639,6 +643,9 @@ body.vscode-high-contrast .brand-mark {
 }
 .tool-card.error .tool-dot {
   background: var(--dsw-alias-state-error-primary, #f85149);
+}
+.tool-card.unknown .tool-dot {
+  background: var(--dsw-alias-state-warning-primary, var(--vscode-editorWarning-foreground, #d29922));
 }
 @keyframes toolPulse {
   50% {
@@ -667,6 +674,9 @@ body.vscode-high-contrast .brand-mark {
 }
 .tool-card.error .tool-state {
   color: var(--dsw-alias-state-error-primary, #f85149);
+}
+.tool-card.unknown .tool-state {
+  color: var(--dsw-alias-state-warning-primary, var(--vscode-editorWarning-foreground, #d29922));
 }
 
 /* 入参：工具名 + 调用参数，等宽小字，弱化 */
@@ -1581,6 +1591,9 @@ body.react-live #empty-hint {
 }
 .ri-tool.ok .ri-tool-state {
   color: var(--dsw-alias-state-success-primary, #3fb950);
+}
+.ri-tool.unknown .ri-tool-state {
+  color: var(--dsw-alias-state-warning-primary, var(--vscode-editorWarning-foreground, #d29922));
 }
 /* 错误行 / 截断说明行 */
 .ri-err {

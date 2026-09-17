@@ -13,9 +13,9 @@
  *    `capToolInput` 的 2 万字符熔断（`chatViewProvider.ts` 的 `tool/call` 分支），这里再存一份
  *    既是双份内存，又是**绕过那条保险丝的一条新路**。要展示命令原文就让它在产生处过熔断，
  *    别在这里开洞。
- * 2. **判据只此一处。** 配对键（`toolKeyFrom`）与「这次工具算不算失败」（`toolResultFailed`）
- *    由本模块导出、provider 调用同一份实现 —— 否则转写里是红卡、检查器里是绿行，
- *    用户不知道信哪个。
+ * 2. **判据只此一处。** 配对键（`toolKeyFrom`）与「这次结果算成功/失败/未知」
+ *    （`toolResultVerdict`）由本模块导出、provider 调用同一份实现 —— 否则转写里是红卡、
+ *    检查器里是绿行（或反过来），用户不知道信哪个。
  * 3. **有界，且不落盘。** 一个全局环（`MAX_RUNS`）在读取时按会话过滤，**不建
  *    `Map<sessionId, ring>`**（那会随「开过的会话数」无界增长）。下一句点名一个函数，
  *    防后人「顺手」把这份记录持久化：**绝不要从 `chatViewProvider._afterTurn()` 走到这里** ——
@@ -30,6 +30,14 @@
  * ⚠️ **本模块一次 `Date.now()` 都不调** —— 一旦掺进宿主时钟，自检就不可复现了。
  * 没有 `turn/end` 的收尾（进程被杀）用**收到的最后一帧的时间**当终点（`lastFrameAt`），
  * 语义上也更贴切：那是这一轮最后一次有人说话的时刻。
+ *
+ * ## 一条实测纠正（2026-09-17，别把它改回去）
+ *
+ * 原设计写「`unmatched` 正常恒为 0，非 0 就是我们的 bug」。**这是错的**：DSH 补平中断轮时
+ * 会补写结果帧（`TOOL_NOT_STARTED` / 「Its outcome is unknown」），那些帧**本来就配不上任何
+ * 调用**。正确的形状是按「谁写的」分开数（见 `unmatched` 与 `repaired`），
+ * 而补平帧的状态判据也必须是三态（见 `toolResultVerdict`）——
+ * 它们**正文说「未知」、帧上却带 `isError: true`**。
  */
 
 /**
@@ -134,8 +142,26 @@ export interface RunRecord {
   tools: RunToolRow[];
   /** 超出 `MAX_TOOL_ROWS` 没记下的工具调用**次数**（继续计数） */
   toolsDropped: number;
-  /** 配不上任何一行的 `tool/result` 条数 —— 配对键失效时的探针，正常恒为 0 */
+  /**
+   * 配不上任何一行的 `tool/result` 条数 —— 「配对键失效」的探针。
+   *
+   * ⚠️ **先前这里写着「正常恒为 0」，那是错的**（2026-09-17 实测推翻）：DSH 补平中断轮时会
+   * 补写结果帧，而那些帧本来就配不上任何调用 —— 混在一起数，等于把一个**必然出现的运行时
+   * 行为**报成我们自己的 bug。它们现在单列在 `repaired`，本字段只留真正的键失效。
+   */
   unmatched: number;
+  /**
+   * DSH **补平**帧的条数（判据 `isRepairResult`）：**运行时代我们写的结果**。
+   *
+   * 名字说的是「谁写的」而不是「那个调用跑没跑」—— 因为两个真实变体的语义本就不同：
+   *   · `TOOL_NOT_STARTED` → 调用从未被记录为开始，**没有** `tool/call` 行可配；
+   *   · `interrupted-tool-result-<callId>-<seq>` → 已经开始了，只是结果没落盘。它的
+   *     `toolCallId` 与真调用**逐字相同**，所以只要那一行还在窗口里，它会正常配上并把状态
+   *     判成 `unknown`（**不会**走到本字段）；只有那一行也不在（轮早于我们开始、或被上限丢掉）
+   *     才会落到这里。
+   * 两种情况都不是我们的 bug，所以与 `unmatched` 分开数。
+   */
+  repaired: number;
   errors: RunError[];
   /** 超出 `MAX_ERRORS` 没记下的条数 */
   errorsDropped: number;
@@ -257,23 +283,51 @@ export function toolKeyFrom(data: unknown): string {
     : `ts:${String(d?.turn ?? '')}:${String(d?.step ?? '')}`;
 }
 
+/** DSH 补平中断轮时补写的结果帧，`message.id` 长这样：`interrupted-tool-result-<callId>-<seq>`。 */
+const REPAIR_ID_PREFIX = 'interrupted-tool-result-';
+
 /**
- * 这次 `tool/result` 算不算失败。
+ * 这是不是 DSH **补平中断轮**时补写的「结果」。
  *
- * 两处来源，与 provider 的判据同源：`data.error` 非空，或任何一个 `tool-result` 块上
- * `isError`。注意**命令非零退出也算失败**（DSH 把它标成 `isError`）—— 这是「工具报错」，
- * 与「本轮出错」（`RunOutcome === 'error'`）是两件事，别混。
+ * 判据只有这两处，都是 2026-09-17 那份真实日志里逐字出现的：
+ *   · `error.code === 'TOOL_NOT_STARTED'`（调用**从未被记录为开始**）
+ *   · `message.id` 以 `interrupted-tool-result-` 开头（已记录、但结果没落盘）
+ * 帧上没有更结构化的「结果未知」字段可用 —— `isError` 反而是**反着的**（见下）。
  */
-export function toolResultFailed(data: unknown): boolean {
+export function isRepairResult(data: unknown): boolean {
   const d = asObject(data);
   if (!d) return false;
+  if (asString(asObject(d.error)?.code) === 'TOOL_NOT_STARTED') return true;
+  return (asString(asObject(d.message)?.id) ?? '').startsWith(REPAIR_ID_PREFIX);
+}
+
+/** 一条 `tool/result` 给工具行的状态。 */
+export type ToolResultVerdict = 'ok' | 'error' | 'unknown';
+
+/**
+ * 这次 `tool/result` 算成功、失败、还是**未知**。**三态，不是布尔。**
+ *
+ * ⚠️ **为什么必须三态**：DSH 补平悬空 turn 时补写的结果帧，**正文自己写着「结果未知」，
+ * 帧上却照样带 `isError: true`**（实测原文：「…but no result was durably recorded.
+ * Its outcome is unknown.」）。只按 `isError` 判，就会把「未知」涂成红色的「失败」——
+ * 那正是 `RunToolState` 立身要避免的那句谎话。先前只判失败/成功两态没暴露，靠的是**运气**：
+ * 这些帧多半在进程重启时才落盘，那时轮已经结束、落在 `_liveRunning` 闸外，压根不入账。
+ *
+ * 其余照旧：`data.error` 非空或任一 `tool-result` 块的 `isError` → 失败。注意**命令非零退出
+ * 也算失败**（DSH 把它标成 `isError`）—— 这是「工具报错」，与「本轮出错」
+ * （`RunOutcome === 'error'`）是两件事，别混。
+ */
+export function toolResultVerdict(data: unknown): ToolResultVerdict {
+  if (isRepairResult(data)) return 'unknown';
+  const d = asObject(data);
+  if (!d) return 'ok';
   let failed = d.error !== undefined && d.error !== null;
   for (const b of asArray(asObject(d.message)?.content)) {
     const o = asObject(b);
     if (!o || o.type !== 'tool-result') continue;
     if (o.isError) failed = true;
   }
-  return failed;
+  return failed ? 'error' : 'ok';
 }
 
 /**
@@ -394,21 +448,29 @@ export class RunInspector {
         const run = this._ensureRun(uiSessionId, dshId, data);
         this._touch(run, t);
         // 配对三步（①② 分开是为了让「键没对上」这件事在 400 次时能被 unmatched 看见 ——
-        // provider 的兜底把它静默盖掉了，这里不盖）：
+        // provider 的兜底把它静默盖掉了，这里不盖；② 对补平帧不开放，见那里的注释）：
         const key = toolKeyFrom(data);
+        const repair = isRepairResult(data);
         let row = this._lastRunning(run, (r) => r.key === key);
-        if (!row && !this._droppedKeys.has(key)) {
-          // ② 键对不上（callId 缺失等）：与 provider 的兜底同序 —— 最近一条 running 行。
+        // ② 键对不上（callId 缺失等）：与 provider 的兜底同序 —— 最近一条 running 行。
+        // **补平帧不走这条路**：它的 `message.id` 是补出来的，`toolCallId` 要么指回真调用、
+        // 要么指一个从没开始过的调用 —— 让它去「就近关一条」等于把结果安到另一次工具头上
+        // （耗时、成败全错）。配不上就老实地记进 `repaired`。
+        if (!row && !repair && !this._droppedKeys.has(key)) {
           row = this._lastRunning(run, () => true);
         }
         if (!row) {
-          // ③ 配不上：不建行、不报错，只计数。这是配对键失效的唯一可观测入口。
-          run.unmatched++;
+          // ③ 配不上任何一行：不建行、不报错，只计数（配对键失效的唯一可观测入口）。
+          // 但要**分两种**，否则一个必然出现的运行时行为会被报成我们的 bug：
+          //   · DSH 补平帧（运行时代写的）→ repaired；
+          //   · 其余（键失效，或对应的 call 被上限丢掉了）→ unmatched。
+          if (repair) run.repaired++;
+          else run.unmatched++;
           return true;
         }
         row.endedAt = t;
         row.durationMs = dur(row.startedAt, row.endedAt);
-        row.state = toolResultFailed(data) ? 'error' : 'ok';
+        row.state = toolResultVerdict(data);
         return true;
       }
       case 'turn/end': {
@@ -571,6 +633,7 @@ export class RunInspector {
       tools: [],
       toolsDropped: 0,
       unmatched: 0,
+      repaired: 0,
       errors: [],
       errorsDropped: 0,
     };

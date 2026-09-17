@@ -117,6 +117,8 @@ function toolStateLabel(m: ChatMessage): string {
       return '已完成';
     case 'error':
       return '失败';
+    case 'unknown':
+      return '结果未知（没收到结果）';
     case 'running':
       return '导出时仍在运行';
     default:

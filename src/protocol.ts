@@ -67,8 +67,12 @@ export interface ChatMessage {
   toolInput?: string;
   /** 工具输出文本 */
   toolOutput?: string;
-  /** 工具状态：running→ok/error。tool 不走 streaming，别用它做流式。 */
-  toolState?: 'running' | 'ok' | 'error';
+  /**
+   * 工具状态：running → ok / error / **unknown**。tool 不走 streaming，别用它做流式。
+   * `unknown` 不是「待定」：是那次调用**没能收到结果**（进程被杀、轮被中断），
+   * 跑没跑完不可知 —— 见 `runInspector.toolResultVerdict` 与 `_finishTurn` 的注释。绝不折成 error。
+   */
+  toolState?: 'running' | 'ok' | 'error' | 'unknown';
 }
 
 /** 历史会话列表里展示的摘要（不含整段消息，避免把大量文本塞进列表）。 */
@@ -201,8 +205,8 @@ export type ExtToWebview =
   | { type: 'assistant-error'; id: string; message: string }
   /** harness 模式下：工具卡开始跑（message 为 role:'tool'，toolState:'running'） */
   | { type: 'tool-start'; message: ChatMessage }
-  /** 工具卡出结果：id 更新 toolState，可选带输出文本 */
-  | { type: 'tool-result'; id: string; toolState: 'ok' | 'error'; output?: string }
+  /** 工具卡出结果：id 更新 toolState，可选带输出文本。unknown = 结果没到（判据同 ChatMessage.toolState） */
+  | { type: 'tool-result'; id: string; toolState: 'ok' | 'error' | 'unknown'; output?: string }
   /** harness（恒为 DSH 直播）连接状态广播：连接中/在线/错误 + 型号 + 忙否，webview 据此亮状态点 */
   | { type: 'backend-status'; state: DshConnState; model?: string; detail?: string; busy: boolean }
   /** live 运行在途（连接/等首事件期间也没有流式气泡）→ 用它锁住输入与后端开关 */
