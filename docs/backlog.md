@@ -9,7 +9,7 @@
 
 | 编号 | 标题 | 优先级 | 阻塞/依赖 | 状态 |
 |---|---|---|---|---|
-| C1 | 事前审批（破坏性操作确认条） | P0 | 无（走 hooks 路线，不必改 DSH） | [x] |
+| C1 | 事前审批（破坏性操作确认条） | P0 | 无（走 hooks 路线，不必改 DSH）。**已实现、真机实测通过**；自检 **19/19**。三轮踩坑（PATH 里的 bash 是 WSL shim / 探 shell 有竞态 / **冷启动那次的失败不该算数**）逐条见正文 | [x] |
 | C2 | DSH 运行时零配置分发 | P0 | 上游 Windows 制品缺失（明文 non-goal）；阶段一自建便携包已就绪 | [~] |
 | C3a | 用量可视化（每轮/每会话 token + 上下文占用） | P0 | 无（wire 带 usage，已实证） | [x] |
 | C3b | 费用估算 + 预算拦截 | P0 | 无价目数据（DSH 不带）；wire 无 prompt-cancel，超限只能拦下一轮 | [ ] |
@@ -76,11 +76,38 @@
   两种都不过才是真接不上，此时**干净地不启用**：丢掉派生配置（不往用户 DSH 里塞一条跑不起来的 hook）、清掉 `_approval`,
   让下次 spawn 重试（冷启动失败是暂时的，热了会自愈；弹窗有 `_approvalWarned` 兜着不刷屏）。
   同时 `testApprovalHook` 的失败话术改成**同时带 stdout 与 stderr**（两边都空则明说），别再把可诊断性丢掉。
-  **真机确认（2026-09-17，用户）**：重载窗口后那条弹窗**不再出现** —— 修的是线上实际发生的那条路径，不是只让自检变绿。
+  **真机确认（2026-09-17，用户）**：重载窗口后那条弹窗**不再出现**。
+  ⚠️ 这句后来**被推翻了一半**：同一天用户再次报告同一条弹窗，而且这次带全了两个形态的失败 —— 见下一条「坑之三」。
+  坑之二修的是「谁先谁后」，坑之三修的才是「那次失败算不算数」。
+
+- **踩到的坑之三（2026-09-17 已修）：换形态只解决了顺序，没解决「冷启动那次失败不该算数」。**
+  线上原文：`审批 hook 自检未通过，审批不会生效：posix 形态：自检超时（15s）；wsl 形态：bash 退出码 1`。
+  重载那一刻**两种形态的自检都可能在 WSL 冷启动里失败**，而这两条失败**都不说明形态写错了**：
+  - `posix 形态：自检超时（15s）` —— `probeShell` 8 s 采样超时后，旧代码静默回落 **posix**，
+    等于在一台 WSL 机器上把唯一跑不通的形态排在**第一个**去自检，15 s 全花在等 WSL 开机上（顺序反了）；
+  - `wsl 形态：bash 退出码 1`（stdout/stderr 都是空的）—— 启动器半路熄火，不是形状不对。
+  **判据**：真写错形态时 bash 又快又响 —— 实测 79–183 ms、退出码 127、stderr 上明写
+  `bash: line 1: /mnt/d/…/node.exe: No such file or directory`。所以「超时」与「退出码非 0 却一个字都不说」
+  是另一档：**不可判**（`HookSelfCheck.retriable`），它只说明那一刻 shell 还没起来，不说明形态错。
+  修法三条，判据全落在纯函数上（`classifyShell` / `shellGuessOnTimeout` / `nextShellCheck`，探针逐条钉）：
+  ① `probeShell` 的失败/超时回落从「一律 posix」改成 `shellGuessOnTimeout()` = **win32 → wsl**
+  （Git Bash 答 `uname -s` 约 130 ms，永远撞不到 8 s 超时；能撞到的只有 WSL 冷启动 ⇒ **超时是 WSL 的正面证据**）；
+  ② 不可判的失败**不判形态死刑**：把它排到队尾再验一次 —— 中间那次自检恰好把冷启动的时间花掉了，
+  回头再验就是实测的 **359 ms 通过**（`classifyShell` 认不出的 uname 同样返回 `undefined` 而不是默认 posix）；
+  ③ **重试全局只给一次**（`_approvalRetried`）：两种形态各自超时两遍 = 用户干等一分钟才看到「发不出去」。
+  冷启动只发生一次，一次足够 —— 这条不是优化，是防止修法本身变成一个卡顿源。
+  失败话术也改了：`事前审批未生效：审批 hook 自检没通过（**下一条消息会自动再试一次**）：…`
+  —— 原话只说「审批不会生效」，没说会自动重来，用户只能以为功能坏了去翻设置。
+  ⚠️ **本机复现不了冷的那一端**（`wsl --shutdown` 会杀掉用户正在跑的东西），验的是热的一端：
+  把 System32 排在 PATH 最前（复刻扩展宿主那份合并 PATH）跑一遍真实排程 → `probeShell 首猜 = wsl`，
+  wsl 形态 **359 ms 第 1 次就过**。
 - **自检**：[`scripts/probe-approval-shell.mjs`](../scripts/probe-approval-shell.mjs) —— 用真实的 `probeShell()` + 真实生成物
   跑两种形态，钉住三个前提：至少一种能过（否则确实该弹窗）、两种互斥（所以判据无歧义）、首猜猜错时另一种能救回来；
-  外加四条失败话术断言（带 stdout / 带 stderr / 两边都空要明说 / stdout 有内容却 exit 0 不能算通过）。
-  `npm run compile && node scripts/probe-approval-shell.mjs` → **7/7**（本机 Git Bash 环境下跑出「posix 过、wsl 不过」，
+  外加四条失败话术断言（带 stdout / 带 stderr / 两边都空要明说 / stdout 有内容却 exit 0 不能算通过）；
+  坑之三的九条纯函数断言（`classifyShell` 三态含「认不出来必须 undefined」、`shellGuessOnTimeout` 的平台先验、
+  `nextShellCheck` 的顺序/只重试不可判的/重试全局仅一次）与三条 `retriable` 分类断言
+  （超时 → true；空手退出码 1 → true；exit 127 带 stderr → **false**）。
+  `npm run compile && node scripts/probe-approval-shell.mjs` → **19/19**（本机 Git Bash 环境下跑出「posix 过、wsl 不过」，
   正是扩展宿主那边的镜像）。不需要 VS Code、不需要 API key。
   ⚠️ backlog 早先写的「由 `probe-approval.cjs` 双形态端到端自检 16/16」**不准确**：那个 `probe-approval.cjs` 只存在于当时的
   `$TEMP`，从未进过仓库（`git log --all` 无此路径），16/16 是按一次性脚本的结果记的。现以仓内这份为准。

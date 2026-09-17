@@ -310,7 +310,7 @@ Harness 才是完成态。
 | `scripts/probe-session-tools.mjs` | 检索/导出/软删除自检，外加落盘加固（原子写、`.bak` 滚动、备份回退、`toolInput` 熔断）（先 `npm run compile`；不需要 VS Code、不需要 key） |
 | `scripts/probe-purge.mjs` | 路径复刻对账/受控删除/留存边界自检（同上；**路径对账需 Node ≥ 22.15**，太老时会让你改用 `dist-runtime/node/node.exe`） |
 | `scripts/probe-turn-state.mjs` | 「继续」判据 + 在线状态跟踪自检（同上；不需 VS Code、不需 key） |
-| `scripts/probe-approval-shell.mjs` | C1 审批 hook 的 shell 形态判据自检：至少一种形态跑得通、两种互斥、首猜猜错能被另一种救回来（同上；不需 VS Code、不需 key） |
+| `scripts/probe-approval-shell.mjs` | C1 审批 hook 的 shell 形态判据自检：至少一种形态跑得通、两种互斥、首猜猜错能被另一种救回来；外加形态先验与「不可判的失败」（超时/空手退出）必须重试且只重试一次这组纯函数判据（同上；不需 VS Code、不需 key） |
 | `scripts/probe-run-inspector.mjs` | C9 运行检查器自检：帧过滤（灌 5000 条 `assistant/chunk` 记录必须逐字节不变）、调用/结果配对（含 DSH 补平帧的三态判据与守恒律）、终态优先级表、环与各项上限，以及把 `logs/dsh-frames/` 最新一份抓帧与一条独立推导的直算式 oracle 对拍（同上；不需 VS Code、不需 key） |
 | `scripts/probe-c8-runtime.mjs` | C8 的运行时前提 spike：第二条 prompt 排队、杀后 resume 补平、优雅 vs 硬杀。**需 API key**、会花掉真实模型轮 |
 | `scripts/update-dsh.mjs` | 运行时依赖治理：把 DSH 检出锁到 tag、查漂移、跑升级仪式 + 冒烟（见 `docs/runtime-dependency.md`） |

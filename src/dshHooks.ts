@@ -109,24 +109,35 @@ export function writeApprovalHookFiles(opts: ApprovalHookOptions): ApprovalHookF
   return { cordisPath, hooksPath, scriptPath, hookCommand };
 }
 
+/** 自检结论。`retriable` 见 `nextShellCheck` 的长注释；它**不是**「可以重试看看」，而是「这次失败没说明任何事」。 */
+export interface HookSelfCheck {
+  ok: boolean;
+  detail: string;
+  /** 结论**不可判**：超时、或 shell 启动器空手退出 —— 只说明那一刻 shell 还没起来，不说明形态写错了 */
+  retriable: boolean;
+}
+
 /**
  * 自检：用**同一个 shell**（DSH 的 hook 也是 `bash -c <command>`）跑一遍这条 hook 命令，
  * 喂一个非 bash 工具的合成载荷（脚本会立刻 exit 0，无副作用）。
  * 失败说明 hook 起不来（典型：node 路径在 bash 里不可达）→ 审批**不会生效**，必须让用户知道，
  * 而不是安静地"看起来配好了"。
+ *
+ * `timeoutMs` 只为探针而留（钉住超时那条分支不必真等 15 s）；扩展侧一律用默认值。
  */
-export function testApprovalHook(hookCommand: string, cwd: string): Promise<{ ok: boolean; detail: string }> {
+export function testApprovalHook(hookCommand: string, cwd: string, timeoutMs = 15000): Promise<HookSelfCheck> {
   return new Promise((resolve) => {
     let done = false;
-    const finish = (ok: boolean, detail: string): void => {
+    const finish = (ok: boolean, detail: string, retriable = false): void => {
       if (done) return;
       done = true;
-      resolve({ ok, detail });
+      resolve({ ok, detail, retriable });
     };
     let child;
     try {
       child = spawn('bash', ['-c', hookCommand], { cwd, env: process.env, windowsHide: true });
     } catch (err) {
+      // spawn 抛错（bash 根本不存在）与形态无关，重试也会一模一样地抛 → retriable 不置位
       finish(false, err instanceof Error ? err.message : String(err));
       return;
     }
@@ -138,8 +149,10 @@ export function testApprovalHook(hookCommand: string, cwd: string): Promise<{ ok
       } catch {
         /* 已退出 */
       }
-      finish(false, '自检超时（15s）');
-    }, 15000);
+      // 超时是**不可判**的：能答的 bash 答得极快（实测 Git Bash 的 uname 约 130 ms），
+      // 撞到十几秒只可能是 WSL 启动器正在冷启动 —— 它压根没跑到命令那一行，形态对不对还没验。
+      finish(false, `自检超时（${Math.round(timeoutMs / 1000)}s）`, true);
+    }, timeoutMs);
     child.stdout?.on('data', (c) => (out += String(c)));
     child.stderr?.on('data', (c) => (errOut += String(c)));
     child.on('error', (err) => {
@@ -154,7 +167,14 @@ export function testApprovalHook(hookCommand: string, cwd: string): Promise<{ ok
         const bits: string[] = [];
         if (errOut.trim()) bits.push(`stderr：${errOut.trim().slice(0, 300)}`);
         if (out.trim()) bits.push(`stdout：${out.trim().slice(0, 300)}`);
-        finish(false, `bash 退出码 ${code}${bits.length ? '（' + bits.join('；') + '）' : '（stdout/stderr 都是空的）'}`);
+        // **两边都空**是第二种「不可判」：形态写错时 bash 会又快又响亮地报错（实测 79–183 ms，
+        // 退出码 127 + `bash: line 1: …: No such file or directory` 打在 stderr 上），
+        // 退出码 1 却一个字都不说，只可能是启动器半路熄火（WSL 还在开机）。
+        finish(
+          false,
+          `bash 退出码 ${code}${bits.length ? '（' + bits.join('；') + '）' : '（stdout/stderr 都是空的）'}`,
+          bits.length === 0
+        );
         return;
       }
       if (out.trim()) {
@@ -171,13 +191,37 @@ export function testApprovalHook(hookCommand: string, cwd: string): Promise<{ ok
 // ---------- 内部 ----------
 
 /**
+ * `uname -s` 的输出来判形态（纯函数，探针钉的就是它）。
+ * **认不出来就返回 undefined**，不假装认识 —— 旧的 `else → posix` 正是把「不知道」当成了「是 posix」。
+ */
+export function classifyShell(unameOut: string): ShellKind | undefined {
+  const s = unameOut.trim();
+  if (!s) return undefined;
+  if (/linux/i.test(s)) return 'wsl'; // WSL 里 uname -s 就是 Linux
+  if (/mingw|msys|cygwin/i.test(s)) return 'posix'; // Git Bash / MSYS / Cygwin
+  return undefined;
+}
+
+/**
+ * 探不到时的**平台先验**：Windows 上唯一「慢」的 bash 是 WSL 的启动器。
+ *
+ * 实测（2026-09-17，本机）：Git Bash 答 `uname -s` 约 **130 ms**，永远撞不到 8 s 超时；
+ * `C:\Windows\System32\bash.exe` 即使在半热状态下也要 **5.1 s**，冷启动更久。
+ * 所以**超时是 WSL 的正面证据**，不是「猜不出来」—— 而这正是重载那一刻的处境：
+ * 旧代码在这里回落 `posix`，等于在一台 WSL 机器上把唯一跑不通的形态排在第一个去自检。
+ * 非 Windows 只有 posix 一种可能。
+ */
+export function shellGuessOnTimeout(platform: NodeJS.Platform = process.platform): ShellKind {
+  return platform === 'win32' ? 'wsl' : 'posix';
+}
+
+/**
  * 用与 DSH 完全相同的方式（`bash -c <command>`，从扩展进程 spawn）探一次 shell。
  * DSH 子进程的 env 继承自扩展，所以这里的 `bash` 解析结果就是 hook 将要用的那个。
  *
- * ⚠️ **这只是首猜，不是判据。** 它只采一次样（8 s 超时），而任何失败（超时、WSL 尚未起来、
- * uname 没输出）都会静默回落 `posix` —— 在「扩展宿主的 bash 其实是 WSL shim」的机器上，
- * 猜错就等于 hook 里全是 Windows 形态路径、必然跑不起来。真正的判据是调用方拿自检结果定的
- * （见 chatViewProvider 的 `_setupApproval`）：首猜不过就换另一种形态再自检一次。
+ * ⚠️ **这只是首猜，不是判据。** 它只采一次样（8 s 超时）。真正的判据是自检
+ * （见 chatViewProvider 的 `_setupApproval`）。但**首猜的优先级仍然要紧**：自检是按顺序来的，
+ * 把跑不通的形态排在第一个，就是白等一次它的超时。
  */
 export function probeShell(cwd: string): Promise<ShellKind> {
   return new Promise((resolve) => {
@@ -191,7 +235,7 @@ export function probeShell(cwd: string): Promise<ShellKind> {
     try {
       child = spawn('bash', ['-c', 'uname -s'], { cwd, env: process.env, windowsHide: true });
     } catch {
-      finish('posix');
+      finish(shellGuessOnTimeout());
       return;
     }
     let out = '';
@@ -201,19 +245,49 @@ export function probeShell(cwd: string): Promise<ShellKind> {
       } catch {
         /* 已退出 */
       }
-      finish('posix');
+      finish(shellGuessOnTimeout());
     }, 8000);
     child.stdout?.on('data', (c) => (out += String(c)));
     child.on('error', () => {
       clearTimeout(timer);
-      finish('posix');
+      finish(shellGuessOnTimeout());
     });
     child.on('close', () => {
       clearTimeout(timer);
-      // WSL 的 uname 是 Linux；Git Bash/MSYS 是 MINGW*/MSYS*/CYGWIN*
-      finish(/linux/i.test(out) ? 'wsl' : 'posix');
+      finish(classifyShell(out) ?? shellGuessOnTimeout());
     });
   });
+}
+
+/** 一次自检结果的**结论面**（`nextShellCheck` 只吃这些，不吃 detail） */
+export interface ShellCheckAttempt {
+  kind: ShellKind;
+  /** 结论是否不可判（超时 / 启动器空手退出）—— 见 `HookSelfCheck.retriable` */
+  retriable: boolean;
+}
+
+/**
+ * 自检排程（纯函数）：下一次该验哪种形态；`undefined` = 验完了，两种都过不了。
+ *
+ * 规则：先按 `order` 逐个验一遍。**不可判**的失败不判形态死刑 —— 把它排到队尾再验一次：
+ * 重载那一刻 WSL 正在冷启动，另一形态的自检恰好把这段冷启动时间花掉了，回头再验通常就过了
+ * （实测：首轮不可判的失败之后，热起来的 wsl 形态自检 **359 ms** 通过）。
+ *
+ * **重试全局只给一次**（`retriesUsed`）：两种形态各自超时两遍 = 用户干等一分钟才看到「发不出去」，
+ * 而冷启动只发生一次，一次足够。这条不是优化，是防止修法本身变成一个卡顿源。
+ */
+export function nextShellCheck(
+  order: ShellKind[],
+  done: ShellCheckAttempt[],
+  retriesUsed: number
+): ShellKind | undefined {
+  const count = (k: ShellKind): number => done.filter((d) => d.kind === k).length;
+  for (const k of order) if (count(k) === 0) return k;
+  if (retriesUsed > 0) return undefined;
+  // 重试给最后失败的那个（它的失败最新鲜，冷启动也走完了）；没别的候选就到此为止
+  const retriable = new Set(done.filter((d) => d.retriable).map((d) => d.kind));
+  for (const k of [...order].reverse()) if (retriable.has(k) && count(k) === 1) return k;
+  return undefined;
 }
 
 /**
