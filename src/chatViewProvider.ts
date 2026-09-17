@@ -17,7 +17,13 @@ import {
   WebviewToExt,
 } from './protocol';
 import { ApprovalAsk, ApprovalOutcome, ApprovalServer, matchesAnyPattern } from './approvalServer';
-import { ApprovalHookFiles, probeShell, testApprovalHook, writeApprovalHookFiles } from './dshHooks';
+import {
+  ApprovalHookFiles,
+  probeShell,
+  ShellKind,
+  testApprovalHook,
+  writeApprovalHookFiles,
+} from './dshHooks';
 import { isAbortError, streamMockReply } from './mockAssistant';
 import {
   dshStillReferenced,
@@ -46,7 +52,10 @@ import {
   DshSpawnRequest,
   DshStatusFrame,
   DshTokenUsage,
+  isDshTimeout,
 } from './dshRuntime';
+// C8：轮次状态判据（纯模块，零 vscode 依赖，scripts/probe-turn-state.mjs 直接加载编译产物自检）
+import { needsContinue, TurnStatus } from './turnState';
 
 /** 附件内容上限：超过这个字节数的文件不读；超过这个字符数的内容截断。 */
 const MAX_FILE_BYTES = 10 * 1024; // 单文件最多 10KB
@@ -311,6 +320,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _openAssistant?: ChatMessage;
   /** 当前 live 轮对应的 DSH 会话 id（事件按它过滤） */
   private _currentDshId?: string;
+  /**
+   * C8：DSH 侧「这个会话还在跑吗」（session.status 通知喂出来的）。
+   *
+   * 只有一个用途：**放宽**判断 —— 已知还在跑就别把长轮误判成失败。`session.status` 只在状态
+   * 翻转时发、wire 上没有查询方法，漏一条就补不回来，所以**绝不能**用它认定「跑完了」。
+   * 与 `_currentDshId` 必须同步 reset（换会话 / 进程一死，一切都不可信）。
+   */
+  private readonly _turnStatus = new TurnStatus();
+  /** 已知 DSH 侧还在跑（见 _turnStatus 的说明）。 */
+  private get _dshRunning(): boolean {
+    return this._turnStatus.running;
+  }
   /** 进行中的连接握手（_connectLive 幂等/共享用；并发调用都等同一个） */
   private _connectPromise?: Promise<void>;
   /** 本轮结束时 resolve（_finishTurn / 出错路径用来唤醒 _runLive 的 await） */
@@ -522,6 +543,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'user-message':
         this._sendUser(msg.text, msg.attachments);
         break;
+      case 'retry-last':
+        this._retryLast();
+        break;
       case 'pick-files':
         void this._pickFiles();
         break;
@@ -617,33 +641,48 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   // ---------- 发送一条用户消息 & 编排回复 ----------
 
-  private _sendUser(rawText: string, refs: FileRef[] = []): void {
+  private _sendUser(rawText: string, refs: FileRef[] = [], opts: { replay?: boolean } = {}): void {
     if (this._abort) {
       vscode.window.showInformationMessage('上一条回复还在生成中，先等它结束或点「停止」。');
       return;
     }
+    // C8：上一轮还在 DSH 侧跑着（回执超时那种情况 —— 界面已经不忙了，但进程还在执行工具）。
+    // 这条闸拦的就是那个窗口：此时再发就是往 inbox 里塞一条排队轮，用户以为新开了话头、
+    // 实际排在一个他看不见的长轮后面。停止是唯一的出路（wire 没有 cancel）。
+    if (this._dshRunning) {
+      vscode.window.showInformationMessage('上一轮还在运行（DSH 侧仍在执行），先点「停止」再发。');
+      return;
+    }
 
-    // 1) 「整行=文件路径」的行自动提升为附件（支持绝对路径 + 相对工作区根目录），
-    //    其余内容保留为正文 —— 这样在输入框直接贴一行路径也能加文件。
     const fileRefs = refs.slice();
-    // 1.1：harness 轮发送时若活动编辑器有非空选区，自动把选中文本作为附件带上（内容取自
-    // 编辑器缓冲，dirty 未保存也包含）。先压入 → 下方"整行=路径"提升按 path 去重，同一文件不会再提一份。
-    const selectionRef = this._activeSelectionRef();
-    if (selectionRef && !fileRefs.some((r) => r.path === selectionRef.path)) {
-      fileRefs.push(selectionRef);
-    }
-    const keptLines: string[] = [];
-    for (const line of rawText.split('\n')) {
-      const resolved = this._pathFromLine(line);
-      if (resolved) {
-        if (!fileRefs.some((r) => r.path === resolved)) {
-          fileRefs.push({ name: path.basename(resolved), path: resolved });
-        }
-      } else {
-        keptLines.push(line);
+    let text: string;
+    if (opts.replay) {
+      // C8 重发（「继续」按钮）：**逐字复现上一轮**。所以两处「取此刻」的处理都要跳过 ——
+      // 选区自动附加会拿现在这个光标位置的内容，行→路径提升会重新解释一遍文本，
+      // 都不是上一轮真正发出去的东西。附件与正文一律用入参原样。
+      text = rawText.trim();
+    } else {
+      // 1) 「整行=文件路径」的行自动提升为附件（支持绝对路径 + 相对工作区根目录），
+      //    其余内容保留为正文 —— 这样在输入框直接贴一行路径也能加文件。
+      // 1.1：harness 轮发送时若活动编辑器有非空选区，自动把选中文本作为附件带上（内容取自
+      // 编辑器缓冲，dirty 未保存也包含）。先压入 → 下方"整行=路径"提升按 path 去重，同一文件不会再提一份。
+      const selectionRef = this._activeSelectionRef();
+      if (selectionRef && !fileRefs.some((r) => r.path === selectionRef.path)) {
+        fileRefs.push(selectionRef);
       }
+      const keptLines: string[] = [];
+      for (const line of rawText.split('\n')) {
+        const resolved = this._pathFromLine(line);
+        if (resolved) {
+          if (!fileRefs.some((r) => r.path === resolved)) {
+            fileRefs.push({ name: path.basename(resolved), path: resolved });
+          }
+        } else {
+          keptLines.push(line);
+        }
+      }
+      text = keptLines.join('\n').trim();
     }
-    const text = keptLines.join('\n').trim();
 
     // 2) 解析每个引用为最终附件（缺内容的按路径从磁盘读，带大小保护）
     const attachments = this._resolveAttachments(fileRefs);
@@ -677,7 +716,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       userMsg.attachments = attachments;
     }
     this._active.messages.push(userMsg);
+    // C8：发了新消息 → 上一轮的异常终态翻篇，「继续」按钮随之消失（判据见此字段本身）。
+    delete this._active.lastTurn;
     this._post({ type: 'user-message', message: userMsg });
+    this._sendTurnState();
     if (isFirst) {
       this._sendHistory(); // 列表出现了新会话
     }
@@ -764,6 +806,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // 停止：杀掉子进程并收尾本轮；下一个 live 轮再重新 spawn（新进程要重新 initialize）
       this._dsh?.kill();
       this._dsh = undefined;
+      // C8：进程没了 → 线上状态一概不可信（下一个 live 轮 _ensureDshSession 会重新认领）。
+      // 不清的话，一条迟到的 running 能把用户永久挡在 _sendUser 的闸外。
+      this._turnStatus.reset();
       this._backendState = 'offline';
       this._backendModel = undefined;
       this._backendDetail = undefined;
@@ -828,7 +873,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     } catch (err) {
       // abort：onAbort 已收尾，安静退出即可；其余错误（含进程意外退出）才上浮
       if (!isAbortError(err) && this._liveRunning) {
-        this._surfaceLiveError(err instanceof Error ? err.message : String(err));
+        // C8 ②：「回执超时」**不等于本轮失败** —— 回执只是服务端收下的收条，本轮何时结束看
+        // idle。长轮（跑一堆工具）本来就可能迟迟不给回执。若此刻已知 DSH 侧还在跑，就继续
+        // 等下去；否则会把一个还在执行工具的长轮标成 error、同时丢掉后续事件，界面与 DSH
+        // 记忆就此失配（用户看不见那份工作，但 DSH 记得）。
+        if (isDshTimeout(err) && this._dshRunning) {
+          await this._waitEndOfTurn(ctrl);
+        } else {
+          this._surfaceLiveError(err instanceof Error ? err.message : String(err));
+        }
       }
     } finally {
       ctrl.signal.removeEventListener('abort', onAbort);
@@ -889,6 +942,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
       }
     }
+    // C8：记下这一轮的终态（「继续」按钮的判据，随 _afterTurn 落盘 → 重载窗口后按钮还在）。
+    // 正常跑完一律删掉：判据就在「有没有值」，不在消息的形状（理由见 turnState.ts）。
+    if (outcome === 'interrupted') {
+      this._active.lastTurn = 'interrupted';
+      // 说清楚「接着跑」的代价：DSH 侧记忆保留（下一轮仍记得前文），但被杀掉那次工具调用的
+      // 结果**未知** —— 与运行时补平悬空 turn 时给模型的措辞（TOOL_OUTCOME_UNKNOWN：
+      // 「结果未知，别盲重试」）对齐，别让用户以为可以无脑重放。工具卡已在上方落成 error，
+      // 所以这里只说编辑/命令类操作可能有副作用。复用 note：它会被持久化，重开也还在。
+      this._pushNote(
+        '本轮已中断。DSH 侧记忆保留（下一轮仍记得此前的对话），但被中断的工具调用结果未知 —— ' +
+          '如果它会写文件或执行命令，请自行确认现场再继续。点下方「继续」会重发上一条消息接着这个会话跑。'
+      );
+    } else {
+      delete this._active.lastTurn;
+    }
+    this._sendTurnState();
     const resolve = this._endTurnResolve;
     this._endTurnResolve = undefined;
     resolve?.();
@@ -954,10 +1023,51 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._backendModel = undefined;
     this._backendDetail = message;
     this._liveRunning = false;
+    // C8 ② 的核心：**出错就真停**。界面说 error 却留着一个还在执行工具的子进程，是 C7 之前
+    // 就存在的问题 —— 用户以为停了，工具还在写盘，而后续事件被 `_onDshEvent` 的
+    // `if (!this._liveRunning)` 全丢掉（看不见，但 DSH 记得）。kill 之后那个悬空的 turn
+    // 交给运行时的 interruptedTurnClosers 在下次 resume 时补平。
+    // 三处调用点：子进程意外退出（`this._dsh` 早已置空 → no-op）、`_runLive` 的 catch、
+    // `turn/end` 报错。**后两处进程是活的**，会被真的杀掉 —— 这是刻意的：wire 上没有状态
+    // 查询，既然这一轮已经失败，就没法确认那个进程还在干什么，与其留着一个状态不可知的
+    // 子进程，不如让它死掉、下一轮重来（补丁在，resume 照常接回同一份记忆）。
+    this._dsh?.kill();
+    this._dsh = undefined;
+    this._turnStatus.reset(); // 进程没了 → 线上状态不可信（同 onAbort）
+    this._active.lastTurn = 'error';
+    this._sendTurnState();
     this._postBackendStatus();
     const resolve = this._endTurnResolve;
     this._endTurnResolve = undefined;
     resolve?.();
+  }
+
+  /** C8「继续」按钮的显隐：判据只有 `lastTurn` 一条（见 turnState.ts）。 */
+  private _sendTurnState(): void {
+    this._post({ type: 'retry-offer', on: needsContinue(this._active) });
+  }
+
+  /**
+   * C8「继续」：重发**上一条用户消息**，接着同一个 DSH 会话再跑一轮。
+   *
+   * 为什么不新开一轮「请继续」：那会凭空造一条用户消息、还得让模型自己猜「继续」指什么；
+   * 重发原文则逐字复现上一轮 —— 加上 DSH 侧的记忆本就在，模型看到的是「同一句话又说了一遍
+   * ＋上次那半截上下文」，接得上。附件也逐字复现（用存下来的内容，不重读磁盘：重读会拿到
+   * 此刻的版本，那就不是「上一轮发出去的东西」了）。
+   */
+  private _retryLast(): void {
+    // 运行中不给发 —— 但**不在这里判**：`_sendUser` 的两道闸已经有各自的提示文案，
+    // 在这里再拦一次只会让用户点了没反应。
+    let last: ChatMessage | undefined;
+    for (const m of this._active.messages) {
+      if (m.role === 'user') last = m;
+    }
+    if (!last || (!last.text && !last.attachments?.length)) return;
+    // 已经是 Attachment（含内容）；结构上兼容 FileRef，直接当引用喂回去。
+    this._sendUser(last.text, last.attachments ?? [], { replay: true });
+    // 发成了 → _sendUser 已把条收掉；被两道闸挡下（上一轮还在跑）→ 这里把状态重发一遍，
+    // 前端据此把点击时置灰的按钮回正，用户还能再点。
+    this._sendTurnState();
   }
 
   /**
@@ -991,6 +1101,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const existing = this._dshSessions.get(uiId);
     if (existing) {
       this._currentDshId = existing;
+      // 状态归零但认领 id：上一个会话（或上一轮的迟到的）running 与新会话无关，继承过来
+      // 会让 _sendUser 把用户挡在门外（见 TurnStatus.reset 的说明）。
+      this._turnStatus.reset(existing);
       return existing;
     }
 
@@ -1013,6 +1126,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     this._dshSessions.set(uiId, dshId);
     this._currentDshId = dshId;
+    this._turnStatus.reset(dshId);
     // 该 UI 会话在**这个 activation**里首次发消息，且此前已有人类历史（典型：host 重启后继续旧对话）。
     // 说清楚模型到底记不记得之前的内容 —— 这个 note 是用户唯一能看到的判据，别含糊。
     if (this._hadHistoryBeforeSend) {
@@ -1035,6 +1149,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // 于是换模型/换 key/换路径之后，会话记忆仍在（C5）。
     this._dshSessions.clear();
     this._currentDshId = undefined;
+    this._turnStatus.reset(); // 进程没了 → 线上状态一概不可信
     this._backendState = 'offline';
     this._backendModel = undefined;
     this._backendDetail = undefined;
@@ -1415,8 +1530,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   // ----- 子进程通知 → 状态/消息协议 -----
 
   private _onDshStatus(frame: DshStatusFrame): void {
-    if (this._currentDshId !== undefined && frame.sessionId !== this._currentDshId) return;
-    if (frame.status === 'idle' && this._liveRunning) {
+    // 判据抽在 turnState.TurnStatus 里（本文件 import vscode，probe 加载不了）：
+    // 非当前会话的通知忽略、running/idle 只在翻转时算数、重复通知幂等。
+    const flipped = this._turnStatus.apply(frame);
+    // 首次通知会认领会话 id（ready → _connectLive 那条路上 initialize 早于 _ensureDshSession，
+    // 此时 _currentDshId 还是空的）—— 认领结果回写，两者别各记一套。
+    if (this._turnStatus.id !== undefined) {
+      this._currentDshId = this._turnStatus.id;
+    }
+    if (flipped && !this._turnStatus.running && this._liveRunning) {
       // idle 可能紧随同一批 stdout 行到达；微任务里收尾，避免同 burst 双重 finalize
       queueMicrotask(() => this._finishTurn('done'));
     }
@@ -1520,7 +1642,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'turn/end': {
         const reason = d.reason && typeof d.reason === 'object' ? d.reason : undefined;
         const kind = reason?.kind;
-        if (kind && kind !== 'completed' && kind !== 'aborted') {
+        // C8：`interrupted` 进白名单。它是**我们自己杀进程之后、运行时在下次 resume 时补平**
+        // 「悬空尾 turn」所用的那个 reason（另见 TOOL_OUTCOME_UNKNOWN 的 tool/result）——
+        // 补平是运行时的正确行为，不是异常，不该被当成「本轮异常结束」上浮。
+        if (kind && kind !== 'completed' && kind !== 'aborted' && kind !== 'interrupted') {
           // DSH 的 reason.error 是结构化失败 {message, code}，尽量带出来让用户看得见
           const err = reason ? (reason as { error?: unknown }).error : undefined;
           const code = err && typeof err === 'object' ? (err as { code?: unknown }).code : undefined;
@@ -1649,6 +1774,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** 子进程意外退出（非用户 kill）。live 中 → 上浮错误收尾；空闲 → 状态标 error。 */
   private _onDshExit(code: number | null): void {
     this._dsh = undefined; // 下一个 live 轮重新 spawn
+    this._turnStatus.reset(); // 进程没了 → 线上状态一概不可信
     if (this._liveRunning) {
       this._surfaceLiveError(`DSH 子进程意外退出（code=${code}）`);
     } else {
@@ -1906,40 +2032,67 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    // hook 由 DSH 用 `bash -c` 跑，而 bash 可能是 WSL 也可能是 Git Bash —— 路径形态完全不同，
-    // 必须先探出来（同一台机器上两种都见过）。
+    // hook 由 DSH 用 `bash -c` 跑，而 bash 既可能是 WSL 也可能是 Git Bash —— 命令里的路径形态
+    // 完全不同（WSL 下 `D:\…\node.exe` 连可执行文件都算不上，直接 command not found）。
+    // probeShell 只是**首猜**：它只采一次样、超时就回落 posix，而 VS Code 重载那一刻恰恰是
+    // WSL 最冷的时候 —— 猜错的代价是审批静默失效。所以真正的判据是**自检本身**：首猜不过就
+    // 换另一种形态再跑一遍自检，哪个跑得通用哪个。两种形态互斥（A 形态的命令在 B 里必然
+    // command not found），所以「谁过」是无歧义的。
     const runCwd = this._dshRunCwd();
-    const shellKind = await probeShell(runCwd);
+    const guess = await probeShell(runCwd);
+    const order: ShellKind[] = guess === 'wsl' ? ['wsl', 'posix'] : ['posix', 'wsl'];
 
-    try {
-      const timeoutMs = this._approvalTimeoutMs();
-      const files = writeApprovalHookFiles({
-        storageDir: this._storageDir,
-        nodePath,
-        shellKind,
-        url: server.url,
-        token: server.token,
-        // 三层超时梯度：扩展先放弃并拒绝(540) < 脚本 socket 放弃(560) < DSH 杀 hook(580)
-        scriptTimeoutMs: timeoutMs + 20000,
-        hookTimeoutSec: Math.ceil((timeoutMs + 40000) / 1000),
-        baseConfigPath: this._baseConfigPathAbs(),
-      });
-      this._approval = server;
-      this._approvalFiles = files;
-    } catch (err) {
-      server.dispose();
-      this._approvalWarn(`审批 hook 生成失败：${err instanceof Error ? err.message : String(err)}`);
-      return;
+    let failure = '';
+    for (const shellKind of order) {
+      let files: ApprovalHookFiles;
+      try {
+        files = this._writeApprovalFiles(shellKind, nodePath, server);
+      } catch (err) {
+        // 生成失败（基础 cordis.yml 不是块状列表等）与 shell 形态无关 → 换一种也一样，不再试
+        server.dispose();
+        this._approvalWarn(`审批 hook 生成失败：${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
+      // 自检：这条 hook 命令在**同一个 shell**（DSH 也是 bash -c）里跑得起来吗？
+      const test = await testApprovalHook(files.hookCommand, runCwd);
+      if (test.ok) {
+        this._approval = server;
+        this._approvalFiles = files;
+        console.log(
+          `[approval] 事前审批已就绪（shell=${shellKind}${shellKind === guess ? '' : `，首猜 ${guess} 猜错了`}，hook 自检通过）`
+        );
+        return;
+      }
+      failure += `${failure ? '；' : ''}${shellKind} 形态：${test.detail}`;
     }
 
-    // 自检：这条 hook 命令在**同一个 shell**（DSH 也是 bash -c）里跑得起来吗？
-    // 起不来 = 审批不会生效 —— 这种情况必须让用户知道，而不是看起来配好了。
-    const test = await testApprovalHook(this._approvalFiles.hookCommand, runCwd);
-    if (test.ok) {
-      console.log(`[approval] 事前审批已就绪（shell=${shellKind}，hook 自检通过）`);
-    } else {
-      this._approvalWarn(`审批 hook 自检未通过，审批不会生效：${test.detail}`);
-    }
+    // 两种形态都跑不起来 = 审批**确实**接不进去。这里要「干净地不启用」而不是留着半套：
+    // 丢掉派生配置（下次 spawn 回到用户原配置，不往他们的 DSH 里塞一条跑不起来的 hook），
+    // 同时清掉 _approval —— 于是 _ensureApproval 下次 spawn 会重试一次（重载时 WSL 冷启动
+    // 失败是暂时的，热了之后自愈），弹窗有 _approvalWarned 兜着，不会刷屏。
+    server.dispose();
+    this._approvalFiles = undefined;
+    this._approvalWarn(`审批 hook 自检未通过，审批不会生效：${failure.slice(0, 400)}`);
+  }
+
+  /** 按指定 shell 形态生成三件套（hook 脚本 / hooks.json / 派生 cordis.yml）。 */
+  private _writeApprovalFiles(
+    shellKind: ShellKind,
+    nodePath: string,
+    server: ApprovalServer
+  ): ApprovalHookFiles {
+    const timeoutMs = this._approvalTimeoutMs();
+    return writeApprovalHookFiles({
+      storageDir: this._storageDir,
+      nodePath,
+      shellKind,
+      url: server.url,
+      token: server.token,
+      // 三层超时梯度：扩展先放弃并拒绝(540) < 脚本 socket 放弃(560) < DSH 杀 hook(580)
+      scriptTimeoutMs: timeoutMs + 20000,
+      hookTimeoutSec: Math.ceil((timeoutMs + 40000) / 1000),
+      baseConfigPath: this._baseConfigPathAbs(),
+    });
   }
 
   /**
@@ -3125,6 +3278,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // 既能把重开会话的累计恢复出来，也保证"切到没有用量的会话"时细条被清掉。
       usage: this._usageReadout(),
     });
+    // C8：按钮状态跟会话走（切会话/重开会话/窗口重载后由这一条纠偏）。
+    // 判据是**已落盘**的 lastTurn，所以重载窗口甚至重启 VS Code 之后按钮照常在。
+    this._sendTurnState();
   }
 
   private _post(msg: ExtToWebview): void {

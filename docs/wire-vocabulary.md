@@ -53,6 +53,47 @@ client session 有 `PendingWait('approval')`）。但当前部署配置下工具
 - **3.1 Shield 的 reasoningEffort 菜单**：不是高优先 —— 这条 wire 下发不了，
   改配置重启才有意义。
 
+## C8 补记：wire 方法全量清单 + 四条运行时行为（2026-09-16 实测）
+
+C1/C5 都是「这条 wire 少东西」的教训。C8 之前把**方法的全量清单**和几条靠实测才知道的**行为语义**
+补在这里 —— 这些不是推测，逐条有实证或上游源码依据，别再凭直觉重推一遍。
+
+**方法全量清单（`dsh-sdk-jsonrpc-server` 的 `handleRequest` 是穷举 switch，故这份清单是完整的）**
+
+| 方向 | 方法 | 说明 |
+|---|---|---|
+| 客户端 → 服务端 | `initialize` | 每个进程一次；只认 `cwd / provider / model / maxTokens` |
+| | `session/prompt` | 提交一轮；**只回「收执」`{messageId}`，不回本轮结果** |
+| | `shutdown` | |
+| 服务端 → 客户端 | `session.event` | 所有转写事件（信封 `{type,seq,time,data}`，载荷在 `data`） |
+| | `session.status` | 只用两个值 `running` / `idle` |
+| | `subagent.started` / `subagent.finished` | |
+
+- **没有 cancel。** 取消能力在进程内是有的（`dsh-agent-loop` 里有 `cancel`），只是**没接到这条 wire**。
+  ⇒ **停止一轮的唯一手段就是杀子进程**（下一轮再惰性重启）。C8 的「中断续跑」全建立在这条约束上。
+- **没有会话状态查询。** 只有 `session.status` 这条**翻转通知**（`if (status !== previousStatus) emit(...)`），
+  **漏收一条就再也补不回来**。⇒ 它只能用来**放宽**判断（已知 running 就多等一会儿），
+  **绝不能**用来认定「跑完了」—— 真完成信号是 idle 通知本身或子进程退出。（`TurnStatus` 的注释与
+  `probe-turn-state.mjs` 里那条「已知 idle 不是完成信号」守的就是这个。）
+- **同一 sessionId 的第二次 `session/prompt` 会排队，不并发、不报错。** 它进 inbox 的 `next-turn`
+  队列，当前 turn 跑完后**作为独立的新一轮**被消费（`wakeDriver` 在非 idle 时只置 `wakeRequested`；
+  一次 turn 只吃一条 next-turn）。收执是立刻给的，**没有幂等键**。
+  ⇒ **「重发」不会造成工具重复执行** —— 这与「超时重发要防重复」的直觉相反（C8 已把这条纠正写进 backlog）。
+- **resume 会自动补平未闭合的尾 turn。** 悬空 `tool/call` 补成 `tool/result`（错误码
+  `TOOL_OUTCOME_UNKNOWN` / `TOOL_NOT_STARTED`，文案明说「结果未知，别盲重试」）+ `step/end` +
+  `turn/end reason={kind:"interrupted"}`。
+  ⇒ **杀掉进程之后 resume 是安全的**；也正因如此，`turn/end` 的 reason 白名单里必须有 `interrupted`
+  （它是补平用的正常 reason，不是「本轮异常结束」）。
+- **写盘是 200 ms 攒批**，而子进程的干净退出路径是
+  `stdin end → disposeAndExit(0) → session/disposed → flush → fsync`。
+  ⇒ `stdin.end()` 与 `child.kill()` 放在**同一 tick** 等于扔掉那批必然还在内存里的事件。
+  实测：空闲进程 `stdin.end()` 后 **~25 ms** 就 `exit(0)`（3/3 轮），所以「先优雅、2 s 后硬杀」是划算的。
+  ⚠️ 但**优雅停止只争取一次 flush，不是事务**：超时后仍是硬杀，那 ≤200 ms 的窗口只是变小、没消失。
+
+**读 DSH 会话日志的坑**：`dsh-sessions/**/session.jsonl.zstd` 是**一串拼接的 zstd 帧**（每批落盘一个帧），
+而 `zstdDecompressSync` 与 `createZstdDecompress` **都只解第一帧就收工**（实测 15 帧的文件两者都只吐 1 行）。
+要读全必须自己按魔数 `28 b5 2f fd` 切帧、逐帧解。`scripts/probe-c8-runtime.mjs` 里有可直接抄的实现。
+
 ## 复现前置：bash 工具必须可用
 
 抓「改文件/破坏性」这类帧依赖 dsh-bash-local 真能跑 bash。它在 Windows 上就是

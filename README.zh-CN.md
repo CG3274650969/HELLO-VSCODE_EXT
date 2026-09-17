@@ -216,6 +216,29 @@ globalStorage；Harness 会话与内嵌聊天分开存放。
 
 ---
 
+## 运行可靠性：中断与续跑
+
+停止是 wire 的硬约束而不是我们的选择：**没有 cancel RPC**，所以**停一轮 = 杀子进程**（下一轮再惰性
+重启）。本仓能做的是让这件事**可见、可续、可解释**：
+
+- **停止会留痕，而不是丢掉。** 被中断的一轮会把 `lastTurn` 落在会话上（随会话落盘），还挂着的工具卡
+  落成 error，并插一行灰 note 说明：DSH 侧记忆保留，但被中断那次工具调用的**结果未知**（与运行时
+  补平悬空 turn 时给模型的措辞一致）。随后 composer 上方出现**「继续」条** —— 点它会把上一条用户消息
+  **逐字重发**到**同一个** DSH 会话，模型接着往下跑。重载窗口、甚至重启 VS Code 之后这条仍在
+  （判据是从盘上读的）。
+- **报错就是真停。** 界面报 error 的一轮现在会**杀掉子进程**。此前是界面说 error、进程却还在执行工具，
+  而它的事件被静默丢弃 —— 你看不见那份工作，DSH 却记得。
+- **长轮不再被误判为失败。** `session/prompt` 回的是**收执**、不是本轮结果，所以一个工具密集的长轮
+  迟迟不给收执是正常的。收执超时已放宽到 10 分钟；而且万一真的超时、而会话**已知仍在运行**，
+  界面会继续等下去，不再直接判 error。
+- **停止更温和。** `kill()` 改成先关 stdin、2 秒后才强杀，给运行时留出它自己的干净退出路径
+  （`disposeAndExit(0)` → flush → fsync）—— 写盘是 200 ms 攒批的，同一 tick 里做完这两件事等于把那批扔掉。
+
+DSH 侧还在跑的时候想发新消息会被拦下并提示先停止（wire 没有 cancel，那一轮抢占不了）。
+这些判断依据的 wire 方法全量清单见 `docs/wire-vocabulary.md`。
+
+---
+
 ## 真 DSH 组件画面（react-live，可选）
 
 当 harness 转写用 DSH 自带 React 组件渲染时，面板会加载 `media/dsh-live/` 的单文件产物
@@ -247,6 +270,7 @@ Harness 才是完成态。
 | `src/chatViewProvider.ts` | 聊天 webview 宿主：拉起 DSH 运行时、握手、消息/工具流转发、模式与配置条逻辑 |
 | `src/dshRuntime.ts` | DSH JSON-RPC 子进程生命周期（spawn/握手/心跳/事件分发） |
 | `src/sessionStore.ts` | 会话标题、软删除/回收站、留存判据、续聊落盘（globalStorage） |
+| `src/turnState.ts` | 轮次状态判据：这条会话要不要显示「继续」、DSH 侧是否已知在跑（纯函数，不引 `vscode`） |
 | `src/sessionSearch.ts` | 存下来的转写做全文检索（纯函数，不引 `vscode`） |
 | `src/sessionExport.ts` | 转写 → Markdown / JSON，以及安全的默认文件名（纯函数，不引 `vscode`） |
 | `src/dshPaths.ts` | DSH 会话日志的路径算法（**逐字复刻持久化插件**）+ 受控删除（纯函数，不引 `vscode`） |
@@ -256,6 +280,9 @@ Harness 才是完成态。
 | `scripts/capture-dsh-frames.mjs` | DSH 运行时抓帧工具（`DSH_CAP_*`） |
 | `scripts/probe-session-tools.mjs` | 检索/导出/软删除自检（先 `npm run compile`；不需要 VS Code、不需要 key） |
 | `scripts/probe-purge.mjs` | 路径复刻对账/受控删除/留存边界自检（同上；**路径对账需 Node ≥ 22.15**，太老时会让你改用 `dist-runtime/node/node.exe`） |
+| `scripts/probe-turn-state.mjs` | 「继续」判据 + 在线状态跟踪自检（同上；不需 VS Code、不需 key） |
+| `scripts/probe-approval-shell.mjs` | C1 审批 hook 的 shell 形态判据自检：至少一种形态跑得通、两种互斥、首猜猜错能被另一种救回来（同上；不需 VS Code、不需 key） |
+| `scripts/probe-c8-runtime.mjs` | C8 的运行时前提 spike：第二条 prompt 排队、杀后 resume 补平、优雅 vs 硬杀。**需 API key**、会花掉真实模型轮 |
 | `scripts/update-dsh.mjs` | 运行时依赖治理：把 DSH 检出锁到 tag、查漂移、跑升级仪式 + 冒烟（见 `docs/runtime-dependency.md`） |
 | `docs/runtime-dependency.md` | 治理决策依据：把 DSH 检出当「版本化运行时依赖」、升级仪式、「何时切官方 npm」观察清单 |
 

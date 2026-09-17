@@ -1273,6 +1273,26 @@ body.react-live #empty-hint {
   color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
 }
 
+/* C8「继续」条：同 review-bar 的体例（composer 内、两画面可见），只是多一个右侧按钮 */
+.retry-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px 3px 10px;
+  border: 1px solid var(--dsw-alias-border-l2, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.25)));
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-1, var(--vscode-editor-inactiveSelectionBackground, rgba(128, 128, 128, 0.12)));
+  font-size: 11px;
+}
+.retry-hint {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+}
+
 /* 面板浮层：铺满 body（body 已 position:relative + overflow:hidden），盖在历史面板(30)之上 */
 .review-panel {
   position: absolute;

@@ -90,6 +90,11 @@
   var approvalId = null;
   var expandedRel = null; // 当前展开 diff 的审阅项 id（同刻只开一行；键用 id 不用 rel，C4 起可跨根）
 
+  // C8「继续」条：扩展 retry-offer 驱动显隐（on = 上一轮以中断/出错收场）。
+  // 判据在扩展侧（已落盘的 lastTurn），这里只管显示与点击 —— 前端不猜「该不该能继续」。
+  var retryBar = document.getElementById('retry-bar');
+  var retryBtn = document.getElementById('retry-btn');
+
   // C3a 用量读数：扩展把整条 UsageReadout 算好下发，这里只格式化 + 填充。null = 无数据，整条隐藏。
   var usageBar = document.getElementById('usage-bar');
   var usageSummary = document.getElementById('usage-summary');
@@ -249,6 +254,20 @@
     var id = approvalId;
     clearApproval();
     post({ type: 'approval-answer', id: id, allow: !!allow });
+  }
+
+  // ---------- C8「继续」条（retry-offer 驱动） ----------
+
+  /**
+   * 显隐完全由扩展说了算：`on` = 这条会话上一轮以中断/出错收场。
+   * 这里**不做任何本地推断**（不数消息、不看状态）—— 判据是扩展侧已落盘的 lastTurn，
+   * 前端猜一遍只会多出一套会和它打架的规则。
+   */
+  function renderRetryBar(on) {
+    retryBar.hidden = !on;
+    // 每轮终态/快照扩展都会重发 retry-offer → 条一重现就复位（点击时置的 disabled
+    // 靠这里回正，不依赖 CSS transition 之类的时序）。
+    if (on) retryBtn.disabled = false;
   }
 
   // ---------- 2.1 本轮改动审阅 UI（review-set / review-clear 驱动） ----------
@@ -1812,6 +1831,12 @@
       atBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 40;
     });
 
+    // ---- C8「继续」条 ----
+    retryBtn.addEventListener('click', function () {
+      retryBtn.disabled = true; // 双保险：扩展侧 _retryLast 也会挡运行中的重发
+      post({ type: 'retry-last' });
+    });
+
     // ---- C1 事前审批确认条 ----
     approvalAllowBtn.addEventListener('click', function () {
       answerApproval(true);
@@ -2049,6 +2074,11 @@
         runBusy = !!data.busy;
         if (!runBusy) sending = false; // 收尾解锁：即使全程没等来 assistant 事件也不卡输入
         updateBusy();
+        break;
+
+      case 'retry-offer':
+        // C8：上一轮中断/出错 → 亮「继续」条。判据在扩展侧（已落盘的 lastTurn）。
+        renderRetryBar(!!data.on);
         break;
 
       case 'live-config':

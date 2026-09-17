@@ -242,6 +242,35 @@ the fs side always allows (guardrail degrades, visibility stops with it).
 
 ---
 
+## Reliability: interrupt & continue
+
+Stopping is a hard constraint of the wire, not a choice: there is **no cancel RPC**, so **stopping a
+turn means killing the child process** (the next turn lazily respawns it). What this repo does is
+make that visible, resumable and honest:
+
+- **Stop is recorded, not lost.** An interrupted turn sets `lastTurn` on the session (persisted), its
+  running tool cards turn into errors, and a grey note explains that the DSH-side memory is kept but
+  the interrupted tool call's outcome is **unknown** (same wording the runtime gives the model when it
+  repairs a dangling turn). A **Continue** bar then appears above the composer — click it and the last
+  user message is **re-sent verbatim** onto the *same* DSH session, so the model picks up where it
+  left off. The bar survives a window reload or a VS Code restart (the verdict is read off disk).
+- **Errors really stop.** A turn that surfaces as an error now **kills the child process**. Before
+  this, the UI said "error" while the process kept executing tools and its events were silently
+  dropped — you couldn't see that work, but DSH remembered it.
+- **Long turns are not mistaken for failures.** `session/prompt` returns an *ack*, not the turn's
+  result, so a long tool-heavy turn legitimately takes a while to acknowledge. The ack timeout is now
+  10 minutes, and if it ever does fire while the session is *known to be running*, the UI keeps
+  waiting instead of declaring an error.
+- **Stopping is gentler.** `kill()` now ends stdin first and force-kills only 2 s later, giving the
+  runtime its own clean-exit path (`disposeAndExit(0)` → flush → fsync) — writes are batched at
+  200 ms, and doing both in the same tick threw that batch away.
+
+Trying to send while a turn is still running on the DSH side is refused with a hint to stop first
+(the wire has no cancel, so that turn cannot be pre-empted). See `docs/wire-vocabulary.md` for the
+full wire-method inventory this rests on.
+
+---
+
 ## Real DSH components (react-live, optional)
 
 When the harness transcript is rendered with DSH's own React components, the panel pulls in the
@@ -276,6 +305,7 @@ finished path.
 | `src/chatViewProvider.ts` | Chat webview host: spawns the DSH runtime, handshake, message/tool streaming, mode & live-config logic |
 | `src/dshRuntime.ts` | DSH JSON-RPC child-process lifecycle (spawn/handshake/heartbeat/events) |
 | `src/sessionStore.ts` | Session titles, soft delete/trash, retention rules & continuation persisted under global storage |
+| `src/turnState.ts` | Turn-state verdicts: whether a session needs a “Continue”, and whether the DSH side is known to be running (pure, no `vscode`) |
 | `src/sessionSearch.ts` | Full-text search over stored transcripts (pure, no `vscode`) |
 | `src/sessionExport.ts` | Transcript → Markdown / JSON, and safe default file names (pure, no `vscode`) |
 | `src/dshPaths.ts` | DSH session-log path algorithm (**copied verbatim from the persistence plugin**) + guarded removal (pure, no `vscode`) |
@@ -285,6 +315,9 @@ finished path.
 | `scripts/capture-dsh-frames.mjs` | Frame-capture tool for the DSH runtime (`DSH_CAP_*`) |
 | `scripts/probe-session-tools.mjs` | Self-check for search/export/soft-delete (`npm run compile` first; no VS Code, no API key) |
 | `scripts/probe-purge.mjs` | Self-check for path parity / guarded removal / retention boundaries (same; **path parity needs Node ≥ 22.15** and points you at `dist-runtime/node/node.exe` otherwise) |
+| `scripts/probe-turn-state.mjs` | Self-check for the Continue-button verdict + online status tracking (same; no VS Code, no API key) |
+| `scripts/probe-approval-shell.mjs` | Self-check for the C1 approval hook's shell-form verdict: at least one form runs, the two are mutually exclusive, and the second form rescues a wrong first guess (same; no VS Code, no API key) |
+| `scripts/probe-c8-runtime.mjs` | Runtime spike for C8: queued second prompt, kill-then-resume turn repair, graceful vs hard kill. **Needs an API key** and spends real model turns |
 | `scripts/update-dsh.mjs` | Runtime-dependency governance: lock the DSH checkout to a tag, check drift, run the upgrade ritual + smoke (see `docs/runtime-dependency.md`) |
 | `docs/runtime-dependency.md` | Governance decision for treating the DSH checkout as a versioned runtime dependency, the upgrade ritual, and the “when to switch to official npm” checklist |
 

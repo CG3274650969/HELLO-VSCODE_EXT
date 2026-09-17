@@ -9,11 +9,32 @@
  * 哲学只落在那一处）。
  *
  * 进程生命周期：由构造时给的回调 makeRequest() 惰性 spawn；initialize 每个进程
- * 只跑一次；kill() 杀进程并令已缓冲/迟到的 stdout 行不再分发。没有 cancel RPC
- * → 停止一轮的唯一手段就是 kill 子进程（下一轮再惰性重启）。
+ * 只跑一次；kill() 停进程（先争取一次优雅退出，见 GRACEFUL_KILL_MS）并令已缓冲/
+ * 迟到的 stdout 行不再分发。没有 cancel RPC → 停止一轮的唯一手段就是停子进程
+ * （下一轮再惰性重启）。
  */
 import { spawn, type ChildProcess } from 'child_process';
 import { createInterface } from 'readline';
+
+/**
+ * kill() 给子进程的优雅退出窗口。
+ *
+ * DSH 运行时的干净退出路径是 `stdin end → disposeAndExit(0) → session/disposed → flush → fsync`
+ * （写盘是 200 ms 攒批，硬切会丢掉最后一批）。实测空闲进程 stdin.end() 后 **~25 ms** 就 exit(0)，
+ * 2 s 对「手上还有一批没落盘」的忙进程是 80 倍余量。
+ *
+ * ⚠️ 这只是**争取一次 flush，不是事务**：超时后仍然是硬杀，那 ≤200 ms 的窗口只是变小、没有消失。
+ */
+const GRACEFUL_KILL_MS = 2000;
+
+/**
+ * session/prompt 的**回执**上限（不是「本轮上限」）。
+ *
+ * 回执只是服务端「收下了」的收条（`{messageId}`），本轮何时结束看 `session.status` idle
+ * 或子进程退出。所以这个值要**宽**：拿回执超时当本轮失败，会把一个还在跑、还在执行工具的
+ * 长轮误报成 error。保留一个上限是刻意的 —— 子进程彻底卡死时得有出路。
+ */
+const PROMPT_ACK_TIMEOUT_MS = 10 * 60_000;
 
 /** 发给 session/prompt 的内容块（v1 只用纯文本块）。 */
 export type ContentBlock = { type: 'text'; text: string };
@@ -124,6 +145,20 @@ function abortError(): Error {
   return e;
 }
 
+/** 请求超时错误的 name。调用方一律走 `isDshTimeout()`，不要自己比字符串。 */
+const DSH_TIMEOUT_ERROR = 'DshTimeoutError';
+
+function timeoutError(method: string): Error {
+  const e = new Error(`DSH「${method}」响应超时`);
+  e.name = DSH_TIMEOUT_ERROR;
+  return e;
+}
+
+/** 这个错误是不是「请求超时」（而不是子进程没了 / JSON-RPC 报错 / stdin 写失败）。 */
+export function isDshTimeout(err: unknown): boolean {
+  return err instanceof Error && err.name === DSH_TIMEOUT_ERROR;
+}
+
 function rpcErrorText(err: unknown): string {
   if (err && typeof err === 'object') {
     const code = (err as { code?: unknown }).code;
@@ -136,7 +171,8 @@ function rpcErrorText(err: unknown): string {
 interface PendingRec {
   resolve: (v: unknown) => void;
   reject: (e: unknown) => void;
-  timer: ReturnType<typeof setTimeout>;
+  /** 无超时的请求（timeoutMs <= 0）没有计时器。 */
+  timer?: ReturnType<typeof setTimeout>;
 }
 
 export class DshRuntime {
@@ -147,6 +183,8 @@ export class DshRuntime {
   private dead = false;
   private exited = false;
   private killedByUser = false;
+  /** kill() 里那个「优雅窗口用完了就硬杀」的计时器（子进程真的退出后清掉）。 */
+  private forceKillTimer?: ReturnType<typeof setTimeout>;
 
   constructor(
     private readonly makeRequest: () => DshSpawnRequest,
@@ -192,6 +230,11 @@ export class DshRuntime {
 
   /** 进程结束（自发退出/spawn 失败/被杀）。统一拒绝在途请求；被杀时不上浮 onExit。 */
   private endChild(message: string, code: number | null): void {
+    // 先于 exited 早退：kill() 会把 exited 抢先置位，这里才是清计时器的唯一时机。
+    if (this.forceKillTimer !== undefined) {
+      clearTimeout(this.forceKillTimer);
+      this.forceKillTimer = undefined;
+    }
     if (this.exited) return;
     this.exited = true;
     this.dead = true;
@@ -208,7 +251,17 @@ export class DshRuntime {
     }
   }
 
-  /** 主动杀掉子进程（用户停止 / provider dispose）。不触发 onExit。 */
+  /**
+   * 主动停掉子进程（用户停止 / 出错收尾 / provider dispose）。不触发 onExit。
+   *
+   * **两段式**：先 `stdin.end()` 让运行时走它自己的干净退出路径（flush 攒批 + fsync），
+   * 给它 GRACEFUL_KILL_MS；到点还没退就硬杀。对外**仍是同步返回**、语义与从前一致
+   * （调用后 `dead = true`，已缓冲/迟到的 stdout 行一律不再分发；在途请求立刻被拒）——
+   * 变的只是「强杀」这一步延后了一小会儿。
+   *
+   * 为什么要争取这一次 flush：写盘是 200 ms 攒批，而 `stdin.end()` 与 `child.kill()`
+   * 放在同一 tick 等于把那批必然还在内存里的事件直接扔掉。
+   */
   kill(): void {
     this.killedByUser = true;
     this.dead = true;
@@ -220,10 +273,18 @@ export class DshRuntime {
       } catch {
         /* stdin 已关 */
       }
-      try {
-        child.kill();
-      } catch {
-        /* 已退出 */
+      // 进程还活着才排这个计时器。为什么必须在这里排、而不是靠 endChild：
+      // kill() 已经把 exited 置位，真正 exit 时 endChild 会在开头就直接返回 —— 这条路径上
+      // 没有别的地方会强杀。反过来，子进程若已退出就没什么可杀的（挂上也只是空转 2 s）。
+      if (child.exitCode === null && child.signalCode === null) {
+        this.forceKillTimer = setTimeout(() => {
+          this.forceKillTimer = undefined;
+          try {
+            child.kill();
+          } catch {
+            /* 已退出 */
+          }
+        }, GRACEFUL_KILL_MS);
       }
     }
     const err = abortError();
@@ -282,7 +343,12 @@ export class DshRuntime {
     }
   }
 
-  /** 发一个请求，按 id 配对响应。signal 中止 → AbortError；超时 → Error。 */
+  /**
+   * 发一个请求，按 id 配对响应。signal 中止 → AbortError；超时 → Error。
+   *
+   * `timeoutMs <= 0` = **不挂计时器**，一直等到有响应、被中止、或子进程收尾
+   * （`endChild` 会把在途请求全部拒绝，所以挂死不会漏掉）。
+   */
   private request(
     method: string,
     params: Record<string, unknown>,
@@ -295,9 +361,12 @@ export class DshRuntime {
     }
     const id = ++this._id;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.settle(id, false, new Error(`DSH「${method}」响应超时`));
-      }, timeoutMs);
+      const timer =
+        timeoutMs > 0
+          ? setTimeout(() => {
+              this.settle(id, false, timeoutError(method));
+            }, timeoutMs)
+          : undefined;
       this.pending.set(id, {
         resolve: (v) => resolve(v),
         reject: (e) => reject(e),
@@ -327,9 +396,19 @@ export class DshRuntime {
     );
   }
 
-  /** 提交一轮用户消息；只等「回执」messageId（本轮何时结束看 session.status idle）。 */
+  /**
+   * 提交一轮用户消息；只等「回执」messageId（本轮何时结束看 session.status idle）。
+   *
+   * ⚠️ 别把这个超时当作本轮失败 —— 回执早于本轮完成，超时只说明服务端迟迟没确认收下
+   * （见 PROMPT_ACK_TIMEOUT_MS 的说明）。调用方要区分「真失败」与「只是还没回执」。
+   */
   prompt(sessionId: string, blocks: ContentBlock[], signal?: AbortSignal): Promise<unknown> {
-    return this.request('session/prompt', { sessionId, contentBlocks: blocks }, 120_000, signal);
+    return this.request(
+      'session/prompt',
+      { sessionId, contentBlocks: blocks },
+      PROMPT_ACK_TIMEOUT_MS,
+      signal
+    );
   }
 
   /** 让子进程正常退出（一般不用：kill 即可）。 */

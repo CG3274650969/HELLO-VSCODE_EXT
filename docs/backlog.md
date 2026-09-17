@@ -17,7 +17,8 @@
 | C5 | 会话记忆跨重启（复用 DSH_SESSION_ROOT） | P1 | wire 无 resume；已自建运行时补丁接上（upstream 有现成 resume-first 写法）。**阶段 0 闸门 + 构建冒烟 + F5 真机均已通过**（2026-09-11）：未补丁必现 id collision，补丁后跨进程答出暗号；真机五条用例逐条见正文 | [x] |
 | C6 | 会话全文检索 + 导出 + 软删除 | P1 | 无。**已实现、自检 47/47、构建冒烟无回归；F5 真机七项全过**（2026-09-14，含回收站跨重启）—— 逐条见正文 | [x] |
 | C7 | 删除即彻底 + 回收站留存（原「转写敏感内容治理」，**脱敏/加密已砍**） | P1 | 无。**已实现、自检 20/20、C6 自检 47/47 无回归；F5 真机八项全过**（2026-09-15）—— 逐条见正文 | [x] |
-| C8 | 运行可靠性：中断续跑 / 重试 / 超时幂等 | P1 | 受「无 cancel RPC」限制 | [ ] |
+| C8 | 运行可靠性：中断续跑 + 超时幂等（原「/ 重试 / 大转写分片」，收窄，见正文） | P1 | 受「无 cancel RPC」限制。**已实现、自检全绿；F5 真机全过**（2026-09-17，用户确认） | [x] |
+| C8c | 存储层写入：`persist()` 原子写 / 写入成本 / `toolInput` 上限（从 C8 ③ 拆出） | P1 | 无 | [ ] |
 | C9 | Run inspector（本轮帧时间线/耗时/工具统计） | P1 | 无（现有帧已够） | [ ] |
 | C10 | 上下文窗口指示 + 超限压缩/归档 | P1 | 数据前置已解（C3a 已透出窗口/占用）；压缩动作本身待做 | [ ] |
 | C11 | 会话级推理档位（reasoningEffort） | P1 | **受限**：wire 下发不了，需 runtime 先支持 | [ ] |
@@ -61,6 +62,28 @@
   现在起服务时先用扩展进程 spawn `bash -c 'uname -s'` **探 shell**，再决定路径形态：WSL 要 exe 用 `/mnt/d/…`
   + 脚本参数用 Windows 形式（混着写），Git Bash 两边都用 Windows 形式。**两种形态都已端到端实测**。
   顺带：不能在自己工具 shell 里判 shell 类型（PATH 被污染），必须由扩展进程探。
+
+- **踩到的坑之二（2026-09-17 已修）：探测本身是个竞态，「探 shell」不足以定形态。**
+  线上症状是一条弹窗：`审批 hook 自检未通过，审批不会生效：bash 退出码 1` —— 外加上当时**只收集了 stderr**，
+  而这条 bash 的话全打在 stdout 上，于是线索是一句查不下去的「退出码 1」。
+  根因是**扩展宿主的 `bash` 与你的工具 shell 里的 `bash` 不是同一个东西**：扩展宿主是 GUI 起的纯 Windows 进程，
+  合并 PATH 里 `%SystemRoot%\system32`（WSL shim `bash.exe`）**排在** `E:\Git\cmd` 之前 ⇒ `spawn('bash')` 命中的是 WSL shim；
+  而在 Git Bash 里跑 `where bash` 会被自己的 bin 抢到前头 —— 这也是当初「两种形态都已实测」却仍然线上翻车的原因（测的环境是偏的）。
+  更要命的是 `probeShell` **只采一次样**、超时 8 s 就静默回落 posix，而实测冷启动的 WSL shim 跑 `uname -s` 要 **4.8–5.5 s**
+  —— VS Code 重载那一刻恰好是 WSL 最冷的时候，猜错 = 用 Windows 形态的路径去喂 WSL = `command not found` = 审批静默失效。
+  **修法：`probeShell` 降级成「首猜」而非判据；真正的判据是自检本身** —— 首猜那个形态自检不过就换另一种再自检一遍，
+  哪个过用哪个（两种形态互斥：A 形态的命令在 B 里必然 `command not found`，所以「谁过」无歧义）。
+  两种都不过才是真接不上，此时**干净地不启用**：丢掉派生配置（不往用户 DSH 里塞一条跑不起来的 hook）、清掉 `_approval`,
+  让下次 spawn 重试（冷启动失败是暂时的，热了会自愈；弹窗有 `_approvalWarned` 兜着不刷屏）。
+  同时 `testApprovalHook` 的失败话术改成**同时带 stdout 与 stderr**（两边都空则明说），别再把可诊断性丢掉。
+- **自检**：[`scripts/probe-approval-shell.mjs`](../scripts/probe-approval-shell.mjs) —— 用真实的 `probeShell()` + 真实生成物
+  跑两种形态，钉住三个前提：至少一种能过（否则确实该弹窗）、两种互斥（所以判据无歧义）、首猜猜错时另一种能救回来；
+  外加四条失败话术断言（带 stdout / 带 stderr / 两边都空要明说 / stdout 有内容却 exit 0 不能算通过）。
+  `npm run compile && node scripts/probe-approval-shell.mjs` → **7/7**（本机 Git Bash 环境下跑出「posix 过、wsl 不过」，
+  正是扩展宿主那边的镜像）。不需要 VS Code、不需要 API key。
+  ⚠️ backlog 早先写的「由 `probe-approval.cjs` 双形态端到端自检 16/16」**不准确**：那个 `probe-approval.cjs` 只存在于当时的
+  `$TEMP`，从未进过仓库（`git log --all` 无此路径），16/16 是按一次性脚本的结果记的。现以仓内这份为准。
+
 - **默认策略放宽**：原默认只拦 `rm -f`/`rm -rf`，**漏掉裸 `rm <文件>`**（正是最常见的那种删）→ 改为 `\brm\b`（任何 rm）。
 - **状态**：**已完成（运行态实测通过）**。代码 `tsc` 通过；生成物与 hook 命令由 `probe-approval.cjs` 双形态端到端自检 16/16
   （放行/拒绝/兜底/留痕/自检全过）；真机 F5 实测：开 `hello.chat.approval.enabled` + 重载窗口后，让 agent 删
@@ -247,7 +270,7 @@ if (!this._abort || !this._reviewChangesOn()) return;  // 对
   - **只有便携运行时带补丁**：开发者路径（手配 `nodePath`/`entry`）与 `hello.dsh.command` 走用户自己的 DSH，**没有补丁** → 那里维持「每 activation 新铸 + 失忆 note」的老行为（硬复用会撞 id collision，门控就是为了不把这条炸路递给用户）。手配路径指向我们已打补丁的产物则能用。
   - 删会话不删磁盘 DSH 日志 → **C7 已接手**：「彻底删除」现在会把该会话的 DSH 日志目录一并删掉（仍被分支引用的除外）。软删（回收站）期间日志照旧保留。
   - 不验跨 DSH 版本的日志兼容（升级 DSH 后旧日志能否 resume，未验）。
-  - resume 失败**不自动换新 id 重试**：错误照抛、用户可见（自动重试归 C8）。
+  - resume 失败**不自动换新 id 重试**：错误照抛、用户可见。⚠️ C8 收窄后这条**仍然成立**：wire 上没有会话状态查询，自动重试等于赌博，C8 只做了「人点一下」的重试。
   - 分支不做「真分叉」（复制日志成新 id），延续既定的共享语义。
 - **验收（2026-09-11 F5 真机，五条全过）**——沿用 C4 的教训，**盯留痕（note / 盘上指针），别盯界面元素**：
   1. 发两轮埋暗号 → 重载窗口 → 点回**那个**会话问 → 答出暗号，note「已恢复此前的 DSH 会话记忆」。
@@ -320,14 +343,43 @@ if (!this._abort || !this._reviewChangesOn()) return;  // 对
 - **已知局限**：
   - **多窗口会互相覆盖**：`globalStorage` 按 profile 共享，每个窗口各持一份内存里的 `_sessions` 全量覆盖写。窗口 A 删掉的会话会被窗口 B 的下一次 `persist()` **推回磁盘** —— 而它的 DSH 日志已经被 A 删了，于是留下一条「看着能恢复、点开却接不上记忆」的会话。设置描述里已写「单窗口使用」。
   - **DSH 日志路径靠复刻插件内部算法**：上游改版会漂移。三层兜底之后，**漂移后「删不掉」仍比「删错」更可能**（内容闸门偏向 `refused`）—— 这是刻意的偏向。
-  - `persist()` **非原子**：C7 之后盘上那份成了删除后的**唯一副本**，这个既有隐患被放大了 —— 该由 C8 接手。
+  - `persist()` **非原子**：C7 之后盘上那份成了删除后的**唯一副本**，这个既有隐患被放大了 —— 已交给 **C8c**（C8 收窄时把它连同写入成本一起拆了出去）。
   - 回收站**仍不自动过期**：留存是手动的，不点就一直留着。
-  - `toolInput` 无长度上限 + `persist()` 每轮同步全量写：删除能**回收空间**，但**写入成本**这个既有问题没变（归 C8）。
+  - `toolInput` 无长度上限 + `persist()` 每轮同步全量写：删除能**回收空间**，但**写入成本**这个既有问题没变（归 **C8c**）。
 
-### C8 · 运行可靠性：中断续跑 / 重试 / 超时幂等
-- **现状**：wire 无 cancel RPC → 停止 = kill 子进程，整轮状态丢（[dshRuntime.ts](../src/dshRuntime.ts)）；崩溃只上浮错误。单 JSON 每次整段覆盖写。
-- **补法**：① 崩溃/停止后给「接着这个会话再发一轮」入口（转写已持久，DSH 会话若在盘上可续 → 与 C5 合并考虑）；② `session/prompt` 超时后的重发要防重复执行（先用 `session/status` 判定是否仍在跑）；③ 大转写改增量写或分片。
-- **验收**：跑到一半杀掉子进程 → 能一键续跑；超时重发不产生重复工具执行。
+### C8 · 运行可靠性：中断续跑 + 超时幂等  [x] 2026-09-16（F5 2026-09-17）
+- **原文三条**：① 崩溃/停止后给「接着这个会话再发一轮」入口；② `session/prompt` 超时后的重发要防重复执行；③ 大转写改增量写或分片。
+  **2026-09-15 拍板收窄**：本次做 ① + ②，**③ 拆成新的 C8c** —— 它动的是存储层核心（`persist()` 原子写 / 写入成本），与运行时行为改动的风险性质不同，混在一起验收会很脏。
+- **⚠️ 本项调研纠正了原文的两条预设。写在这儿，否则下次又按错误的直觉做：**
+  1. **「超时重发会产生重复工具执行」——反了。** 运行时对同一 sessionId 的第二次 `session/prompt` **不并发、不报错**：它被塞进 inbox 的 `next-turn` 队列，当前 turn 跑完后**作为独立的新一轮**被消费（`dist-runtime/node_modules/@deepseek-ai/dsh-sdk-jsonrpc-server/lib/index.js` → `agent.followup` → `dsh-agent-loop`，`wakeDriver` 在非 idle 时只置 `wakeRequested`，不抢占当前 turn；一次 turn 只吃一条 next-turn）。**排在后面 ≠ 重复执行**，所以 ② 不需要「防重发」。
+  2. **真正的隐患是反过来：界面报 error，工具还在跑。** 回执超时（原硬编码 120 s）会把界面标成 error、清掉 `_liveRunning`，**但子进程没被杀、那一轮还在执行工具**；此后 `_onDshEvent` 的 `if (!this._liveRunning) return;` 把后续事件全丢掉 ⇒ 用户看不见那份工作，而 DSH 记忆里有 ⇒ UI/转写与记忆失配。所以 ② 的修法是 **①别把长轮当超时 + ②让 error 名副其实（出错就杀进程）**。
+- **补法**：
+  - [src/dshRuntime.ts](../src/dshRuntime.ts)：`request()` 支持 `timeoutMs <= 0`（不挂计时器）；`prompt()` 的回执超时提为具名常量 `PROMPT_ACK_TIMEOUT_MS = 10 * 60_000` 并配注释说明**回执只是服务端「收下了」的收条**，本轮何时结束看 `session.status` idle；超时错误带 `name = DshTimeoutError`（`isDshTimeout()` 导出），调用方据此把「超时」与「真失败」分开。`kill()` 改**两段式**：`stdin.end()` → 立即 `dead = true`（语义与从前一致）→ `setTimeout(强杀, GRACEFUL_KILL_MS = 2000)`，子进程自己退出就清掉计时器；签名与同步返回的契约不变，只是强杀延后。
+  - [src/turnState.ts](../src/turnState.ts)（新，纯模块，**绝不 import `vscode`** —— 自检要在扩展宿主之外加载编译产物）：`readLastTurn()` / `needsContinue()`（「继续」按钮的**唯一判据**）+ `TurnStatus`（`session.status` 通知的状态跟踪，从 `_onDshStatus` 抽出来才盖得住）。
+  - [src/sessionStore.ts](../src/sessionStore.ts)：`StoredSession` 增 `lastTurn?: 'interrupted' | 'error'`；`normalize()` 里**只认这两个值**，其余一律 `delete`（方向与 `deletedAt` 相反：坏值朝「不打扰」倒 —— 最多让按钮不出现，而一个不该出现的按钮会把「上一轮其实跑完了」说成中断）。
+  - [src/chatViewProvider.ts](../src/chatViewProvider.ts)：`_surfaceLiveError` 收尾子进程（**② 的核心**）；`turn/end` 的 reason 白名单加 `interrupted`（它是运行时补平悬空 turn 用的 reason，不是异常）；`_onDshStatus` 改用 `TurnStatus`；`_sendUser` 增 `_dshRunning` 闸；`_runLive` 的 catch 里**回执超时且已知仍在跑 → 继续等**，只有真失败才上浮；`_finishTurn('interrupted')` 落 `lastTurn` + 插一行灰 note；新增 `_sendTurnState()` / `_retryLast()`，`_sendUser` 增 `opts.replay`（重发时**跳过选区自动附加与「整行=路径」再解析** —— 那两处都取「此刻」，而重发要逐字复现上一轮）。
+  - [src/protocol.ts](../src/protocol.ts)：`retry-offer {on}`（扩展→前端）/ `retry-last`（前端→扩展）。
+  - `media/chat.{html,js,css}`：「继续」条挂**composer 内**（同 review-bar / approval-bar）。⚠️ **有意偏离方案原话**：原写「消息列表尾部」，但 react-live（真 DSH 组件画面）只接管 `#messages`、会把那里整个藏掉 —— 挂在消息区尾部的按钮在默认模式下**根本看不见**。
+- **自检**：
+  - [scripts/probe-c8-runtime.mjs](../scripts/probe-c8-runtime.mjs)（新，运行时前提 spike，需 key、**发真实模型轮**）：三条前提。① 跑到一半再发一条 prompt → 确认排队成第二轮；② 硬杀后同 id 重新 boot → 确认 resume 不报 corruption 且尾 turn 被补平；③（`--kill-compare`，指示性）优雅退出 vs 硬杀。
+    - ⚠️ 读 DSH 日志**必须自己按 zstd 魔数 `28 b5 2f fd` 切帧**：文件是一串拼接的帧，而 `zstdDecompressSync` 与 `createZstdDecompress` **都只解第一帧就收工**（实测 15 帧的文件两者都只吐 1 行）。这一条踩过 —— 探针第一版因此把「补平数 = 0」报成前提不成立，纯属读错了盘。
+  - [scripts/probe-turn-state.mjs](../scripts/probe-turn-state.mjs)（新，零依赖零 key）：`needsContinue` / `readLastTurn` 边界（垃圾值、`completed`、消息形状不能影响判据）+ `TurnStatus`（非当前会话忽略、翻转、重复幂等、`reset(id)` 归零、垃圾通知不认领）+ 与 `SessionStore` 的落盘往返（重开还在、发新消息消失、坏值被 `normalize` 丢掉）。**13/13 通过**。
+- **验收（spike 全过；F5 真机 2026-09-17 通过）**：
+  - **运行时前提（已复验）**：① 两轮都跑完 `turn/start=2 turn/end=["completed","completed"]`、状态序列 `["running","idle"]`，期间第二条 prompt 不并发不报错；② 硬杀后 resume 回执正常、**盘上补平 1 个 `turn/end reason=interrupted` 且含 `TOOL_OUTCOME_UNKNOWN`**、无 corruption（16 帧 → 47 条）；③ `stdin.end()` → `exit(0)` 实测 **~25 ms**（空闲，3/3 轮），故 2000 ms 的窗口是 80 倍余量。⚠️ ③ 的「盘上条数」对比（硬杀 24 / 优雅 21）**不可用**：两轮 token 数不同（线上 234 vs 149），数的是转写长度而非 flush 窗口，别拿它当结论。
+  - **F5 真机（2026-09-17 通过，用户确认）**：停止 → 灰 note + 末条 interrupted + 「继续」条出现；点「继续」接上**同一个** DSH 会话（盘上 `dsh.id` 与日志目录不变）且模型答得出上一轮的暗号；停止后**重载窗口**按钮仍在且同样接得上；长轮不再被误判 error；制造真错误 → 界面 error **且任务管理器里没有残留 node 子进程**；不回归 `probe-purge` 20/20、`probe-session-tools` 47/47、`smoke-runtime --resume` 4/4。
+    （以上是待验清单原文；用户 2026-09-17 确认整轮通过，未逐条留痕。）
+- **本次不做**：**自动重试**（wire 无法查询会话状态，只有翻转通知且漏收不可补拉 —— 自动重试等于赌博，本项只做「人点一下」的重试）；**不改重复 prompt 的排队语义**（那是运行时的正确行为，不去规避它）；不碰 C1 审批、2.1 审阅、C6 检索/回收站、C7 删除路径。
+- **已知局限**：
+  - **`_dshRunning` 可能停在错误值**：`session.status` 只在翻转时发、漏收不可补拉 ⇒ 它**只用于放宽**判断（已知 running 就继续等），**绝不用来「据此认为已完成」**；真完成信号仍是 idle 通知或子进程退出。代价是：若 idle 漏收，用户会被那条闸挡在门外 —— 出路与今天一样，是点「停止」。
+  - **优雅停止只争取到一次 flush，不是事务**：2 s 后仍是硬杀，那 ≤200 ms 的窗口只是**变小**而非消失。
+  - **两边的「中断」措辞不同**：DSH 记忆里是补平的 interrupted turn（含 `TOOL_OUTCOME_UNKNOWN` 结果），我们的转写里是一条 `status:'interrupted'` 的助手消息 + 一行 note —— 别指望逐字对齐。
+  - **停止 = 杀进程**这条底层约束没变（wire 无 cancel）；本项只是把它做得**可见、可续、可解释**。
+
+### C8c · 存储层写入：`persist()` 原子写 + 写入成本
+- **来源**：C8 收窄时从 ③ 拆出来（原话「大转写改增量写或分片」），并接住 C7 交接的两条：`persist()` **非原子**（C7 之后盘上那份是删除后的唯一副本）、**每轮同步全量覆盖写**且 `toolInput` 无长度上限 ⇒ 文件随使用单调增长、轮尾同步写耗时渐增（垃圾回收只是回收了空间，没省下每轮那次全量写）。
+- **补法（待定，先把范围钉住）**：`persist()` 改 tmp + rename；写入防抖 / 异步 / 分片；`toolInput` 长度上限。
+- **已知约束**：⚠️ 别顺手把探针的 `process.exit()` 也当成本项的一部分改掉 —— 那个已经单独修了（见下）。
+- **顺带修掉的（与本项相邻、已随手处理）**：`scripts/smoke-runtime.mjs` 与 `scripts/probe-c8-runtime.mjs` 结尾的 `process.exit(...)` → `process.exitCode = ...`。原因：Windows 上被重定向/管道的 stdout 是**异步**写，`process.exit()` 会把还没冲出去的**结论行整段丢掉** —— 表现为「只打印了前半段、退出码却是 0」，一份会吞掉自己结论的报告比不跑还坏（本轮 `smoke-runtime` 就是这么被发现的：exit=0 但只有第一行）。
 
 ### C9 · Run inspector
 - **现状**：调试只有 `hello.dsh.debug` 往输出通道打 stderr，用户看不到本轮发生了什么。
