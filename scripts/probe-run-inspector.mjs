@@ -18,7 +18,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } 
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { zstdDecompressSync } from 'node:zlib';
+import { findSessionLogs, readSessionEvents } from './dsh-session-log.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const outDir = join(repoRoot, 'out');
@@ -771,90 +771,8 @@ check('★ 最新一份抓帧：RunInspector 与直算式 oracle 全等', () => 
 // ---------- G. 真实会话日志回放（补平帧的真身） ----------
 console.log('\n· 真实 DSH 会话日志（zstd）：补平帧不许被算成我们的 bug');
 
-/**
- * 列出所有 `session.jsonl.zstd`（旧 → 新）。**不硬编码机器路径** —— 从 globalStorage 根往下走，
- * 也允许 `HELLO_DSH_SESSIONS_DIR` 追加一个根（别的机器 / CI 上跑就有路子）。
- * logs/ 与 globalStorage 都不在仓库里，缺了要**响亮地跳过**，别把通过当成验过了。
- */
-function findSessionLogs() {
-  const override = process.env.HELLO_DSH_SESSIONS_DIR;
-  const roots = [];
-  if (override) roots.push(override);
-  if (process.env.APPDATA) {
-    roots.push(join(process.env.APPDATA, 'Code', 'User', 'globalStorage', 'starmerx-local.hello-vscode-ext', 'dsh-sessions'));
-  }
-  roots.push(join(repoRoot, 'logs', 'dsh-sessions'));
-  const found = [];
-  const walk = (dir, depth) => {
-    if (depth > 4) return;
-    let entries;
-    try {
-      entries = readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries) {
-      const p = join(dir, e.name);
-      if (e.isDirectory()) walk(p, depth + 1);
-      else if (e.name.endsWith('.jsonl.zstd')) {
-        try {
-          found.push({ p, m: statSync(p).mtimeMs });
-        } catch {
-          /* 读不到就跳过 */
-        }
-      }
-    }
-  };
-  for (const r of roots) walk(r, 0);
-  found.sort((a, b) => a.m - b.m);
-  return found.map((x) => x.p);
-}
-
-/**
- * 会话日志是**首尾相接的 zstd 帧**（magic `28 b5 2f fd`），`zstdDecompressSync` 只认第一帧 ——
- * 所以按 magic 切段、每段往后多要一帧再试。同一份实现在 probe-c8-runtime.mjs 里也有一份，
- * 两处都别各改各的：这里炸了先去看那份的行为是不是也变了。
- */
-function readZstdFrames(file) {
-  const buf = readFileSync(file);
-  const magic = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
-  const offs = [];
-  for (let i = 0; ; ) {
-    const j = buf.indexOf(magic, i);
-    if (j < 0) break;
-    offs.push(j);
-    i = j + 1;
-  }
-  const text = [];
-  for (let k = 0; k < offs.length; k += 1) {
-    let done = false;
-    for (let span = 1; span <= 4 && k + span <= offs.length && !done; span += 1) {
-      const end = k + span < offs.length ? offs[k + span] : buf.length;
-      try {
-        text.push(zstdDecompressSync(buf.subarray(offs[k], end)).toString('utf8'));
-        k += span - 1;
-        done = true;
-      } catch {
-        /* 往后多要一帧再试 */
-      }
-    }
-  }
-  return text.join('');
-}
-
-/** 把一份 zstd 会话日志解成事件数组（解不动的行丢掉，不抛）。 */
-function readSessionEvents(log) {
-  return readZstdFrames(log)
-    .split('\n')
-    .filter(Boolean)
-    .flatMap((l) => {
-      try {
-        return [JSON.parse(l)];
-      } catch {
-        return [];
-      }
-    });
-}
+/* 解日志的三个件（列日志 / 按魔数切帧 / 解成事件）已抽到 ./dsh-session-log.mjs ——
+ * C10 的压缩帧对拍读的是同一份实现。这里只留 C9 自己的 oracle。 */
 
 /**
  * oracle：独立地按**帧面特征**数补平帧（不调 isRepairResult，免得拿被测对象给自己作证）。
@@ -872,6 +790,30 @@ function countRepairFrames(events) {
   return n;
 }
 
+/**
+ * 补平帧分两种，**它们去向不同**，所以选样本时得知道手上这份有没有后一种：
+ *   · `repairedAfterRecorded`（`message.id` 带 `interrupted-tool-result-` 前缀）→ 配得上那一行，收掉它；
+ *   · `repairedNotStarted`  （`error.code === 'TOOL_NOT_STARTED'`）→ 从来没有过调用行，只能记一次 repaired。
+ * 只有后者能让 `repaired` 为正 —— 而哪一种出现纯看那轮当时断在哪，是运气。
+ */
+function splitRepairFrames(events) {
+  let byId = 0;
+  let byCode = 0;
+  let both = 0;
+  for (const ev of events) {
+    if (ev.type !== 'tool/result') continue;
+    const d = ev.data ?? {};
+    const idOk = typeof d.message?.id === 'string' && d.message.id.startsWith('interrupted-tool-result-');
+    const codeOk = d.error?.code === 'TOOL_NOT_STARTED';
+    if (idOk) byId += 1;
+    if (codeOk) byCode += 1;
+    if (idOk && codeOk) both += 1;
+  }
+  // ⚠️ 总数是**并集**不是和：实测有帧**同时**带这两种特征（2026-09-18 那份日志 6 条里占 2 条），
+  // 加成 byId+byCode 会多算一遍，于是守恒律那条断言会拿着一个虚高的期望值去红。
+  return { byId, byCode, both, total: byId + byCode - both };
+}
+
 check('★★ 真日志回放：补平帧既不许算成 unmatched，也不许被静默吞掉', () => {
   const logs = findSessionLogs();
   if (!logs.length) {
@@ -881,17 +823,20 @@ check('★★ 真日志回放：补平帧既不许算成 unmatched，也不许�
 
   // ⚠️ 样本要挑**含补平帧的那一份**，不能无脑取最新那份：补平帧只在「一轮被中断」时才产生，
   // 是稀有事件 —— 取最新 = 拿一次运气当判据，之后每跑一轮 F5 都会红一次假警（2026-09-18 实测：
-  // 最新的那份 0 条，而 09-17 那份有 8 条）。从新往旧找第一份有补平帧的；一份都没有就**响亮跳过**。
+  // 最新的那份 0 条，而 09-17 那份有 8 条）。从新往旧找；一份都没有就**响亮跳过**。
+  //
   let log;
   let events;
   let repairFrames = 0;
+  let split = { byId: 0, byCode: 0, both: 0 };
   for (let i = logs.length - 1; i >= 0; i -= 1) {
     const evs = readSessionEvents(logs[i]);
-    const n = countRepairFrames(evs);
-    if (n > 0) {
+    const s = splitRepairFrames(evs);
+    if (s.total > 0) {
       log = logs[i];
       events = evs;
-      repairFrames = n;
+      repairFrames = s.total;
+      split = s;
       break;
     }
   }
@@ -917,7 +862,11 @@ check('★★ 真日志回放：补平帧既不许算成 unmatched，也不许�
   }
 
   eq(totalUnmatched, 0, '真实运行时行为被算成了我们的 bug（unmatched）：');
-  ok(totalRepaired > 0, 'repaired 是 0：补平帧要么被吞了，要么被算去别处了');
+  // ⚠️ **不在这里断言 `repaired > 0`**（2026-09-18 改）。它曾经在这条，红过两次假警：一台机器上
+  // 到底有没有「配不上任何调用」的补平帧，纯看那几轮断在哪 —— 本机两份含补平帧的日志**全都
+  // 配得上**（`interrupted-tool-result-` 带得回 callId），于是这条断言考的是运气而不是判据。
+  // `repaired++` 本身由上面的合成用例盯着（「补平帧没有可配的行（TOOL_NOT_STARTED）→ repaired++」）；
+  // 真帧这一条要守的是**守恒律**：每条补平帧恰好落到一处，一条都不许被吞（见下）。
   // ★ 守恒律：每条补平帧**恰好**落在某一处 —— 收掉一行，或记一次 repaired。既不许多、也不许少。
   eq(closedByRepair + totalRepaired, repairFrames, '补平帧去向不守恒：');
   ok(!hasNonFinite(runs), '真帧回放产出了 NaN / Infinity');
@@ -933,8 +882,11 @@ console.log('');
 if (failures.length) {
   console.log(`✗ ${failures.length} 条未过（共 ${passed + failures.length} 条）：`);
   for (const f2 of failures) console.log(`   · ${f2}`);
+} else {
+  // ⚠️ 这行**必须在 else 里**：它从前无条件打印，于是「2 条红 + ✓ 全部通过：29/29」同屏出现过。
+  // 一个会说谎的收尾比没有收尾更坏 —— 它把红色读成了绿色。
+  console.log(`✓ 全部通过：${passed}/${passed}`);
 }
-console.log(`✓ 全部通过：${passed}/${passed}`);
 // ⚠️ 不用 process.exit()：Windows 上被管道/文件重定向的 stdout 是**异步**写，退出会把还没
 // 冲出去的结论行整段丢掉（C8 的 smoke-runtime 就是这么被抓到的：exit=0 却只有第一行）。
 process.exitCode = failures.length ? 1 : 0;

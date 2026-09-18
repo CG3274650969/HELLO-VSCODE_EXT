@@ -29,8 +29,16 @@ import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
+import { findHarnessStore, readHarnessStore } from './dsh-session-log.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+
+/**
+ * `media/chat.js` 里那个 `FOLD_KEEP`（那边是 IIFE 内的 var，探针拿不到，只能钉一份在这里）。
+ * **这是有意的重复**：它一旦与 chat.js 里的值不一致，下面 D4 那两组断言会立刻整片变红 ——
+ * 那就该有人去看是"实现改了"还是"探针过时了"，而不是静默地对不齐。
+ */
+const FOLD_KEEP = 60;
 
 let passed = 0;
 const failures = [];
@@ -267,6 +275,21 @@ function texts(el) {
 function hasText(el, s) {
   return texts(el).some((t) => t.includes(s));
 }
+/**
+ * 比**真数据正文**时用的宽松版：markdown 渲染会把 `` ` `` 当代码记号、把 `\` 当转义吃掉，
+ * 所以两边都先去记号、去空白再比。用它只为了确认"这个节点是那条消息"，不是验渲染细节
+ * —— 2026-09-18 实测：真实消息里带 `D:\metabase\…` 这种路径，raw slice 比法假红过一次。
+ */
+function plainText(s) {
+  return String(s)
+    .replace(/[`\\*_#>|~[\]()]/g, '')
+    .replace(/\s+/g, '');
+}
+function hasTextLoose(el, s) {
+  const want = plainText(s).slice(0, 24);
+  if (!want) return true; // 这条消息没有可比的可观察特征（比如纯符号），跳过不判
+  return plainText(texts(el).join('')).includes(want);
+}
 function childWithClass(el, cls) {
   return el.children.filter((c) => c.classList.contains(cls));
 }
@@ -442,6 +465,85 @@ check('D4 换到短会话 → 既没折叠行、消息也齐', () => {
   eq(foldRows().length, 0, '短会话不该出现折叠行');
   eq(msgNodes().length, 5, '短会话消息数不对');
 });
+
+// ---------- D4 · 真数据（几百条消息的真实会话，F5 那一条的机器可验版） ----------
+//
+// 上面那组全是合成帧（`mkMessages` 只有 user/assistant 两种角色、正文是「第 N 条」）。
+// 真实会话里混着 **tool 卡与 note**，这才是折叠真正要面对的输入 —— 也是唯一能验「几百条消息
+// 的会话里折叠行为对不对」而不用人眼的路子。**不打印任何消息正文**，失败信息只报下标。
+
+console.log('\n· D4 真数据：盘上那条最长的会话');
+
+{
+  const storePath = findHarnessStore();
+  const sessions = storePath ? readHarnessStore(storePath) : [];
+  let longest = null;
+  for (const s of sessions) {
+    const msgs = s.messages ?? [];
+    if (s.deletedAt) continue;
+    if (!longest || msgs.length > longest.messages.length) longest = s;
+  }
+  const real = longest ? longest.messages : [];
+
+  if (real.length <= FOLD_KEEP) {
+    console.log(
+      `    ⚠ 跳过：本机最长的会话只有 ${real.length} 条（FOLD_KEEP=${FOLD_KEEP}），折叠根本不会触发。\n` +
+        '      别把这次跳过当成验过了 —— 这一段要有一条够长的真实会话才有得比。'
+    );
+  } else {
+    const head = real.length - FOLD_KEEP;
+    send({ type: 'snapshot', sessionId: 'real-longest', messages: real });
+
+    check(`D4 真数据：${real.length} 条 → 折掉 ${head}、渲 ${FOLD_KEEP}，折叠行在最前`, () => {
+      eq(foldRows().length, 1, '真实长会话没出现折叠行');
+      eq(msgNodes().length, FOLD_KEEP, '折后渲染条数不对');
+      ok(messagesEl().children[0].classList.contains('msg-fold'), '折叠行不在首位');
+      ok(hasText(foldRows()[0], `更早的 ${head} 条已折叠`), '折叠条数与 真实条数-FOLD_KEEP 对不上');
+    });
+
+    check('★★ D4 真数据：渲染出来的**就是**真实消息从 head+1 条起那一段（折的是头部，不是随机一段）', () => {
+      // ⚠️ 真实消息有三种角色，**可观察特征各不相同**（tool 卡渲染的是 toolName、note 与气泡渲染 text）
+      // —— 只比 text 的话，第一条恰好是工具卡时这条会假红（2026-09-18 实测就这么红过一次）。
+      const sig = (m) => (m.role === 'tool' ? String(m.toolName || 'tool') : String(m.text || ''));
+      const nodes = messagesEl().children.filter((c) => !c.classList.contains('msg-fold'));
+      ok(nodes.length === FOLD_KEEP, `渲染节点数不是 ${FOLD_KEEP}`);
+      // 逐条对最前面几个节点：**顺序**也必须对上，否则就成了"条数对、内容错位"
+      const n = Math.min(8, nodes.length);
+      for (let k = 0; k < n; k += 1) {
+        const expected = sig(real[head + k]);
+        if (!expected) continue;
+        ok(hasTextLoose(nodes[k], expected), `真实消息第 ${head + k + 1} 条没出现在第 ${k + 1} 个渲染节点里`);
+      }
+    });
+
+    check('★★ D4 真数据：点「显示」→ 全部真实消息回来，一条不少', () => {
+      foldRows()[0].children[0].click();
+      eq(foldRows().length, 0, '展开后还留着折叠行');
+      eq(msgNodes().length, real.length, '展开后条数与真实消息数对不上 —— 折着折着把消息弄丢了');
+    });
+
+    check('★★ D4 真数据：同一会话再来一帧快照 → 保持展开（真会话的快照是反复下发的）', () => {
+      send({ type: 'snapshot', sessionId: 'real-longest', messages: real });
+      eq(foldRows().length, 0, '同一会话的后续快照把用户点开的又折回去了');
+      eq(msgNodes().length, real.length, '后续快照改了渲染条数');
+    });
+
+    check('D4 真数据：切走再切回来 → 折回复位、条数仍是真实条数', () => {
+      send({ type: 'snapshot', sessionId: 'real-other', messages: real.slice(-5) });
+      eq(foldRows().length, 0, '短会话不该有折叠行');
+      send({ type: 'snapshot', sessionId: 'real-longest', messages: real });
+      eq(foldRows().length, 1, '切回长会话后折叠没复位');
+      eq(msgNodes().length, FOLD_KEEP, '切回来后渲染条数不对');
+    });
+
+    const toolCards = longest.messages.filter((m) => m.role === 'tool').length;
+    const noteCards = longest.messages.filter((m) => m.role === 'note').length;
+    console.log(
+      `    真数据：${longest.messages.length} 条消息（含 ${toolCards} 张工具卡 / ${noteCards} 条 note）` +
+        ` → 折 ${head} / 渲 ${FOLD_KEEP}，全部对得上`
+    );
+  }
+}
 
 // ---------- C9 运行条：同一影子的回归样（第 1 类真 bug 的案发现场） ----------
 

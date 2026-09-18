@@ -13,15 +13,21 @@
  * 的 `commitCompactionBody` 与 `compactRegion` 的 catch 分支。用例里的字段名一旦与那里脱节，
  * 这个探针就该红 —— 它是我们与插件之间那份"口头契约"的唯一书面记录。
  *
- * ⚠️ 这是**唯一**一条没有真帧可回放的探针：`logs/dsh-frames/` 里 5270 条已抓事件中
- * **一条 `compaction/*` 都没有**（默认阈值太高，从没触发过）。所以这里的用例全是合成帧，
- * 「压缩事件到底会不会透传到扩展」只能靠真机 F5 盖（见 docs/backlog.md 的 C10 节）。
+ * 头半段是合成帧（字段漂移、降级、边界），后半段是**真帧对拍**（见文件末尾那一段）：
+ * 把盘上 DSH 会话日志里的 `compaction/*` 帧解出来，逐条喂进 `readCompactionEvent`，
+ * 要求产出与我们**落盘的 note 逐字相同**、且计数与 `compacted` 字段守恒。
+ *
+ *   2026-09-18 之前这条探针的头上写着「唯一一条没有真帧可回放的探针」—— `logs/dsh-frames/`
+ *   里 5270 条已抓事件中**一条 `compaction/*` 都没有**（默认阈值 0.8 × 1M 从没触发过）。
+ *   那天把阈值调到 0.02 跑了一轮，真帧就有了：6 次 start / 5 次 summary / 6 次 end（其中一次
+ *   带 error 失败）。**那 5270 条的空缺因此不再成立**，本文件的后半段就是补上的那一条。
  *
  *   npm run compile && ./dist-runtime/node/node.exe scripts/probe-compaction-notice.mjs
  */
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { findHarnessStore, readHarnessStore, readSessionEvents } from './dsh-session-log.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const outDir = join(repoRoot, 'out');
@@ -36,6 +42,7 @@ async function load(moduleName) {
 }
 
 const { readCompactionEvent } = await load('compactionNotice.js');
+const { logPath } = await load('dshPaths.js');
 
 let passed = 0;
 const failures = [];
@@ -188,12 +195,142 @@ try {
   /* 无现场要清 */
 }
 
+// ---------- 真帧对拍：盘上那份 DSH 会话日志里的 compaction/* ----------
+//
+// 上面那些用例守的是「函数对不对」，这一段守的是**整条链**：真帧 → 我们的判据 → 落盘的 note。
+// 判据是**双向逐字**：wire 上有几条、按什么顺序，落盘的 note 就得有几条、按什么顺序、一字不差；
+// 加上计数守恒（成功 note 数 == `compacted` 字段）。任何一处漂移都会当场红。
+//
+// ⚠️ 这里**不许打印任何消息正文**（`summary` 是模型写的摘要、note 是转写内容）—— 只报数字。
+
+console.log('\n· 真帧对拍：DSH 会话日志里的 compaction/* ↔ 落盘的 note');
+
+/** 从落盘的会话里挑「有压缩 note 且能定位到 DSH 日志」的那一个（note 最多的那个）。 */
+function pickSession(storePath) {
+  const sessions = readHarnessStore(storePath);
+  const root = join(dirname(storePath), 'dsh-sessions');
+  let best = null;
+  for (const s of sessions) {
+    const notes = (s.messages ?? []).filter((m) => m.role === 'note' && /压缩/.test(m.text ?? ''));
+    if (!notes.length || !s.dsh?.id || !s.dsh?.cwd) continue;
+    const log = logPath(root, s.dsh.cwd, s.dsh.id, 'zstd');
+    if (!existsSync(log)) continue;
+    if (!best || notes.length > best.notes.length) best = { store: s, notes, log };
+  }
+  return best;
+}
+
+{
+  const storePath = findHarnessStore();
+  const picked = storePath ? pickSession(storePath) : null;
+
+  if (!picked) {
+    console.log(
+      '    ⚠ 跳过：本机没有「含压缩 note 且日志还在」的会话（压缩默认阈值下基本不会发生）。\n' +
+        '      别把这次跳过当成验过了 —— 真帧那半段要等真机上压过一次才有得比。'
+    );
+  } else {
+    const events = readSessionEvents(picked.log);
+    const frames = events.filter((e) => String(e.type ?? '').startsWith('compaction/'));
+
+    await check('真帧：日志里确实有 compaction/* 帧（否则这段等于空跑）', () => {
+      ok(events.length > 0, '日志解出来 0 条事件（格式变了？）');
+      ok(frames.length > 0, '日志里没有 compaction/* 帧 —— 这段对拍会变成假绿');
+    });
+
+    await check('真帧：每种类型的条数与插件行为对得上（start/summary/end 各几次）', () => {
+      const n = (t) => frames.filter((f) => f.type === t).length;
+      console.log(
+        `    真帧 ${frames.length} 条：start ${n('compaction/start')} / summary ${n('compaction/summary')} / end ${n('compaction/end')}`
+      );
+      eq(n('compaction/start'), n('compaction/end'), 'start 与 end 必须成对（少了就是日志被截断）');
+      ok(n('compaction/summary') <= n('compaction/end'), 'summary 比 end 还多 —— 载荷不对');
+    });
+
+    await check('真帧：start 一律不发声；无 error 的 end 不发声（成功只报一次）', () => {
+      for (const f of frames) {
+        const d = f.data ?? {};
+        if (f.type === 'compaction/start') eq(readCompactionEvent(f.type, d), undefined, 'start 不该发声');
+        if (f.type === 'compaction/end' && !d.error) {
+          eq(readCompactionEvent(f.type, d), undefined, '无 error 的 end 不该发声（会与 summary 重复）');
+        }
+      }
+    });
+
+    const wireNotes = frames.map((f) => readCompactionEvent(f.type, f.data ?? {})).filter(Boolean);
+
+    await check('★★ 真帧对拍：wire 上的 note 与落盘的 note **逐字**相同、条数与顺序也一样', () => {
+      eq(wireNotes.length, picked.notes.length, 'note 条数对不上（漏报或重复报）');
+      for (let i = 0; i < wireNotes.length; i++) {
+        eq(wireNotes[i].text, picked.notes[i].text ?? '', `第 ${i + 1} 条 note 的正文与落盘的不一致`);
+      }
+    });
+
+    await check('★★ 真帧对拍：成功 note 数 == 落盘的 compacted 计数（计数器没算漏也没算重）', () => {
+      const done = wireNotes.filter((n) => n.kind === 'done').length;
+      eq(picked.store.compacted, done, 'compacted 字段与成功 note 数对不上');
+      console.log(`    成功 ${done} 次 / 失败 ${wireNotes.filter((n) => n.kind === 'failed').length} 次`);
+    });
+
+    await check('★★ 真帧对拍：note 里的条数与 token 数**确实来自帧上那两个字段**', () => {
+      // 独立重算：条数 = shadowedSeqs.length；token = 把 note 里那个「约 X」解析回数值，
+      // 与帧上的 shadowedTokenCount 比（K/M 量级换算后允许舍入误差，不复制我们的格式化规则）。
+      const MUL = { '': 1, K: 1000, M: 1e6 };
+      let checked = 0;
+      for (const f of frames) {
+        const note = readCompactionEvent(f.type, f.data ?? {});
+        if (!note || note.kind !== 'done') continue;
+        const d = f.data ?? {};
+        const seqs = Array.isArray(d.shadowedSeqs) ? d.shadowedSeqs.length : null;
+        if (seqs !== null) {
+          ok(note.text.includes(`前 ${seqs} 条事件`), `note 里的条数不是帧上的 shadowedSeqs.length(${seqs})`);
+        }
+        const m = note.text.match(/约 ([\d.]+)([KM]?)/);
+        ok(m, `note 里没报 token 数`);
+        const shown = Number(m[1]) * MUL[m[2]];
+        const real = d.shadowedTokenCount;
+        ok(
+          Math.abs(shown - real) < Math.max(100, real * 0.01),
+          `note 报的 ${m[1]}${m[2]} 与帧上的 shadowedTokenCount(${real}) 差太多`
+        );
+        checked += 1;
+      }
+      ok(checked > 0, '一条成功帧都没比到 —— 这段空转了');
+    });
+
+    await check('★ 真帧对拍：模型写的摘要正文一个字都没进 note（隐私与"二手记忆"两件事）', () => {
+      for (const f of frames) {
+        const d = f.data ?? {};
+        const note = readCompactionEvent(f.type, d);
+        if (!note || typeof d.summary !== 'string' || !d.summary) continue;
+        // 取摘要里最长的一段「实词片段」来比 —— 短前缀可能恰好是标点/标题，比不出东西
+        const probe = d.summary.replace(/\s+/g, ' ').slice(0, 40);
+        ok(!note.text.includes(probe), 'note 里出现了摘要正文');
+        ok(!note.text.includes(d.summary.slice(-40)), 'note 里出现了摘要正文（尾部）');
+      }
+    });
+
+    await check('真帧：note 里不出现 shadowedRange（实测它可以是 反的：start > end）', () => {
+      // 2026-09-18 那份日志的最后一次压缩给的是 range 36129-36125。我们**一个数字都没用**它，
+      // 所以这条是"保持不用的现状"的守卫；哪天有人想往 note 里加区间，先看这里。
+      const inverted = frames.filter((f) => {
+        const r = f.data?.shadowedRange;
+        return r && typeof r.start === 'number' && typeof r.end === 'number' && r.start > r.end;
+      }).length;
+      for (const n of wireNotes) ok(!/\d+\s*-\s*\d+/.test(n.text), `note 里出现了区间：${n.text.slice(0, 80)}`);
+      console.log(`    帧上带区间且 start > end 的：${inverted} 条（我们一条都没用）`);
+    });
+  }
+}
+
 console.log('');
 if (failures.length) {
   console.log(`✗ ${failures.length} 条未过（共 ${passed + failures.length} 条）：`);
   for (const f of failures) console.log(`   · ${f}`);
+} else {
+  // ⚠️ 这行必须在 else 里：它从前无条件打印，于是「有红 + ✓ 全部通过」同屏出现过。
+  console.log(`✓ 全部通过：${passed}/${passed}`);
 }
-console.log(`✓ 全部通过：${passed}/${passed}`);
 // ⚠️ 不用 process.exit()：Windows 上被管道/文件重定向的 stdout 是**异步**写，退出会把还没
 // 冲出去的结论行整段丢掉（C8 的 smoke-runtime 就是这么被抓到的：exit=0 却只有第一行）。
 process.exitCode = failures.length ? 1 : 0;
