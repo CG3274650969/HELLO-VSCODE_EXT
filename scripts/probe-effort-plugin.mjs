@@ -453,6 +453,21 @@ async function main() {
     );
   });
 
+  await check('静态守卫：换活跃会话必须走 _setActive（四个入口一个都不能漏）', () => {
+    // 真机 F5 里踩到的：`_openSession` 换了 _active 却没重播配置条 ⇒ 点开设过 low 的会话，
+    // 菜单还显示「跟随配置」。**探针载不了那个文件**（它 import vscode），所以能机器化的
+    // 只有这条结构判据：赋值只准出现在 `_setActive` 一处。
+    const src = readFileSync(join(repoRoot, 'src', 'chatViewProvider.ts'), 'utf8');
+    const writes = src.split('\n').filter((l) => /_actives\[this\._mode\]\s*=/.test(l));
+    eq(writes.length, 1, `_actives[_mode] 的赋值有 ${writes.length} 处（应恰好 1 处，在 _setActive 里）：${writes.join(' | ')}`);
+    const at = src.indexOf('private _setActive(');
+    ok(at > 0, '找不到 _setActive（改了名就同步改这条守卫）');
+    ok(
+      src.slice(at, at + 400).includes('_postLiveConfig()'),
+      '_setActive 里没有 _postLiveConfig() —— 换会话时档位菜单会安静地留着上一个会话的值'
+    );
+  });
+
   console.log('');
   if (failures.length) {
     console.log(`✗ ${failures.length} 条未过（共 ${passed + failures.length} 条）：`);

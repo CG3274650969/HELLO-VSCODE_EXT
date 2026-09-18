@@ -21,7 +21,7 @@
 | C8c | 存储层写入：`persist()` 原子写 / 写入成本 / `toolInput` 上限（从 C8 ③ 拆出） | P1 | 无。**已实现、自检 64/64 + 真实数据往返无回归；F5 待办** —— 实测推翻了「`toolInput` 无上限导致增长」与「需要写入防抖」两条预设，分片/异步/防抖按实测不做，见正文 | [ ] |
 | C9 | Run inspector（本轮帧时间线/耗时/工具统计） | P1 | 无（现有帧已够）。**已实现、自检 31/31 + DOM 影子自检、四项探针无回归、F5 通过（2026-09-17 用户真机）** —— 耗时全靠信封自带 `time` 相减（零计时器），体积故事 = 丢弃 819/823 条 chunk；F5 先后推翻三条预设（「配对失败恒 0」「按 `isError` 判成败」，以及**「DSH 一步一次工具」**—— 实测一步可带 2–3 次并行调用），见正文 | [x] |
 | C10 | 上下文窗口指示 + 超限压缩/归档 | P1 | 数据前置已解（C3a 已透出窗口/占用）。**已实现；F5 的 ①②⑤ 过了（真压缩 6 次：5 成功 1 失败；wire note 与落盘 note 逐字相同）；③ 的两半分头都过了但组合未验、④ 百分比那半过了（⚠ 那半与续聊回落未验）** —— 三个前提被推翻：压缩 DSH 早已自己做（`compaction-basic`，已 compose）、那三个事件早就在流里而我们从没读、**「归档旧轮」按字面做不到**（无 wire RPC + 日志 append-only）。另，`DSH_CORDIS_CONFIG` env 赢过位置参数这条命脉（C1 与 C10 共用）**首次被反控证住**。⚠️ **F5 之后揪出一个真 bug（C10b）**：`request/context` 只在路由**变化**时才发，续聊时一条都不发 ⇒ 分母恒缺、整条占用指示安静地不存在（那次真机的读数里就没有百分比）。已修：分母记在会话上，新增纯模块 `contextWindow.ts` + `probe-context-window.mjs`（14/14），见正文 | [~] |
-| C11 | 会话级推理档位（reasoningEffort） | P1 | **原判「受限：需 runtime 先支持」已推翻** —— 机制早就在（provider 按请求解析档位、`agent/request` 瀑布的返回值就是请求 config），缺的只是入口。**已实现：自检 24/24 全绿，F5 待办**（热切 + 真会话级；DSH 侧一行不改、用户配置一行不碰，纯追加一个我们自己的插件块） | [~] |
+| C11 | 会话级推理档位（reasoningEffort） | P1 | **原判「受限：需 runtime 先支持」已推翻** —— 机制早就在（provider 按请求解析档位、`agent/request` 瀑布的返回值就是请求 config），缺的只是入口。**已实现：自检 25/25 全绿；F5 的 ① ② 已通过，④ 揪出一个真 bug（换会话不重播配置条，已修 + 加了静态守卫）**（热切 + 真会话级；DSH 侧一行不改、用户配置一行不碰，纯追加一个我们自己的插件块） | [~] |
 | C12 | 项目级 agent profile（工具白名单/默认模型/审批策略） | P1 | 与 C1 同源 | [ ] |
 | C13 | Windows / 跨环境 shell 与路径收口 | P1 | 无（扩展侧为主） | [ ] |
 | C14 | 事前 diff 预览（近似实现） | P2 | 受 wire 无 file 事件限制 | [ ] |
@@ -597,7 +597,7 @@ if (!this._abort || !this._reviewChangesOn()) return;  // 对
     - **这次它又抓到两个真 bug**，且第 ① 个正是「不忠实的影子比没有影子更坏」的又一例：① 影子的 `className` setter **换掉了**那个 `Set`，而 `classList` 的闭包捕获的是构造时那一个 ⇒ `wrap.className = 'msg msg-user'` 之后 `classList.contains('msg')` 为假、`removeAllMessages` 一个都删不掉（断言全空转）。改成**原地改**。② 我自己按旧影子抄的期望值是过期的（`24K` 应为 `24.0K`、C9 条文案已改成三后缀并列）。③ 顺带发现旧脚本以为 `{type:'run-panel', open:true}` 是**入站**消息 —— 它其实是**出站**（扩展据此下发 details），浮层要靠点 `#runs-view` 才开；现在按真路子驱动，并断言那条回执确实发出去了。
   - [scripts/probe-approval-roundtrip.mjs](../scripts/probe-approval-roundtrip.mjs)（新，C1/C4 的决策回路，2026-09-18）**18/18**：真服务 + 真 hook 脚本 + 真 HTTP + 真子进程，整个搬出扩展宿主。逐条见 C1 正文。
   - 不回归：`probe-approval-shell` **19/19**（D3 动了派生，这条是 C1 的主力证据）／`probe-session-tools` **64/64**（D1 加了落盘字段）／`probe-run-inspector` **31/31**／`probe-turn-state` **13/13**／`probe-purge` **20/20**／`probe-derived-config-boot` **4/4**／`probe-resume` ✓／`smoke-runtime --runtime dist-runtime` exit 0。
-  - **全套实跑一次（2026-09-18）**：`approval-roundtrip 18/18`、`approval-shell 19/19`、`compaction-notice 20/20`、`compaction-override 31/31`、`context-window 14/14`、`effort-plugin 24/24`、`purge 20/20`、`run-inspector 31/31`、`session-tools 64/64`、`turn-state 13/13`、`webview-render 34/34`、`c8-runtime ✓`、`resume ✓`，全部 exit 0。
+  - **全套实跑一次（2026-09-18）**：`approval-roundtrip 18/18`、`approval-shell 19/19`、`compaction-notice 20/20`、`compaction-override 31/31`、`context-window 14/14`、`effort-plugin 25/25`、`purge 20/20`、`run-inspector 31/31`、`session-tools 64/64`、`turn-state 13/13`、`webview-render 34/34`、`c8-runtime ✓`、`resume ✓`，全部 exit 0。
   - **两条探针各修掉一处「假红」和一处「说谎的收尾」**（都是这次新增真帧/真数据段时暴露的）：① `probe-run-inspector` 的补平帧计数原来把「同时带两种特征」的帧算了**两遍**（`byId + byCode`）⇒ 改成**并集**（实测 6 条里占 2 条）；`repaired > 0` 那条断言也是样本依赖的（只有恰好挑中含 `TOOL_NOT_STARTED` 变体的日志才成立）⇒ 去掉，改成守恒律当判据。② `probe-run-inspector` 与 `probe-compaction-notice` 都在**有红时**照样打出过「✓ 全部通过」—— `✓` 那行现在必须在 `else` 里，本文件里也写了注释：**一个会说谎的收尾比没有收尾更坏**。
   - 静态守卫：`grep "import \* as vscode" src/compactionNotice.ts` 无输出。
   - **顺带修掉一条探针的假红**：`probe-run-inspector` 的真日志回放原本**无脑取最新那份**会话日志，而补平帧只在「一轮被中断」时才产生（稀有）——新会话一多它必然变红。改成**从新往旧找第一份含补平帧的**，一份都没有才响亮跳过；现在跑的是 09-17 那份（1722 事件 / 8 轮 / 6 条补平帧）。
@@ -658,7 +658,7 @@ if (!this._abort || !this._reviewChangesOn()) return;  // 对
   - `case 'set-effort'` → `_setLiveEffort()`：落字段 → `_persistActiveSession()` → 块**还没挂**才 `_restartLiveProcess()`（本进程第一次选档位的代价，"按需挂载"已拍板接受）；块**已在**则**什么都不重启**，只重写表 + `_postLiveConfig()`（**热生效**）。⚠️ 与 `_setLiveModel`（必定重连）形成对照，两处注释都写明了为什么不一样。
   - `_postLiveConfig()` 多带 `effort`（**`null` 而不是省略** —— webview 要能区分"跟随配置"与"还没收到"）、`efforts`（四档由扩展下发，前端不写死，防两边漂移）、`effortThinkingDisabled`。
 - **D4 · webview**（[media/chat.html](../media/chat.html) / [media/chat.js](../media/chat.js) / [media/chat.css](../media/chat.css)）：`#live-config-bar` 里模型选择器之后加一个同款浮层菜单，**复用现有 `.lc-model-*` 类**（CSS 只多了个 `.lc-item-disabled` 置灰态，**不隐藏**不可选的档位 —— 让用户看见"有这几档、只是当前配置下不行"）。菜单项：`跟随配置` / `off · 关闭思考` / `low` / `high` / `max`，当前项打勾；两个菜单互斥（开一个收另一个），外部点击与 Esc 都收。
-- **自检（零依赖、零 key、不过真模型）**：[scripts/probe-effort-plugin.mjs](../scripts/probe-effort-plugin.mjs)（新）**24/24**，三段：
+- **自检（零依赖、零 key、不过真模型）**：[scripts/probe-effort-plugin.mjs](../scripts/probe-effort-plugin.mjs)（新）**25/25**，三段：
   - 纯判据：`normalizeEffort` 的四个合法值 + 12 种垃圾输入；`thinkingDisabledInConfig` 的引号形态 / 块边界 / 相邻块同键不误伤 / 锚点不唯一；派生块文本（id、`file:///`、`statePath`、`thinkingDisabled`、路径里单引号写成两个）；**零回归：没给 `effort` 时派生文件里一个字都不多**；根不合法时只 warning 且 **C1 那条 throw 没被改软**；`writeEffortState` 的清洗与"整份重写、不留 `.tmp`"。
   - **决策表**：把**生成出来的插件文件**当纯模块 `import()`，喂假 ctx 抓住它的 `agent/request` 监听器逐条喂载荷 —— 命中 / 未命中（**返回的是上游那个对象的引用本身**）/ 载荷没 `agent` / 文件不在 / 坏 JSON / 值非法 / 没给 `statePath` 就不注册 / `thinkingDisabled` 下只放行 `off` / **上游抛错必须原样抛出去** / 上游返回非对象不许 spread 成 `{}`；以及一条**"每次请求现读表 ⇒ 换掉盘上的表下一步就变"** —— 这就是"热生效"的机器判据。
   - **端到端**：派生配置挂真插件 → 真跑一轮 → 读盘上日志的 `request/header`，断言 `config.reasoningEffort === 'low'` 且 `adapterDefaults.reasoningEffort !== true`；**反控**：表里没有该会话 ⇒ 这次请求带的是**底本自己的默认档位**（从底本原文里读，并断言它 ≠ `low`，否则这条反控没有鉴别力）。⚠️ 这一段的靶子**不是"没有这个键"** —— 实测它**有**，值是底本 `llm-deepseek` 自己的 `reasoningEffort`；真正要证的是"这个值的来源不是我们"。用**假 key**（`sk-000…`）跑：请求会 401，但 `request/header` 在请求**构建期**就落盘了，所以断言照样成立且**不花真钱**；"压根没跑起来"会响亮报错，绝不读成"验过了"。
@@ -666,11 +666,16 @@ if (!this._abort || !this._reviewChangesOn()) return;  // 对
   - 静态守卫：`src/effortPlugin.ts` 不含 `vscode`。
   - 不回归（动了派生配置，全套实跑一次）：`probe-derived-config-boot` **4/4**、`probe-compaction-override` **31/31**、`probe-approval-shell` **19/19**、`probe-approval-roundtrip` **18/18**、`probe-compaction-notice` **20/20**、`probe-context-window` **14/14**、`probe-webview-render` **34/34**、`probe-run-inspector` **31/31**、`probe-session-tools` **64/64**、`probe-turn-state` **13/13**、`probe-purge` **20/20**、`probe-c8-runtime` ✓、`probe-resume` ✓，全部 exit 0。
 - **只能真机 F5 盖住**：
-  - ⬜ ① 档位菜单出现、默认「跟随配置」；选 `low` ⇒ **重连一次**（本进程第一次）；此后在菜单里来回切 ⇒ **不重连**、下一步就变。
-  - ⬜ ② 盘上证据：`session.jsonl.zstd` 里新 `request/header` 的 `reasoningEffort` 跟着选择走，`adapterDefaults` 里**没有** `reasoningEffort: true`。
-  - ⬜ ③ **会话级的真判据**：两个会话各设不同档位、各跑一轮 ⇒ 两份日志各对各的（进程是同一个）。
-  - ⬜ ④ 重载窗口后档位还在（会话字段落盘），且不需要再重连（刚起就连、块一开始就在）。
+  - ✅ ① 档位菜单出现、默认「跟随配置」；选 `low` ⇒ **重连一次**（本进程第一次）；此后在菜单里来回切 ⇒ **不重连**、下一步就变。（2026-09-18 用户真机确认）
+  - ✅ ② **盘上证据（我代查的，不必用户学解 zstd）**：`71bab594…::0a31398b` 那份 `session.jsonl.zstd` 里两条 `request/header`（`initial` + `resume`）都是 `data.header.config.reasoningEffort === "low"`，且 `adapterDefaults` **只有** `{maxTokens:true}`（没有 `reasoningEffort:true`）。同一次比对里的反证：另两个会话（`4f49f56f` / `ff54dc78`）跑的是**底本自己的 `max`** —— 与 `dist-runtime/cordis.yml` 的 `llm-reasoningEffort: max` 一致。
+  - ⬜ ③ **会话级的真判据**：两个会话各设不同档位、各跑一轮 ⇒ 两份日志各对各的（进程是同一个）。目前只证到「设过档位的那份是 low、没设过的两份是 max」。
+  - ⚠️ ④ 重载窗口后档位还在（会话字段落盘），且不需要再重连（刚起就连、块一开始就在）。**F5 当场揪出一个真 bug，已修**（见下）。
   - ⬜ ⑤ 不回归：C1 弹条与「拒绝」、C10 占用条 / 压缩 note、C8「继续」按钮各抽查一次。
+- **★★ F5 揪出的真 bug（2026-09-18，`_setActive` 咽喉）**：用户报「重载之后档位变成跟随默认」。查盘：字段**落盘了**（`sessions-harness.json` 里 `71bab594` 有 `"effort":"low"`）、状态表在（`dsh-plugins/reasoning-effort-state.json` = `{"71bab594…::0a31398b":"low"}`）、派生配置里块也在 —— **三层盘的都对，错在界面**。
+  - 病根：`_postLiveConfig()` 每次都从 `_active` **现读**档位，而 `_actives[this._mode] = …` 有**四处**（新建 / 打开 / 分支 / 删掉当前那条），**一处都没重播配置条**。⇒ 菜单留着上一个会话的档位：点开设过 `low` 的老会话显示「跟随配置」，反过来「新建对话」会显示上一个会话的 `low`。重载后 `_active` 是**全新的空会话**，所以那一眼看到的 `null` 是对的 —— **错的是随后点回老会话那一下没刷新**。
+  - ⚠️ 这与 C10b 是**同一型**：会话级的东西只在某一条路径上重播 ⇒ 它在别的路径上安静地不存在。失效的样子都是「本该出现的东西没出现」，肉眼抓不住。
+  - 修法照本仓库自己的「唯一咽喉」体例：新私有方法 `_setActive(session)` 成为**唯一**赋值处（里面顺手 `_postLiveConfig()`），四处调用点全改过去。另：**分支继承档位**（同 `usage` 的理由 —— 分支是「接着这件事往下做」，悄悄掉回 `max` 只会让人以为「分了个支怎么变笨了」；没设过就仍不设，不替用户做他没做过的选择）。
+  - **守卫**：`probe-effort-plugin.mjs` 加一条**结构判据**（这个文件探针载不了 —— 它 import vscode）：`_actives[this._mode] =` 只准出现 **1** 次、且 `_setActive` 体内必须调 `_postLiveConfig()`。25/25。
 - **已知局限（要留着）**：
   - **档位不落在 DSH 的会话数据里**：它是我们在请求构建期覆盖的 config，DSH 只记下"这次请求用了什么"。换个不带我们插件的运行时（用户自己的 DSH CLI）跑同一个会话，档位就没了 —— 这是**扩展侧行为**，不是会话属性。
   - **第一次选档位要重连一次**（"按需挂载"的既定代价）：在那之前派生配置里没有我们的块，插件根本没加载。

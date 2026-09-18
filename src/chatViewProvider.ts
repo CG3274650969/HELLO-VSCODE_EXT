@@ -523,6 +523,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * 换「正在聊」会话的**唯一入口**（新建 / 打开 / 分支 / 删掉当前那条）。
+   *
+   * ⚠️ 配置条必须跟着重播：**C11 的档位是会话字段**，`_postLiveConfig()` 每次都从 `_active`
+   * 现读。漏了这一步不会报错 —— 菜单会**安静地留着上一个会话的档位**，于是「新对话看起来
+   * 继承了 low」「点开设过 low 的老会话却显示跟随」这两种错值都长得像正常状态。
+   * （与 C10b 同型：会话级的东西只在某一条路径上重播 = 它在别的路径上就不存在。）
+   */
+  private _setActive(session: StoredSession): void {
+    this._actives[this._mode] = session;
+    this._postLiveConfig();
+  }
+
+  /**
    * react-live：harness 模式（恒为 DSH 直播）+ media/dsh-live 产物齐全。
    * 为真时 webview 揭示真 DSH 对话组件（ChatView）；扩展据此把原始帧转给 webview，
    * 而不是只发 DOM 气泡（DOM 气泡仍照发，让 SessionStore 转写保持完整）。
@@ -568,7 +581,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._store.replace(this._active);
       this._store.persist();
     }
-    this._actives[this._mode] = this._store.create();
+    this._setActive(this._store.create());
     this._postSnapshot();
     this._sendHistory();
   }
@@ -3101,7 +3114,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._store.replace(target);
     this._store.persist();
 
-    this._actives[this._mode] = target;
+    this._setActive(target);
     // 打开历史会话后，让消息 id 序号接续既有历史：避免"重启后续聊"产生撞 id
     this._seedMsgSeq();
     this._postSnapshot();
@@ -3139,6 +3152,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // 清零会让"刚分完支就显示本会话 0 token"读起来像 bug。代价是两个会话各显示同一份
     // 累计（是副本不是分割）—— 这是有意为之。
     fork.usage = src.usage;
+    // C11：档位**同样继承**（同 usage 的理由）—— 分支是"接着这件事往下做"，若它悄悄掉回
+    // 底本的 max，用户只会看到"分了个支，怎么变笨了"。继承的是**会话字段**，没设过就仍不设
+    // （= 跟随配置），不替用户做一个他没做过的选择。
+    fork.reasoningEffort = src.reasoningEffort;
 
     this._dropReview(true); // 切会话 → 清掉上一会话的审阅（同 _openSession 惯例）
     this._resetTurnUsage(); // C3a：本轮读数属于切走的那个会话
@@ -3154,7 +3171,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._dshSessions.set(fork.id, srcDshId);
     }
 
-    this._actives[this._mode] = fork;
+    this._setActive(fork);
     this._seedMsgSeq(); // 续接消息 id 尾号，防撞 id
     this._postSnapshot();
     this._sendHistory();
@@ -3180,7 +3197,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (isActive) {
       this._dropReview(true); // 删的是当前会话 → 一并清掉审阅
       this._resetTurnUsage(); // C3a：连同被删会话的本轮读数一起清掉
-      this._actives[this._mode] = this._store.create();
+      this._setActive(this._store.create());
       this._postSnapshot();
     }
     this._sendHistory();
