@@ -1080,6 +1080,28 @@ body.live-busy #send-btn {
 .lc-model.open .lc-chev {
   transform: rotate(180deg);
 }
+/* 轴图标（推理档位 / profile）：钮上文案只剩"值"，轴靠这个图标 + title 带出。
+   尺寸/路径全在 HTML 的 <svg> 上（15px，同附件钮），这里只管两件事：
+   竖对齐，以及**别写颜色** —— stroke=currentColor 是它跟主题走的唯一根据，
+   在这儿写死一个色会让它在深/浅主题下各错一半。 */
+.lc-glyph {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+}
+/* C12：profile 钉住模型时，箭头槽位换小锁（.lc-model.pinned 由 chat.js 切）。
+   默认 display:none ⇒ 没钉住时它一个像素都不占，三个钮的排布与加锁前完全一致。 */
+.lc-lock {
+  display: none;
+  flex: none;
+  align-items: center;
+}
+.lc-model.pinned .lc-chev {
+  display: none;
+}
+.lc-model.pinned .lc-lock {
+  display: inline-flex;
+}
 
 /* 浮层菜单：anchored 到触发钮上方（composer 在面板底部，向下会出界），
    圆角 + 令牌底 + lv2 阴影，逐项 hover；当前项右侧打勾。z 高于消息/历史/审阅。 */

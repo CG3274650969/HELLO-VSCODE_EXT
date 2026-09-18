@@ -711,11 +711,11 @@
     if (!liveModelLabel || !liveModelMenu) return;
     // C12：profile 钉住模型时，这个菜单**不可用**且要说清为什么 —— 选它等于选一个不会生效的值。
     // 与 C11 档位菜单置灰同一套道理：宁可明确告知，也不做"选了没反应"的静默覆盖。
-    // 前缀是必须的：裸文字按钮没有药丸外壳兜着，光一个 `deepseek-v4-flash` 混在
-    // 「推理 · low」「profile · 严格」中间，读不出它是什么（药丸时代靠形状分组）。
-    liveModelLabel.textContent = liveProfileModelPinned
-      ? '模型 · 由 profile 固定'
-      : '模型 · ' + (liveModel || '未选');
+    // 钮上只剩模型名（轴名交给 title）：模型名本身就自证身份，旁边两个钮才需要图标 ——
+    // 硬给它配个"芯片"图标，等于多一个要认的符号，换不来一点辨识度。**钉住时也一样显示真名**
+    // （那才是当下真在用的模型），钉这件事由 .pinned 的小锁 + title 说，不改文案。
+    liveModelLabel.textContent = liveModel || '未选';
+    liveModelBtn.classList.toggle('pinned', liveProfileModelPinned);
     // 触发钮的 title 也必须跟着改：chat.html 里那句「切换模型…会重启 live 子进程」在钉住时是**假话**
     // —— 选了根本不生效（同 C11 档位菜单的「底本 thinking: disabled」那条）。
     liveModelBtn.title = liveProfileModelPinned
@@ -829,6 +829,12 @@
     return v;
   }
 
+  /** 触发钮上的档位文案：钮上只有图标 + 值，所以这里给**短形**（跟随 / off / low…）。
+   *  菜单里仍用 effortText()——那边有地方，也要把 off 说清是"关闭思考"。 */
+  function effortTriggerText(v) {
+    return v === null ? '跟随' : v;
+  }
+
   /** 该档位现在能不能选：底本 thinking: disabled 时只有 off（与「跟随」）合法 —— 其余三档
    *  会让 provider 在请求期抛 UNSUPPORTED_REASONING_EFFORT，所以置灰并说明原因。 */
   function effortBlocked(v) {
@@ -838,7 +844,7 @@
   /** 重建菜单内容并刷新触发钮文案（体例同 renderModelMenu，全量重画）。 */
   function renderEffortMenu() {
     if (!liveEffortLabel || !liveEffortMenu) return;
-    liveEffortLabel.textContent = '推理 · ' + effortText(liveEffort);
+    liveEffortLabel.textContent = effortTriggerText(liveEffort);
     liveEffortBtn.title = liveEffortThinkingOff
       ? '会话级推理档位：底本 llm-deepseek 是 thinking: disabled，只有 off 可用'
       : '会话级推理档位（reasoningEffort）：默认跟随 cordis.yml；改档位下一步就生效';
@@ -908,9 +914,14 @@
 
   // ---------- C12 项目 profile 菜单（同款浮层；但它**必定重启子进程**） ----------
 
-  /** 触发钮文案：不用 profile 时直说「不用」，别让空字符串长得像加载失败。 */
+  /** 菜单里的 profile 文案：不用 profile 时直说「不用 profile」，别让空字符串长得像加载失败。 */
   function profileText(v) {
     return v === null ? '不用 profile' : v;
+  }
+
+  /** 触发钮上的 profile 文案 = profileText 的短形（钮上还有个人形图标在说"这是哪一轴"）。 */
+  function profileTriggerText(v) {
+    return v === null ? '不用' : v;
   }
 
   /** 菜单顶部那一行"刚改过文件"的提示（只在真的改过时出现）。 */
@@ -933,7 +944,7 @@
   /** 重建菜单内容并刷新触发钮文案（体例同 renderEffortMenu，全量重画）。 */
   function renderProfileMenu() {
     if (!liveProfileLabel || !liveProfileMenu) return;
-    liveProfileLabel.textContent = 'profile · ' + profileText(liveProfile);
+    liveProfileLabel.textContent = profileTriggerText(liveProfile);
     liveProfileBtn.title = liveProfileModelPinned
       ? '项目级 agent profile：当前 profile 钉住了模型与审批策略，切换会重启 live 子进程'
       : '项目级 agent profile（.hello-chat/profile.json）：一键切换模型 / 审批策略 / 工具白名单。切换会重启 live 子进程';

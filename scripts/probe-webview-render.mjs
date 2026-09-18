@@ -599,13 +599,13 @@ const effortRow = (label) => $('live-effort-menu').children.find((r) => hasText(
 check('C11 档位：payload 的 effort 字段与渲染函数对得上（默认「跟随」）', () => {
   send({ type: 'mode-set', mode: 'harness' });
   send({ type: 'live-config', model: 'deepseek-v4-flash', models: ['deepseek-v4-flash'], apiConfigured: true, dshConfigured: true, effort: null, efforts: ['off', 'low', 'high', 'max'], effortThinkingDisabled: false });
-  eq($('live-effort-label').textContent, '推理 · 跟随配置', '默认档位文案不对（未设档位 = 跟随配置）');
+  eq($('live-effort-label').textContent, '跟随', '默认档位文案不对（未设档位 = 跟随配置；钮上只写短值，轴在图标+title 上）');
   ok(!$('live-config-bar').hidden, '配置条没显示');
 });
 
 check('C11 档位：选中档位 → 触发钮跟着走、当前项打勾、其余不打', () => {
   send({ type: 'live-config', model: 'deepseek-v4-flash', models: ['deepseek-v4-flash'], apiConfigured: true, dshConfigured: true, effort: 'low', efforts: ['off', 'low', 'high', 'max'], effortThinkingDisabled: false });
-  eq($('live-effort-label').textContent, '推理 · low', '触发钮没跟着 effort 走');
+  eq($('live-effort-label').textContent, 'low', '触发钮没跟着 effort 走');
   // 菜单是关闭态也照渲 —— 打开时会重画，但内容必须已经是对的
   const rows = [['跟随配置', null], ['off · 关闭思考', 'off'], ['low', 'low'], ['high', 'high'], ['max', 'max']];
   for (const [label] of rows) ok(effortRow(label), `菜单里没有「${label}」这一项`);
@@ -681,7 +681,7 @@ check('C12 profile：payload 字段与渲染函数对得上（默认「不用 pr
   send({ type: 'mode-set', mode: 'harness' });
   posted.length = 0;
   liveConfig({});
-  eq($('live-profile-label').textContent, 'profile · 不用 profile', '未选 profile 时的文案不对');
+  eq($('live-profile-label').textContent, '不用', '未选 profile 时的文案不对（钮上是短值；菜单首项才写全「不用 profile」）');
   ok(!$('live-config-bar').hidden, '配置条没显示');
   ok(profileRow('不用 profile'), '菜单首项不是「不用 profile」');
   ok(profileRow('严格'), '菜单里没有「严格」');
@@ -697,7 +697,7 @@ check('C12 profile：payload 字段与渲染函数对得上（默认「不用 pr
 
 check('C12 profile：选中一项 → 触发钮跟着走、当前项打勾、其余不打', () => {
   liveConfig({ profile: '严格' });
-  eq($('live-profile-label').textContent, 'profile · 严格', '触发钮没跟着 profile 走');
+  eq($('live-profile-label').textContent, '严格', '触发钮没跟着 profile 走');
   const checkOf = (label) => profileRow(label).children.find((c) => c.className === 'lc-mi-check');
   eq(checkOf('严格').hidden, false, '当前 profile 没打勾');
   eq(checkOf('省钱').hidden, true, '非当前 profile 也打勾了');
@@ -719,7 +719,8 @@ check('C12 profile：点一项 → **恰好一条** set-profile；点「不用 p
 check('C12 profile：钉住模型 → 模型菜单整片置灰、**连监听器都不挂**、且不给自定义入口', () => {
   posted.length = 0;
   liveConfig({ profile: '严格', profileModelPinned: true, model: 'deepseek-reasoner' });
-  eq($('live-model-label').textContent, '模型 · 由 profile 固定', '模型钮没说清是被 profile 固定的');
+  // 钮上照旧是**真在用的**模型名（"被钉住"改由 .pinned 的小锁 + title 说 —— 见下面「配置条三钮」那组）
+  eq($('live-model-label').textContent, 'deepseek-reasoner', '钉住时钮上该是真正在用的模型名');
   const modelRows = $('live-model-menu').children.filter((r) => r.children[0] && /^deepseek-/.test(r.children[0].textContent));
   ok(modelRows.length > 0, '模型菜单里一行都没有（置灰也就无从谈起）');
   for (const r of modelRows) {
@@ -785,13 +786,50 @@ check('C12 profile：正有一轮在跑 → profile 钮禁用 + 菜单收起（�
   $('live-profile-btn').click(); // 收起来，别把开着的菜单留给后面
 });
 
-// ---------- 配置条三个下拉钮的形状（2026-09-18：从药丸改成裸文字） ----------
+// ---------- 配置条三个下拉钮的形状（2026-09-18 两次收窄：药丸 → 裸文字 → 图标 + 值） ----------
 
-check('配置条三钮：触发钮文案带得出「这是哪一轴」，光一个值读不出来', () => {
+check('配置条三钮：钮上只剩**值**，轴名交给图标 + title（省宽省掉的是那段每次一样的常量）', () => {
+  liveConfig({ profile: null, profileModelPinned: false, model: 'deepseek-v4-flash', effort: null });
+  eq($('live-model-label').textContent, 'deepseek-v4-flash', '模型钮文案被改了（模型名自证身份，既不加图标也不加前缀）');
+  eq($('live-effort-label').textContent, '跟随', '档位钮该只显示短值「跟随」，不该再带「推理 · 」');
+  eq($('live-profile-label').textContent, '不用', 'profile 钮该只显示短值「不用」，不该再带「profile · 」');
+  // 轴名从文案里撤了，就**必须**在别处还够得着 —— 否则钮退化成"一个来路不明的值"，
+  // 而这正是上一版把前缀加回来的理由。钮内文字已经不是轴名了，剩下能读的只有 title，所以盯它。
+  ok(/模型/.test($('live-model-btn').title), '模型钮的 title 里没有「模型」—— 轴名从钮上撤了又没在 title 里补，用户没法知道这是什么');
+  ok(/推理档位/.test($('live-effort-btn').title), '档位钮的 title 里没有「推理档位」');
+  ok(/profile/i.test($('live-profile-btn').title), 'profile 钮的 title 里没有「profile」');
+});
+
+check('配置条三钮：钉住时钮上仍是**真在用的模型名** + .pinned（小锁靠这个 class 出）', () => {
+  liveConfig({ profile: '严格', profileModelPinned: true, model: 'deepseek-reasoner' });
+  eq($('live-model-label').textContent, 'deepseek-reasoner', '钉住时钮上不是真在用的模型名 —— 那条信息不该为了"说明是被钉住的"而让位');
+  eq($('live-model-btn').classList.contains('pinned'), true, '钉住时没挂 .pinned —— 箭头槽换不成小锁，钮上就一点看不出被固定了');
+  ok(/固定/.test($('live-model-btn').title) && /严格/.test($('live-model-btn').title), '钉住时 title 没说清是被哪个 profile 固定的');
   liveConfig({ profile: null, profileModelPinned: false, model: 'deepseek-v4-flash' });
-  eq($('live-model-label').textContent, '模型 · deepseek-v4-flash', '模型钮没带前缀 —— 裸文字按钮没有药丸外壳分组，光一个模型名读不出它是什么');
-  eq($('live-effort-label').textContent, '推理 · 跟随配置', '档位钮的文案被改了');
-  eq($('live-profile-label').textContent, 'profile · 不用 profile', 'profile 钮的文案被改了');
+  eq($('live-model-btn').classList.contains('pinned'), false, 'profile 撤了 .pinned 还赖着 —— 小锁会一直挂在钮上');
+});
+
+check('配置条三钮：轴图标是**两个不同的真 <svg>**（轴名撤出文案后，图标就是唯一还看得见的轴标）', () => {
+  const html = readFileSync(htmlPath, 'utf8');
+  const buttonOf = (id) => {
+    const m = new RegExp(`<button[^>]*\\bid="${id}"[\\s\\S]*?</button>`).exec(html);
+    return m ? m[0] : '';
+  };
+  const svgOf = (b) => {
+    const m = /<svg[\s\S]*?<\/svg>/.exec(b);
+    return m ? m[0] : '';
+  };
+  const effort = buttonOf('live-effort-btn');
+  const profile = buttonOf('live-profile-btn');
+  ok(effort, 'chat.html 里找不到 #live-effort-btn');
+  ok(profile, 'chat.html 里找不到 #live-profile-btn');
+  ok(svgOf(effort), '#live-effort-btn 里没有 <svg> —— 轴名已经不在文案里了，图标再没有，这个钮就是个来路不明的值');
+  ok(svgOf(profile), '#live-profile-btn 里没有 <svg> —— 同上');
+  ok(svgOf(effort) !== svgOf(profile), '两个钮用了同一个图标 —— 轴标退化成"这里有个图标而已"，还不如把轴名写回来');
+  // 图标必须跟主题走：颜色一旦写死，深/浅主题下各错一半
+  for (const [id, b] of [['live-effort-btn', effort], ['live-profile-btn', profile]]) {
+    ok(svgOf(b).includes('stroke="currentColor"'), `#${id} 的图标不是 stroke="currentColor" —— 定色的话深浅主题会各错一半`);
+  }
 });
 
 check('配置条三钮：**与「配置 DSH」「API」同款**（都挂 .link-button），别再各自长回药丸', () => {
