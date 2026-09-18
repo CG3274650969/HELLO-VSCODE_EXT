@@ -98,6 +98,12 @@ C1/C5 都是「这条 wire 少东西」的教训。C8 之前把**方法的全量
   实测：空闲进程 `stdin.end()` 后 **~25 ms** 就 `exit(0)`（3/3 轮），所以「先优雅、2 s 后硬杀」是划算的。
   ⚠️ 但**优雅停止只争取一次 flush，不是事务**：超时后仍是硬杀，那 ≤200 ms 的窗口只是变小、没消失。
 
+**`request/header` 的 `reason` 有三个取值（2026-09-18，C11 的 F5 实测补）**：`initial`（进程/会话的第一次请求）、
+`resume`（重连后接着跑）、**`change`（同一条连接内 config 变了 —— 就是"热切"的痕迹）**。
+前两个是 C10b 就用来判「有没有重连」的；`change` 此前**从没被记下来过**，而它恰恰是判「改档位要不要重启」最直接的那个字。
+实测：同一会话第一轮 `reason=initial / reasoningEffort=max`（底本默认），13 秒后第二轮 `reason=change / reasoningEffort=low`
+—— **没重启就变了档**。（出处见 [backlog.md](backlog.md) 的 C11 ③。）
+
 **读 DSH 会话日志的坑**：`dsh-sessions/**/session.jsonl.zstd` 是**一串拼接的 zstd 帧**（每批落盘一个帧），
 而 `zstdDecompressSync` 与 `createZstdDecompress` **都只解第一帧就收工**（实测 15 帧的文件两者都只吐 1 行）。
 要读全必须自己按魔数 `28 b5 2f fd` 切帧、逐帧解。`scripts/probe-c8-runtime.mjs` 里有可直接抄的实现。
