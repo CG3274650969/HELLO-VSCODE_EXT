@@ -1137,6 +1137,15 @@ body.live-busy #send-btn {
 .lc-model-custom {
   color: var(--dsw-alias-label-secondary, var(--vscode-dropdown-foreground, #999));
 }
+/* C11：底本 thinking: disabled 时不可选的档位（点了会被 provider 在请求期拒掉）。
+   置灰 + 去掉指针，但**不隐藏** —— 让用户看见"有这几档、只是当前配置下不行"。 */
+.lc-item-disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.lc-item-disabled:hover {
+  background: none;
+}
 /* 自定义模型输入：临时出现，低调小字段（定宽，避免把卡片底行撑开） */
 .lc-input {
   flex: none;

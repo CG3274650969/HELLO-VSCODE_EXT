@@ -15,6 +15,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';
+import type { EffortPluginMount } from './effortPlugin';
 
 /** 生成结果：三个文件的绝对路径 + 实际下发的 hook 命令（自检也用它） */
 export interface ApprovalHookFiles {
@@ -166,29 +167,38 @@ export interface DerivedConfigOptions {
   hooksPath: string;
   /** 比例覆盖；undefined = 原样不动 */
   compaction?: CompactionRatios;
+  /** C11：会话级推理档位插件块；undefined = 不追加（行为与没有这个功能时逐字节相同） */
+  effort?: EffortPluginMount;
 }
 
 export interface DerivedConfigResult {
   cordisPath: string;
   /** 比例覆盖没落上的原因。**有值 = 写出去的是「原文(+hooks 块)」，覆盖未生效，必须报给用户** */
   warning?: string;
+  /** C11：档位块没落上的原因（根不是块状序列）。与 `warning` **分开** —— 挂不上的东西不同，
+   *  提示话术也不同，混成一条会让用户照着"压缩阈值"去查一个档位问题 */
+  effortWarning?: string;
+  /** C11：档位块**真的写进这份文件了吗**。调用方据此判断"改档位要不要重连一次" */
+  effortMounted: boolean;
 }
 
 /**
- * 派生配置的**唯一写手**。合成链：原文 →（可选）改 compaction 两行 →（可选）追加 hooks 块。
+ * 派生配置的**唯一写手**。合成链：原文 →（可选）改 compaction 两行 →（可选）追加 hooks 块
+ * →（可选）追加 C11 档位插件块。三个可选项**互相独立**：各自要不要，由调用方按当下状态给。
  *
  * 只有两种失败是致命的（throw，调用方据此降级）：
  *   · 底本读不出来；
  *   · **要追加 hooks 块**但根不是块状序列 —— C1 的既有语义，绝不改写用户原文。
  *
- * 「改不动 compaction 那两行」**只回落到 warning，绝不 throw** —— 这不是随手的取舍：
+ * 「改不动 compaction 那两行」与「C11 档位块挂不上」**都只回落到 warning，绝不 throw** —— 这不是随手的取舍：
  * `_setupApproval()` 对 throw 的反应是 `server.dispose()` + 不启用审批，也就是说
  * **throw 等于拿 C1 整个主功能去换一个可选的性能旋钮**。比例改不动时写出去的就是
  * 「原文 + hooks 块」，与没有这个功能时逐字节相同 —— 审批照常，只是旋钮没拧上，并且会被告知。
  */
 export function writeDerivedConfig(opts: DerivedConfigOptions): DerivedConfigResult {
   const base = fs.readFileSync(opts.baseConfigPath, 'utf8');
-  if (opts.hooksPath && !isBlockSequenceRoot(base)) {
+  const blockRoot = isBlockSequenceRoot(base);
+  if (opts.hooksPath && !blockRoot) {
     throw new Error('基础 cordis.yml 的根不是块状列表，无法安全追加（不改写用户原文）');
   }
   let text = base;
@@ -201,11 +211,24 @@ export function writeDerivedConfig(opts: DerivedConfigOptions): DerivedConfigRes
       warning = err instanceof Error ? err.message : String(err);
     }
   }
+  // C11：档位块排在 hooks 块之后。挂不上**只 warning，绝不 throw** —— 同比例补丁那条纪律：
+  // 一个可选旋钮不能拿 C1 的主功能去换（throw 在 `_setupApproval` 那边等于整个审批不启用）。
+  let effortWarning: string | undefined;
+  let effortMounted = false;
+  let appended = opts.hooksPath ? derivedBlock(opts.hooksPath) : '';
+  if (opts.effort) {
+    if (blockRoot) {
+      appended += effortBlock(opts.effort);
+      effortMounted = true;
+    } else {
+      effortWarning = '基础 cordis.yml 的根不是块状列表，推理档位块无法追加（档位功能不生效，其余一切照旧）';
+    }
+  }
   const configDir = path.join(opts.storageDir, 'dsh-config');
   fs.mkdirSync(configDir, { recursive: true });
   const cordisPath = path.join(configDir, 'cordis.yml');
-  fs.writeFileSync(cordisPath, text + (opts.hooksPath ? derivedBlock(opts.hooksPath) : ''), 'utf8');
-  return { cordisPath, warning };
+  fs.writeFileSync(cordisPath, text + appended, 'utf8');
+  return { cordisPath, warning, effortWarning, effortMounted };
 }
 
 /**
@@ -592,6 +615,25 @@ function derivedBlock(hooksPath: string): string {
     "  name: '@deepseek-ai/dsh-hooks-claude-code'\n" +
     '  config:\n' +
     '    configPath: ' + yamlLiteral(hooksPath) + '\n'
+  );
+}
+
+/**
+ * C11 档位插件块：同样只增不改。
+ *
+ * `name:` 写的是**本机文件的 `file:///…` URL** —— `cordis-plugin-loader` 认这条分支
+ * （`new URL(name, baseUrl)` 然后 `import()`），所以插件不必进仓库、不必发 npm。
+ * `statePath` 交给插件，它每次请求现读（热生效的根据）。
+ */
+function effortBlock(mount: EffortPluginMount): string {
+  return (
+    '\n' +
+    '# --- AlohaDSH 会话级推理档位（C11）自动追加：由扩展生成，请勿手工编辑 ---\n' +
+    '- id: hello-chat-reasoning-effort\n' +
+    '  name: ' + yamlLiteral(mount.pluginUrl) + '\n' +
+    '  config:\n' +
+    '    statePath: ' + yamlLiteral(mount.statePath) + '\n' +
+    '    thinkingDisabled: ' + (mount.thinkingDisabled ? 'true' : 'false') + '\n'
   );
 }
 

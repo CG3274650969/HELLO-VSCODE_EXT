@@ -16,6 +16,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { randomBytes, randomUUID } from 'crypto';
 import { ChatMessage, UsageBuckets } from './protocol';
+// C11：档位取值。同样只取类型 —— effortPlugin 那边没有 import vscode，也不会反向依赖本文件。
+import type { ReasoningEffort } from './effortPlugin';
 // 只取类型：编译后不留 require，与 turnState.ts 的 `import type { StoredSession }` 相抵，
 // 运行时没有环。C8 的「继续」按钮判据就靠这个字段（见 turnState.ts）。
 import type { LastTurn } from './turnState';
@@ -68,6 +70,15 @@ export interface StoredSession {
    *  「发生过压缩」这件事的**正文说明**是转写里那条 note（见 compactionNotice.ts）。
    *  旧数据没有本字段 → 向后兼容。 */
   compacted?: number;
+  /** C11：**会话级推理档位**（`off|low|high|max`）。
+   *
+   *  ⚠️ 语义是「**未设 = 跟随配置**」，不是「默认 low」—— 未设时我们不覆盖任何东西，
+   *  DSH 用它自己 `cordis.yml` 里那个值（当前底本是 `max`）。
+   *
+   *  它是**扩展侧行为**不是 DSH 会话属性：档位是我们在请求构建期覆盖的 config，
+   *  DSH 只记下"这次请求用了什么"。换个不带我们这个插件的运行时跑同一个会话，档位就没了。
+   *  旧数据没有本字段 → 向后兼容（= 跟随配置）。 */
+  reasoningEffort?: ReasoningEffort;
 }
 
 /** 由首条用户消息生成一句话标题（单行、截断）。 */

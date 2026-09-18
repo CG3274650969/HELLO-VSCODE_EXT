@@ -44,14 +44,22 @@ client session 有 `PendingWait('approval')`）。但当前部署配置下工具
 `cwd / provider / model / maxTokens`，其余静默忽略。要调 effort 只能改
 `cordis.yml` 里 `llm-deepseek`（当前写死 `reasoningEffort: max`）后重启运行时。
 
+> ⚠️ **补记（2026-09-18，C11）**：上面这段只说对了"**wire** 下发不了"，**别读成"做不到"**。
+> provider 本来就按请求解析档位（`dsh-llm-deepseek` 的 `resolveThinking(options, defaults)`），
+> 而 `dsh-agent-loop` 每步都跑 `dispatch.waterfall("agent/request", …)` 且**它的返回值就是这次
+> 请求的 config** ⇒ 在派生 `cordis.yml` 里挂一个我们自己的插件就能按会话覆盖，**热生效、不重启**。
+> 详见 [backlog.md](backlog.md) 的 C11（含四条源码坐标与两条实测证据）。**wire 依然是死的，这条路不是。**
+
 ## 对扩展功能设计的含义
 
 - **2.1 diff 审阅 + Keep/Revert**：扩展侧做（live 轮开始 git 快照 → 收尾 diff）。
   没有「官方 file 事件」可等。
 - **审批（2.x）**：扩展侧自造（破坏性工具命令预审 / 确认条）。运行时当前不给任何
   wire 级审批入口；除非先在 DSH 配置层启用审批策略再另行评估。
-- **3.1 Shield 的 reasoningEffort 菜单**：不是高优先 —— 这条 wire 下发不了，
-  改配置重启才有意义。
+- **3.1 Shield 的 reasoningEffort 菜单**：~~不是高优先 —— 这条 wire 下发不了，
+  改配置重启才有意义。~~ **已实现（C11，2026-09-18）**：wire 仍下发不了，但改走
+  「派生配置里挂我们自己的插件，按会话覆盖 `agent/request` 的返回值」⇒ 会话级菜单 +
+  热生效（不重启）。见上面第 4 条的补记。
 
 ## C8 补记：wire 方法全量清单 + 四条运行时行为（2026-09-16 实测）
 

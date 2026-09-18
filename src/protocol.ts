@@ -248,7 +248,20 @@ export type ExtToWebview =
   /** 发送被扩展拒绝（附件读取失败/过大等）；webview 应恢复输入态，已写内容不丢 */
   | { type: 'user-message-rejected'; reason: string }
   /** live 配置态广播：当前模型、可选预设、API key / DSH 运行路径是否已配置（供 composer 下的配置条渲染） */
-  | { type: 'live-config'; model: string; models: string[]; apiConfigured: boolean; dshConfigured: boolean }
+  | {
+      type: 'live-config';
+      model: string;
+      models: string[];
+      apiConfigured: boolean;
+      dshConfigured: boolean;
+      /** C11：当前会话的推理档位；**null = 跟随配置**（绝不能省略 —— webview 要能区分
+       *  「跟随配置」与「还没收到」，否则重连期间按钮会闪回默认文案） */
+      effort: string | null;
+      /** C11：可选档位（固定四档；由扩展下发而不是前端写死，防两边漂移） */
+      efforts: string[];
+      /** C11：底本 `thinking: disabled` —— 那时只有 `off` 合法，其余三档界面置灰 */
+      effortThinkingDisabled: boolean;
+    }
   /** 2.1：本轮 DSH 改动审阅（一轮 done 后推送整份；新一轮开始时清空/隐藏） */
   | { type: 'review-set'; changes: ReviewChange[] }
   /** 2.1：清空并隐藏审阅条与面板（新一轮开始 / 模式切换 / 全部处理完） */
@@ -298,6 +311,9 @@ export type WebviewToExt =
   | { type: 'set-mode'; mode: Mode } // 顶部模式切换（内嵌聊天 / Harness）
   // 下方几条来自 composer 下的配置条（仅 Harness 模式可见；Harness 恒为 DSH 直播）
   | { type: 'set-model'; model: string } // 改模型 → 扩展重启 live 子进程生效
+  // C11：改会话级推理档位。`null`/缺省 = 跟随配置。与 set-model 不同，**通常不重启** ——
+  // 档位是插件每次请求现读的，热生效（只有本进程第一次选档位要重连一次）。
+  | { type: 'set-effort'; effort: string | null }
   | { type: 'configure-key' } // 点"API" → 扩展弹密码输入框写入 SecretStorage
   | { type: 'configure-dsh' } // 点"配置 DSH" → 扩展弹引导向导，写 hello.dsh.*（machine scope）
   // 2.1 改动审阅动作：id 为 ReviewChange.id（跨根唯一）；*-all 不带 id

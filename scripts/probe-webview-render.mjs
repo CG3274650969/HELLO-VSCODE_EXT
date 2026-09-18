@@ -591,6 +591,60 @@ check('C9 浮层：details 到位 → 工具行与丢弃计数都渲染', () => 
   ok(hasText($('runs-list'), 'DSH 子进程意外退出（code=1）'), '本轮错误没渲染');
 });
 
+// ---------- C11 推理档位菜单（同一影子的回归样） ----------
+
+/** 菜单项按文案找（渲染函数把文案写在 `.lc-mi-name` 上） */
+const effortRow = (label) => $('live-effort-menu').children.find((r) => hasText(r, label));
+
+check('C11 档位：payload 的 effort 字段与渲染函数对得上（默认「跟随」）', () => {
+  send({ type: 'mode-set', mode: 'harness' });
+  send({ type: 'live-config', model: 'deepseek-v4-flash', models: ['deepseek-v4-flash'], apiConfigured: true, dshConfigured: true, effort: null, efforts: ['off', 'low', 'high', 'max'], effortThinkingDisabled: false });
+  eq($('live-effort-label').textContent, '推理 · 跟随配置', '默认档位文案不对（未设档位 = 跟随配置）');
+  ok(!$('live-config-bar').hidden, '配置条没显示');
+});
+
+check('C11 档位：选中档位 → 触发钮跟着走、当前项打勾、其余不打', () => {
+  send({ type: 'live-config', model: 'deepseek-v4-flash', models: ['deepseek-v4-flash'], apiConfigured: true, dshConfigured: true, effort: 'low', efforts: ['off', 'low', 'high', 'max'], effortThinkingDisabled: false });
+  eq($('live-effort-label').textContent, '推理 · low', '触发钮没跟着 effort 走');
+  // 菜单是关闭态也照渲 —— 打开时会重画，但内容必须已经是对的
+  const rows = [['跟随配置', null], ['off · 关闭思考', 'off'], ['low', 'low'], ['high', 'high'], ['max', 'max']];
+  for (const [label] of rows) ok(effortRow(label), `菜单里没有「${label}」这一项`);
+  const checkOf = (label) => effortRow(label).children.find((c) => c.className === 'lc-mi-check');
+  eq(checkOf('low').hidden, false, '当前档位没打勾');
+  eq(checkOf('high').hidden, true, '非当前档位也打勾了');
+  eq(checkOf('跟随配置').hidden, true, '「跟随配置」不该打勾');
+});
+
+check('C11 档位：点一项 → 发出 set-effort（点当前项不发）', () => {
+  posted.length = 0;
+  effortRow('max').click();
+  eq(posted.length, 1, '点一下菜单项该只发一条消息');
+  eq(posted[0].type, 'set-effort', `发的不是 set-effort：${posted[0].type}`);
+  eq(posted[0].effort, 'max', '档位值没带上');
+  posted.length = 0;
+  effortRow('low').click(); // 就是当前项
+  eq(posted.length, 0, '点当前档位不该发消息（白重写一次表）');
+  posted.length = 0;
+  effortRow('跟随配置').click();
+  eq(posted[0] && posted[0].effort, null, '「跟随配置」该发 null（扩展据此删掉会话字段）');
+});
+
+check('C11 档位：底本 thinking: disabled → 三档置灰且点了不发，off 与跟随仍可选', () => {
+  posted.length = 0;
+  send({ type: 'live-config', model: 'deepseek-v4-flash', models: ['deepseek-v4-flash'], apiConfigured: true, dshConfigured: true, effort: null, efforts: ['off', 'low', 'high', 'max'], effortThinkingDisabled: true });
+  for (const label of ['low', 'high', 'max']) {
+    ok(effortRow(label).classList.contains('lc-item-disabled'), `${label} 没置灰（选了会让 provider 在请求期抛错）`);
+    effortRow(label).click();
+  }
+  eq(posted.length, 0, '置灰的档位竟然发出去了');
+  ok(!effortRow('off · 关闭思考').classList.contains('lc-item-disabled'), 'off 被误置灰了');
+  ok(hasText($('live-effort-menu'), 'thinking: disabled'), '没写明为什么置灰');
+  effortRow('off · 关闭思考').click();
+  eq(posted[0] && posted[0].effort, 'off', 'disabled 下 off 该能选');
+  // 触发钮的 title 也要说实话
+  ok(/thinking: disabled/.test($('live-effort-btn').title), '触发钮 title 没说清当前配置的限制');
+});
+
 console.log('');
 if (failures.length) {
   console.log(`✗ ${failures.length} 条未过（共 ${passed + failures.length} 条）：`);

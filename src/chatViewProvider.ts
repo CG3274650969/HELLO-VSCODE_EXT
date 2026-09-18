@@ -31,6 +31,15 @@ import {
   writeApprovalHookFiles,
   writeDerivedConfig,
 } from './dshHooks';
+import {
+  EFFORT_VALUES,
+  EffortPluginMount,
+  normalizeEffort,
+  ReasoningEffort,
+  thinkingDisabledInConfig,
+  writeEffortPluginFiles,
+  writeEffortState,
+} from './effortPlugin';
 import { isAbortError, streamMockReply } from './mockAssistant';
 import {
   capToolInput,
@@ -413,6 +422,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** C10：压缩阈值覆盖相关告警是否已弹过。**独立旗标**，理由同 `_storageWarned` */
   private _compactionWarned = false;
 
+  // ---------- C11 会话级推理档位状态 ----------
+
+  /** 档位表文件（`<storageDir>/dsh-plugins/reasoning-effort-state.json`）；空 = 还没生成过 */
+  private _effortStatePath?: string;
+  /** 档位块**真的挂进当前派生配置了吗**。改档位要不要重连一次，全看它 ——
+   *  ⚠️ 不能用 `_overlayConfigPath` 代替：审批/阈值也能让它非空，而那时块并不在里面 */
+  private _effortMounted = false;
+  /**
+   * 本 activation 内**动过一次档位**。挂上就不摘 —— 于是切会话永远不需要重连。
+   * 与 `_effortNeeded()` 里的"存量会话里有档位"那一半互补：重载窗口后靠后者，全新会话靠前者。
+   */
+  private _effortUsed = false;
+  /** C11：档位相关告警是否已弹过。**独立旗标**，理由同 `_storageWarned` */
+  private _effortWarned = false;
+  /**
+   * 底本 llm-deepseek 是不是 `thinking: disabled`（那时只有 `off` 合法）。每次连接重算。
+   * `undefined` = 本 activation 还没读过 —— 读一次就记住，避免每次广播都去读一遍底本。
+   */
+  private _thinkingDisabled?: boolean;
+
   // ---------- C3a 用量读数（每轮/每会话 token + 上下文占用率）状态 ----------
 
   /** 本轮累计；一轮跑着才有值。轮尾折进 `_active.usage` 后置空（单点折叠 → 不可能双计） */
@@ -596,6 +625,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (model) this._setLiveModel(model);
         break;
       }
+      case 'set-effort':
+        // C11：null/垃圾值一律当「跟随配置」（normalizeEffort 负责，绝不猜）
+        this._setLiveEffort(normalizeEffort(msg.effort));
+        break;
       case 'configure-key':
         void this._promptAndStoreApiKey();
         break;
@@ -893,6 +926,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._captureBaselineAtTurnStart();
       // 1) 拿本 UI 会话对应的 DSH 会话；首次续聊"旧对话"会插一行"失忆"note
       const dshId = this._ensureDshSession();
+      // C11：这一步**才**可能拿到 dsh.id（新会话在此之前没有身份、表里也无从写起）。
+      // 放在闸后、发请求前 —— 表里少了这一行，这一轮就会静默沿用上一次的档位（或跟随配置）。
+      this._writeEffortState();
 
       // 2) 组 contentBlocks：正文在前，附件按 <file> 包裹（与 mock 观感一致）
       const parts: string[] = [];
@@ -2210,28 +2246,163 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * 唯一的调用点（`_doConnectLive` 里 `_ensureApproval()` 之后那行）。
    */
   private _refreshDerivedConfig(): void {
+    // C11：底本 thinking 只在这里读一次，UI 与插件共用同一个结论（省得两处各读数一次、各自漂移）
+    this._thinkingDisabled = this._readThinkingDisabled();
     const hooksPath = this._approvalFiles?.hooksPath ?? '';
     const compaction = this._compactionOverride();
-    if (!hooksPath && !compaction) {
-      // 两样都不需要 → 不派生。留着旧的派生文件只会是一份会过期的副本。
+    const wantEffort = this._effortNeeded();
+    if (!hooksPath && !compaction && !wantEffort) {
+      // 三样都不需要 → 不派生。留着旧的派生文件只会是一份会过期的副本。
       this._overlayConfigPath = undefined;
+      this._effortMounted = false;
       return;
     }
     const baseConfigPath = this._baseConfigPathAbs();
     if (!baseConfigPath) {
       this._overlayConfigPath = undefined;
+      this._effortMounted = false;
       return;
     }
+    let effort: EffortPluginMount | undefined;
+    if (wantEffort) {
+      try {
+        const files = writeEffortPluginFiles({ storageDir: this._storageDir });
+        this._effortStatePath = files.statePath;
+        // 表先落地：插件一加载、第一步请求就会读它，顺序反了会白跑一步
+        this._writeEffortState();
+        effort = {
+          pluginUrl: files.pluginUrl,
+          statePath: files.statePath,
+          thinkingDisabled: this._thinkingDisabledFlag(),
+        };
+      } catch (err) {
+        // 写不出插件文件 → 本次不挂块（其余一切照旧，档位不生效并被告知）
+        this._effortWarn(err instanceof Error ? err.message : String(err));
+      }
+    }
     try {
-      const r = writeDerivedConfig({ storageDir: this._storageDir, baseConfigPath, hooksPath, compaction });
+      const r = writeDerivedConfig({ storageDir: this._storageDir, baseConfigPath, hooksPath, compaction, effort });
       // 比例没落上（底本里没有那个插件块等）时仍然要用这份文件 —— hooks 块在里面
       if (r.warning) this._compactionWarn(r.warning);
+      if (r.effortWarning) this._effortWarn(r.effortWarning);
       this._overlayConfigPath = r.cordisPath;
+      this._effortMounted = r.effortMounted;
     } catch (err) {
       // 只剩「底本读不出来」会走到这。降级到「不用派生配置」，绝不阻断连接 —— 与 _ensureApproval 同一条纪律。
       this._overlayConfigPath = undefined;
+      this._effortMounted = false;
       if (compaction) this._compactionWarn(err instanceof Error ? err.message : String(err));
     }
+  }
+
+  // ---------- C11：会话级推理档位 ----------
+
+  /**
+   * 上面那个字段的读法。**连接过程中也要能问** —— `_doConnectLive` 是先广播一次状态
+   * （那时 `_refreshDerivedConfig` 还没跑），若此时硬说 false，在 `thinking: disabled` 的
+   * 底本上界面会短暂地不置灰，用户手快选中 `low` 就是一次静默不生效。
+   */
+  private _thinkingDisabledFlag(): boolean {
+    if (this._thinkingDisabled === undefined) this._thinkingDisabled = this._readThinkingDisabled();
+    return this._thinkingDisabled;
+  }
+
+  /** 底本 llm-deepseek 是不是 `thinking: disabled`（读不到/锚点不唯一 → false，理由见 effortPlugin.ts） */
+  private _readThinkingDisabled(): boolean {
+    const base = this._baseConfigPathAbs();
+    if (!base) return false;
+    try {
+      return thinkingDisabledInConfig(fs.readFileSync(base, 'utf8'));
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 要不要把档位块挂进派生配置。两个条件取或：
+   *   · 存量会话里有任何一个设过档位（重载窗口后靠它 —— 会话字段是落盘的）；
+   *   · 本 activation 内动过一次档位（全新会话的第一次选择靠它）。
+   *
+   * ⚠️ **一旦为真就不再变假**（挂了就不摘）：`_effortUsed` 只在置位处赋值，没有反向操作。
+   * 这正是"切会话永远不需要重连"的根据 —— 块一直在，缺的只是表里那一行。
+   */
+  private _effortNeeded(): boolean {
+    if (this._effortUsed) return true;
+    return Object.values(this._stores).some((store) =>
+      store.all().some((s) => normalizeEffort(s.reasoningEffort) !== undefined)
+    );
+  }
+
+  /**
+   * 全量重建档位表并落盘。**给的是所有会话**，不是活跃那个 —— 一个 DSH 进程服务多个会话、
+   * 切会话不重启，所以表里必须同时有它们的档位（漏一个，切过去就静默用了别人的档位）。
+   * 只认已有 `dsh.id` 的会话：还没有 DSH 身份的会话，表里也无从写起。
+   */
+  private _writeEffortState(): void {
+    const statePath = this._effortStatePath;
+    if (!statePath) return;
+    const byId: Record<string, ReasoningEffort> = {};
+    for (const store of Object.values(this._stores)) {
+      for (const s of store.all()) {
+        const effort = normalizeEffort(s.reasoningEffort);
+        if (effort && s.dsh?.id) byId[s.dsh.id] = effort;
+      }
+    }
+    try {
+      writeEffortState(statePath, byId);
+    } catch (err) {
+      this._effortWarn(`档位表写入失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** 档位告警：控制台始终留痕、用户侧每次 activation 只弹一条（体例同 `_compactionWarn`）。 */
+  private _effortWarn(text: string): void {
+    console.warn('[effort]', text);
+    if (this._effortWarned) return;
+    this._effortWarned = true;
+    void vscode.window.showWarningMessage(`推理档位设置未生效：${text}`);
+  }
+
+  /**
+   * 「块真的挂在**这一份**派生文件里」。`_effortMounted` 是记忆，这里是**复核** ——
+   * 单看记忆会在「改了配置、重连还没跑到 `_refreshDerivedConfig`」那一小段里骗人，
+   * 而那一段里走热路径的后果是**静默不生效**（最坏的失效形状）。读一次小文件很便宜。
+   */
+  private _effortBlockIsLive(): boolean {
+    if (!this._effortMounted || !this._overlayConfigPath) return false;
+    try {
+      return fs.readFileSync(this._overlayConfigPath, 'utf8').includes('- id: hello-chat-reasoning-effort');
+    } catch {
+      return false; // 读不到就按"没挂"处理 —— 重连一次总是对的
+    }
+  }
+
+  /**
+   * 改会话级推理档位。`undefined` = 跟随配置（= 不覆盖，DSH 用它自己 cordis.yml 里的值）。
+   *
+   * ⚠️ **与 `_setLiveModel` 最大的区别：这条通常不重连**。模型是 initialize 的参数，
+   * 非重启不可；档位是插件在**每次请求**现读状态表，所以块一旦挂上就热生效（下一步就变）。
+   * 只有本进程还没挂过块时才要付一次重连的代价（见 `_effortMounted`）。
+   */
+  private _setLiveEffort(effort: ReasoningEffort | undefined): void {
+    if (this._abort) {
+      vscode.window.showInformationMessage('当前有回复在生成中，先停止或等它结束，再切换档位。');
+      return;
+    }
+    if (effort === normalizeEffort(this._active.reasoningEffort)) return; // 没变，别白写盘
+    if (effort === undefined) delete this._active.reasoningEffort;
+    else this._active.reasoningEffort = effort;
+    this._persistActiveSession(); // 会话字段落盘 → 重载窗口后档位还在
+
+    if (!this._effortBlockIsLive()) {
+      // 本进程第一次选档位：派生配置里还没有我们的块，插件根本没加载 → 必须重连一次
+      this._effortUsed = true;
+      this._restartLiveProcess();
+      return;
+    }
+    // 块已在 ⇒ 热生效。只重写表 + 刷新配置条，**不杀进程**（正在跑的那一步不受影响 —— 对的）
+    this._writeEffortState();
+    this._postLiveConfig();
   }
 
   /**
@@ -2730,7 +2901,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._postLiveConfig(); // 顺带刷新配置条（模型/预设/API 灯）
   }
 
-  /** 把配置条状态广播给 webview：当前模型 + 可选预设 + API key / DSH 路径是否已配。 */
+  /** 把配置条状态广播给 webview：当前模型 + 可选预设 + API key / DSH 路径是否已配 + C11 档位。 */
   private _postLiveConfig(): void {
     const model = this._dshModel();
     const models = PRESET_MODELS.includes(model) ? PRESET_MODELS : [model, ...PRESET_MODELS];
@@ -2740,6 +2911,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       models,
       apiConfigured: this._apiKeyCache !== undefined && this._apiKeyCache !== '',
       dshConfigured: this._dshConfigured(),
+      // C11：档位是**会话字段**（不是全局设置），所以每次广播都从活跃会话现读。
+      // null 而不是省略：webview 要能区分「跟随配置」与「还没收到」。
+      effort: normalizeEffort(this._active.reasoningEffort) ?? null,
+      efforts: [...EFFORT_VALUES],
+      // 底本 thinking: disabled 时三档会抛，界面据此置灰并写明原因
+      effortThinkingDisabled: this._thinkingDisabledFlag(),
     });
   }
 

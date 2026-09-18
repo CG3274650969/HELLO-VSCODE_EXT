@@ -57,11 +57,18 @@
   var liveModelMenu = document.getElementById('live-model-menu'); // 浮层菜单
   var liveModelWrap = document.getElementById('live-model-wrap');
   var liveModelInput = document.getElementById('live-model-input');
+  var liveEffortBtn = document.getElementById('live-effort-btn'); // C11 推理档位触发钮
+  var liveEffortLabel = document.getElementById('live-effort-label');
+  var liveEffortMenu = document.getElementById('live-effort-menu'); // 浮层菜单
+  var liveEffortWrap = document.getElementById('live-effort-wrap');
   var liveApiBtn = document.getElementById('live-api-btn');
   var liveDshBtn = document.getElementById('live-dsh-btn');
   var liveModels = []; // 扩展下发的可选模型
   var liveModel = ''; // 当前生效模型（扩展为真相）
   var liveModelList = []; // 菜单展示用的模型列表（预设 + 当前模型兜底）
+  var liveEfforts = ['off', 'low', 'high', 'max']; // C11 可选档位（扩展下发的为准）
+  var liveEffort = null; // C11 当前会话档位；**null = 跟随配置**（扩展为真相）
+  var liveEffortThinkingOff = false; // C11 底本 thinking: disabled → 只有 off 合法
   var apiConfigured = false; // API key 是否已配
   var dshConfigured = false; // DSH 运行路径（nodePath && entry）是否已配
   var customModelActive = false; // 是否正显示"自定义模型"输入框
@@ -614,15 +621,22 @@
   function refreshLiveConfigVisibility() {
     var show = currentMode === 'harness';
     if (!show && customModelActive) exitCustomModelInput(false); // 藏起来时收掉自定义输入态
-    if (!show) closeModelMenu(); // 切走 harness 时收起模型菜单
+    if (!show) {
+      closeModelMenu(); // 切走 harness 时收起模型菜单
+      closeEffortMenu();
+    }
     liveConfigBar.hidden = !show;
   }
 
-  /** 运行在途（sending/runBusy）→ 模型 / API / DSH 配置一律禁改。 */
+  /** 运行在途（sending/runBusy）→ 模型 / 档位 / API / DSH 配置一律禁改。 */
   function refreshLiveConfigEnabled() {
     var busy = sending || runBusy;
     liveModelBtn.disabled = busy;
-    if (busy) closeModelMenu(); // 开始运行了就把打开的菜单收起
+    liveEffortBtn.disabled = busy;
+    if (busy) {
+      closeModelMenu(); // 开始运行了就把打开的菜单收起
+      closeEffortMenu();
+    }
     liveModelInput.disabled = busy;
     liveApiBtn.disabled = busy;
     liveDshBtn.disabled = busy;
@@ -652,6 +666,13 @@
     if (liveModel && list.indexOf(liveModel) === -1) list.unshift(liveModel);
     liveModelList = list;
     renderModelMenu();
+
+    // C11 档位：会话字段（不是全局设置），扩展为真相；null/缺省 = 跟随配置
+    if (data.efforts) liveEfforts = data.efforts;
+    liveEffort = typeof data.effort === 'string' ? data.effort : null;
+    if (typeof data.effortThinkingDisabled === 'boolean') liveEffortThinkingOff = data.effortThinkingDisabled;
+    renderEffortMenu();
+
     refreshLiveConfigVisibility();
     refreshLiveConfigEnabled();
     toggleEmptyHint(); // dshConfigured 一变 → harness 空态引导文案跟着切
@@ -743,6 +764,92 @@
     if (commit && v && v !== liveModel) {
       post({ type: 'set-model', model: v });
     }
+  }
+
+  // ---------- C11 推理档位菜单（与模型菜单同构，但换的是会话字段、且通常不重启） ----------
+
+  /** 档位项文案：跟随配置那项要说清"不覆盖"，四档直接给 id（它们就是 provider 的取值）。 */
+  function effortText(v) {
+    if (v === null) return '跟随配置';
+    if (v === 'off') return 'off · 关闭思考';
+    return v;
+  }
+
+  /** 该档位现在能不能选：底本 thinking: disabled 时只有 off（与「跟随」）合法 —— 其余三档
+   *  会让 provider 在请求期抛 UNSUPPORTED_REASONING_EFFORT，所以置灰并说明原因。 */
+  function effortBlocked(v) {
+    return liveEffortThinkingOff && v !== null && v !== 'off';
+  }
+
+  /** 重建菜单内容并刷新触发钮文案（体例同 renderModelMenu，全量重画）。 */
+  function renderEffortMenu() {
+    if (!liveEffortLabel || !liveEffortMenu) return;
+    liveEffortLabel.textContent = '推理 · ' + effortText(liveEffort);
+    liveEffortBtn.title = liveEffortThinkingOff
+      ? '会话级推理档位：底本 llm-deepseek 是 thinking: disabled，只有 off 可用'
+      : '会话级推理档位（reasoningEffort）：默认跟随 cordis.yml；改档位下一步就生效';
+    // 档位是会话级的，但它不重启子进程 —— 与模型的提示区别就在这里
+    liveEffortMenu.textContent = '';
+    var items = [null].concat(liveEfforts);
+    for (var i = 0; i < items.length; i++) {
+      (function (v) {
+        var row = document.createElement('div');
+        row.className = 'lc-model-item';
+        row.setAttribute('role', 'menuitem');
+        var name = document.createElement('span');
+        name.className = 'lc-mi-name';
+        name.textContent = effortText(v);
+        name.title = effortBlocked(v) ? '底本 thinking: disabled，此档在当前配置下不可用' : effortText(v);
+        if (effortBlocked(v)) row.classList.add('lc-item-disabled');
+        var check = document.createElement('span');
+        check.className = 'lc-mi-check';
+        check.textContent = '✓';
+        check.hidden = v !== liveEffort; // 当前档位右侧打勾
+        row.appendChild(name);
+        row.appendChild(check);
+        if (!effortBlocked(v)) {
+          row.addEventListener('click', function () {
+            pickEffort(v);
+          });
+        }
+        liveEffortMenu.appendChild(row);
+      })(items[i]);
+    }
+    if (liveEffortThinkingOff) {
+      var sep = document.createElement('div');
+      sep.className = 'lc-model-sep';
+      liveEffortMenu.appendChild(sep);
+      var hint = document.createElement('div');
+      hint.className = 'lc-model-item lc-model-custom';
+      hint.textContent = '底本 thinking: disabled';
+      hint.title = 'cordis.yml 的 llm-deepseek 设了 thinking: disabled，此时只有 off 合法';
+      liveEffortMenu.appendChild(hint);
+    }
+  }
+
+  /** 点触发钮：开/关菜单（两个菜单互斥，开一个就收另一个）。 */
+  function toggleEffortMenu() {
+    if (liveEffortBtn.disabled) return;
+    if (liveEffortMenu.classList.contains('open')) {
+      closeEffortMenu();
+      return;
+    }
+    closeModelMenu();
+    renderEffortMenu(); // 打开前重画，勾到当前项
+    liveEffortMenu.classList.add('open');
+    liveEffortBtn.classList.add('open');
+  }
+
+  function closeEffortMenu() {
+    liveEffortMenu.classList.remove('open');
+    liveEffortBtn.classList.remove('open');
+  }
+
+  /** 选一个档位（null = 跟随配置）。busy 由 disabled 兜住；点的就是当前项 → 只收起。 */
+  function pickEffort(v) {
+    closeEffortMenu();
+    if (v !== liveEffort) post({ type: 'set-effort', effort: v });
+    // 触发钮文案等扩展 live-config 回执刷新（所见为准）
   }
 
   /**
@@ -2098,10 +2205,14 @@
     liveModelBtn.addEventListener('click', function () {
       toggleModelMenu();
     });
+    // C11 推理档位：同款触发钮 + 浮层菜单
+    liveEffortBtn.addEventListener('click', function () {
+      toggleEffortMenu();
+    });
     document.addEventListener('click', function (e) {
-      if (!liveModelMenu.classList.contains('open')) return;
-      if (liveModelWrap.contains(e.target)) return; // 菜单/触发钮内部各自处理
-      closeModelMenu();
+      // 两个菜单各自判断"点在外面"：一个处理函数里连判两次，比注册两条互不知情的监听器稳
+      if (liveModelMenu.classList.contains('open') && !liveModelWrap.contains(e.target)) closeModelMenu();
+      if (liveEffortMenu.classList.contains('open') && !liveEffortWrap.contains(e.target)) closeEffortMenu();
     });
     liveModelInput.addEventListener('keydown', function (e) {
       if (e.key === 'Enter') {
@@ -2287,6 +2398,10 @@
       if (e.target === chatTitleInput || e.target === historySearch || e.target === liveModelInput) return;
       if (liveModelMenu.classList.contains('open')) { // 模型菜单开着 → 先收它
         closeModelMenu();
+        return;
+      }
+      if (liveEffortMenu.classList.contains('open')) { // C11 档位菜单同理
+        closeEffortMenu();
         return;
       }
       if (reviewPanelOpen) {
