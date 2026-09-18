@@ -43,10 +43,12 @@ export interface ApprovalAsk {
 /** 一条审批的最终去向 */
 export type ApprovalOutcome = 'allowed' | 'rejected' | 'timeout' | 'cancelled';
 
-/** 挂起中的一条：那条 HTTP 连接的结算函数 + 超时定时器 */
+/** 挂起中的一条：那条 HTTP 连接的结算函数 + 超时定时器 + 工具名（只为了拒绝话术里用对名词） */
 interface Pending {
   settle: (r: Decision) => void;
   timer: NodeJS.Timeout;
+  /** `bash` | `write` | `edit` —— 拒绝原因是要回给**模型**看的，说「该命令」还是「该写入」得对上 */
+  toolName: string;
 }
 
 /** 回给 hook 脚本的决策 */
@@ -128,7 +130,7 @@ export class ApprovalServer {
     p.settle(
       allow
         ? { allow: true }
-        : { allow: false, reason: '用户在 AlohaDSH 中拒绝了该命令，未执行。' }
+        : { allow: false, reason: `用户在 AlohaDSH 中拒绝了${nounOf(p.toolName)}，未执行。` }
     );
     return true;
   }
@@ -142,7 +144,7 @@ export class ApprovalServer {
       this._pending.delete(id);
       clearTimeout(p.timer);
       this._onResolved(id, 'cancelled');
-      p.settle({ allow: false, reason: '本轮已停止或切换，审批被取消，命令未执行。' });
+      p.settle({ allow: false, reason: `本轮已停止或切换，审批被取消，${nounOf(p.toolName)}未执行。` });
     }
   }
 
@@ -240,10 +242,21 @@ export class ApprovalServer {
         this._onResolved(id, 'timeout');
         resolve({ allow: false, reason: '等待确认超时，已按拒绝处理，命令未执行。' });
       }, timeoutMs);
-      this._pending.set(id, { settle: resolve, timer });
+      this._pending.set(id, { settle: resolve, timer, toolName: ask.toolName });
       this._onAsk({ ...ask, id });
     });
   }
+}
+
+/**
+ * 拒绝话术里的名词。这条原因会经 hook 原样回给**模型**（`permissionDecisionReason`），
+ * 对着一次写文件说「该命令」会让模型以为自己的 bash 被拦了 —— C4 起这条通路也管 write/edit，
+ * 所以名词得跟着工具走。未知工具一律用中性的「该操作」。
+ */
+function nounOf(toolName: string): string {
+  if (toolName === 'bash') return '该命令';
+  if (toolName === 'write' || toolName === 'edit') return '该写入';
+  return '该操作';
 }
 
 /**
