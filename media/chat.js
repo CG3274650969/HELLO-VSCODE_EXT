@@ -1012,9 +1012,12 @@
     var prefix = r.outcome === 'running' ? self + '运行中' : self + (RUN_OUTCOME_LABEL[r.outcome] || r.outcome);
     var line = prefix + ' · ' + (c.toolCount > 0 ? c.toolCount + ' 工具' : '无工具调用') + ' · ' + fmtDuration(runDuration(r));
     if (r.outcome !== 'running') {
+      // 三种后缀**并列**，不再互相顶掉：一轮里可能同时有轮级错误、工具失败、结果未知，
+      // 只写最重的那个会把另外两类直接吞掉（实测中断轮「1 未知 + 3 失败」条上只剩「3 失败」）。
+      // 顺序固定（重 → 轻），所以同一轮在两处的这一句仍然逐字可比。
       if (c.errorCount > 0) line += ' · ' + c.errorCount + ' 错误';
-      else if (c.toolErrors > 0) line += ' · ' + c.toolErrors + ' 失败';
-      else if (c.toolUnknown > 0) line += ' · ' + c.toolUnknown + ' 结果未知';
+      if (c.toolErrors > 0) line += ' · ' + c.toolErrors + ' 失败';
+      if (c.toolUnknown > 0) line += ' · ' + c.toolUnknown + ' 结果未知';
     }
     return line;
   }
