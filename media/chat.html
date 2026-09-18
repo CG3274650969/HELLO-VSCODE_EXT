@@ -154,12 +154,15 @@
           </svg>
         </button>
         <div id="live-config-bar" class="live-config-bar" hidden>
-          <!-- 模型选择器：DOM 浮层菜单（CC/DSH 同款）。原生 <select> 的弹出列表是系统方形控件、
-               无法圆角/配色，故弃用；此处按钮触发 .lc-model-menu（chat.js 渲染/开关）。 -->
+          <!-- 三个下拉触发钮（模型 / 推理档位 / profile）：**裸文字按钮，与右侧「配置 DSH」「API」
+               逐字同款**（都挂 .link-button），不再是自己一套带边框底色的药丸 —— 三个药丸并排
+               在工具行里太抢眼，也比旁边两个状态钮重得多。样式差异只剩"菜单开着时保持高亮"。
+               原生 <select> 依然不用：它的弹出列表是系统方形控件，无法圆角/配色（这是"方、白底
+               白字"的根源），所以走 DOM 浮层菜单（chat.js 渲染/开关）。 -->
           <div class="lc-model-wrap">
-            <button id="live-model-btn" class="lc-model" type="button"
+            <button id="live-model-btn" class="link-button lc-model" type="button"
                     title="切换模型（需停在运行中后生效，会重启 live 子进程）">
-              <span id="live-model-label" class="lc-model-label">选择模型</span>
+              <span id="live-model-label" class="lc-model-label">模型 · 未选</span>
               <span class="lc-chev" aria-hidden="true"></span>
             </button>
             <div id="live-model-menu" class="lc-model-menu" role="menu" aria-label="模型列表"></div>
@@ -167,7 +170,7 @@
           <!-- C11 推理档位：与模型选择器同款浮层菜单（复用 .lc-model-* 类）。
                与模型不同的是它**按会话**记、且通常热生效（不重启子进程）。 -->
           <div id="live-effort-wrap" class="lc-model-wrap">
-            <button id="live-effort-btn" class="lc-model" type="button"
+            <button id="live-effort-btn" class="link-button lc-model" type="button"
                     title="会话级推理档位（reasoningEffort）：默认跟随 cordis.yml；改档位下一步就生效">
               <span id="live-effort-label" class="lc-model-label">推理 · 跟随</span>
               <span class="lc-chev" aria-hidden="true"></span>
@@ -177,7 +180,7 @@
           <!-- C12 项目级 profile：同一款浮层菜单。与前两个不同的是它**必定重连**（模型/工具白名单/
                审批开关都要重建），且它是**整个项目**的一份声明，不是会话级。 -->
           <div id="live-profile-wrap" class="lc-model-wrap">
-            <button id="live-profile-btn" class="lc-model" type="button"
+            <button id="live-profile-btn" class="link-button lc-model" type="button"
                     title="项目级 agent profile（.hello-chat/profile.json）：一键切换模型 / 审批策略 / 工具白名单。切换会重启 live 子进程">
               <span id="live-profile-label" class="lc-model-label">profile</span>
               <span class="lc-chev" aria-hidden="true"></span>

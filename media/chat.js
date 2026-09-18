@@ -711,9 +711,11 @@
     if (!liveModelLabel || !liveModelMenu) return;
     // C12：profile 钉住模型时，这个菜单**不可用**且要说清为什么 —— 选它等于选一个不会生效的值。
     // 与 C11 档位菜单置灰同一套道理：宁可明确告知，也不做"选了没反应"的静默覆盖。
+    // 前缀是必须的：裸文字按钮没有药丸外壳兜着，光一个 `deepseek-v4-flash` 混在
+    // 「推理 · low」「profile · 严格」中间，读不出它是什么（药丸时代靠形状分组）。
     liveModelLabel.textContent = liveProfileModelPinned
       ? '模型 · 由 profile 固定'
-      : (liveModel || '选择模型');
+      : '模型 · ' + (liveModel || '未选');
     // 触发钮的 title 也必须跟着改：chat.html 里那句「切换模型…会重启 live 子进程」在钉住时是**假话**
     // —— 选了根本不生效（同 C11 档位菜单的「底本 thinking: disabled」那条）。
     liveModelBtn.title = liveProfileModelPinned

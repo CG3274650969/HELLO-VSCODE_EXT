@@ -785,6 +785,43 @@ check('C12 profile：正有一轮在跑 → profile 钮禁用 + 菜单收起（�
   $('live-profile-btn').click(); // 收起来，别把开着的菜单留给后面
 });
 
+// ---------- 配置条三个下拉钮的形状（2026-09-18：从药丸改成裸文字） ----------
+
+check('配置条三钮：触发钮文案带得出「这是哪一轴」，光一个值读不出来', () => {
+  liveConfig({ profile: null, profileModelPinned: false, model: 'deepseek-v4-flash' });
+  eq($('live-model-label').textContent, '模型 · deepseek-v4-flash', '模型钮没带前缀 —— 裸文字按钮没有药丸外壳分组，光一个模型名读不出它是什么');
+  eq($('live-effort-label').textContent, '推理 · 跟随配置', '档位钮的文案被改了');
+  eq($('live-profile-label').textContent, 'profile · 不用 profile', 'profile 钮的文案被改了');
+});
+
+check('配置条三钮：**与「配置 DSH」「API」同款**（都挂 .link-button），别再各自长回药丸', () => {
+  // 这条盯的是"同一个观感只有一处定义"：三个触发钮的外观必须全部来自 .link-button，
+  // 一旦有人把 border/background/height 加回 .lc-model，两边就会各自漂移 ——
+  // 而漂移的样子（三个钮比旁边两个状态钮重一截）正是这次要改掉的东西。
+  const html = readFileSync(htmlPath, 'utf8');
+  const classOf = (id) => {
+    for (const m of html.matchAll(/<[a-zA-Z][^>]*>/g)) {
+      if (!new RegExp(`\\bid="${id}"`).test(m[0])) continue;
+      const c = m[0].match(/\bclass="([^"]*)"/);
+      return c ? c[1].split(/\s+/) : [];
+    }
+    return undefined;
+  };
+  for (const id of ['live-model-btn', 'live-effort-btn', 'live-profile-btn']) {
+    const cls = classOf(id);
+    ok(cls, `chat.html 里找不到 #${id}`);
+    ok(cls.includes('link-button'), `#${id} 没挂 .link-button —— 它就长不成旁边 DSH/API 的样子`);
+    ok(cls.includes('lc-model'), `#${id} 丢了 .lc-model（.lc-model.open 的高亮就挂了）`);
+  }
+  // 反向：药丸那几件（边框/底色/固定高度）不该再回到 .lc-model 里
+  const css = readFileSync(join(repoRoot, 'media', 'chat.css'), 'utf8');
+  const block = /\.lc-model\s*\{([^}]*)\}/.exec(css);
+  ok(block, 'chat.css 里找不到 .lc-model 的规则块');
+  for (const dead of ['border:', 'background:', 'height:']) {
+    ok(!block[1].includes(dead), `.lc-model 里又出现了 \`${dead}\` —— 药丸正在长回来（外观该全部来自 .link-button）`);
+  }
+});
+
 console.log('');
 if (failures.length) {
   console.log(`✗ ${failures.length} 条未过（共 ${passed + failures.length} 条）：`);

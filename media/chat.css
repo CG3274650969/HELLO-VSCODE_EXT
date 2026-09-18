@@ -1035,29 +1035,28 @@ body.live-busy #send-btn {
   font-size: 12px;
 }
 
-/* 模型选择：自定义 DOM 触发钮 + 浮层菜单（弃用原生 <select>——其弹出列表是系统方形控件，
+/* 模型/档位/profile 的下拉触发钮 + 浮层菜单（弃用原生 <select>——其弹出列表是系统方形控件，
    无法圆角/随主题配色，这正是此前“方、白底白字”的根源）。全部样式走 DSH 令牌。 */
 .lc-model-wrap {
   position: relative; /* 菜单 absolute 的定位基准 */
 }
+/* ⚠️ 触发钮的**外观一个字都不在这里** —— HTML 上挂的是 `class="link-button lc-model"`，
+   边框/底色/hover/圆角/字号全从 .link-button 来，与旁边「配置 DSH」「API」逐字同款。
+   这里只留它独有的三件，**别再往回加 border/background/height**（那正是被去掉的药丸）：
+
+   · `flex: none` —— 工具行是 flex，不加会被压窄（标签已经在省略号兜底了）；
+   · `max-width` —— 模型名可能很长，得有个上限，长出去走 .lc-model-label 的省略号；
+   · `.open` 的高亮 —— .link-button 只在 :hover 亮，菜单开着时鼠标可能已经移开了。
+
+   （`padding` 也不覆盖：.link-button 的 `2px 10px` 让三块裸文字之间留出 20px 呼吸，
+   比原来药丸贴着药丸更清楚。） */
 .lc-model {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  max-width: 150px;
-  height: 26px;
-  padding: 0 6px 0 12px;
-  border: 1px solid var(--dsw-alias-border-l2, var(--vscode-input-border, transparent));
-  border-radius: 999px;
-  background: var(--dsw-alias-bg-layer-2, var(--vscode-input-background, rgba(128, 128, 128, 0.12)));
-  color: var(--dsw-alias-label-primary, var(--vscode-input-foreground));
-  font-family: inherit;
-  font-size: 12px;
-  cursor: pointer;
+  flex: none;
+  max-width: 200px;
 }
-.lc-model:hover:not(:disabled),
 .lc-model.open {
-  background: var(--dsw-alias-interactive-bg-hover, var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.18)));
+  background: var(--dsw-alias-interactive-bg-hover, var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.12)));
+  color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
 }
 .lc-model:disabled {
   opacity: 0.5;
