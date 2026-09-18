@@ -57,12 +57,10 @@
   var liveModelMenu = document.getElementById('live-model-menu'); // 浮层菜单
   var liveModelWrap = document.getElementById('live-model-wrap');
   var liveModelInput = document.getElementById('live-model-input');
-  var liveEffortBtn = document.getElementById('live-effort-btn'); // C11 推理档位触发钮
-  var liveEffortLabel = document.getElementById('live-effort-label');
+  var liveEffortBtn = document.getElementById('live-effort-btn'); // C11 推理档位触发钮（方块图标钮）
   var liveEffortMenu = document.getElementById('live-effort-menu'); // 浮层菜单
   var liveEffortWrap = document.getElementById('live-effort-wrap');
-  var liveProfileBtn = document.getElementById('live-profile-btn'); // C12 项目 profile 触发钮
-  var liveProfileLabel = document.getElementById('live-profile-label');
+  var liveProfileBtn = document.getElementById('live-profile-btn'); // C12 项目 profile 触发钮（方块图标钮）
   var liveProfileMenu = document.getElementById('live-profile-menu'); // 浮层菜单
   var liveProfileWrap = document.getElementById('live-profile-wrap');
   var liveApiBtn = document.getElementById('live-api-btn');
@@ -831,23 +829,25 @@
 
   /** 触发钮上的档位文案：钮上只有图标 + 值，所以这里给**短形**（跟随 / off / low…）。
    *  菜单里仍用 effortText()——那边有地方，也要把 off 说清是"关闭思考"。 */
-  function effortTriggerText(v) {
-    return v === null ? '跟随' : v;
-  }
-
   /** 该档位现在能不能选：底本 thinking: disabled 时只有 off（与「跟随」）合法 —— 其余三档
    *  会让 provider 在请求期抛 UNSUPPORTED_REASONING_EFFORT，所以置灰并说明原因。 */
   function effortBlocked(v) {
     return liveEffortThinkingOff && v !== null && v !== 'off';
   }
 
-  /** 重建菜单内容并刷新触发钮文案（体例同 renderModelMenu，全量重画）。 */
+  /** 重建菜单内容并刷新触发钮（体例同 renderModelMenu，全量重画）。
+   *  钮是**方块图标钮**（.tool-icon），里面没有位置放值 —— 轴与当前值只能走
+   *  title / aria-label（看不见但读得到），以及非默认时的那个 `.on` 角点。 */
   function renderEffortMenu() {
-    if (!liveEffortLabel || !liveEffortMenu) return;
-    liveEffortLabel.textContent = effortTriggerText(liveEffort);
-    liveEffortBtn.title = liveEffortThinkingOff
-      ? '会话级推理档位：底本 llm-deepseek 是 thinking: disabled，只有 off 可用'
-      : '会话级推理档位（reasoningEffort）：默认跟随 cordis.yml；改档位下一步就生效';
+    if (!liveEffortBtn || !liveEffortMenu) return;
+    var now = liveEffort === null ? '跟随 cordis.yml' : effortText(liveEffort);
+    liveEffortBtn.title = '推理档位：' + now + '。' + (liveEffortThinkingOff
+      ? '底本 llm-deepseek 是 thinking: disabled，只有 off 可用'
+      : '会话级（reasoningEffort），改档位下一步就生效');
+    // 方块钮里只有一支 <svg aria-hidden>，没有文字 ⇒ aria-label 是它**唯一**的可访问名。
+    // 值也带上：不动鼠标的人（屏读）本来就拿不到 title。
+    liveEffortBtn.setAttribute('aria-label', '推理档位：' + now);
+    liveEffortBtn.classList.toggle('on', liveEffort !== null); // 非「跟随」才点角上的状态点
     // 档位是会话级的，但它不重启子进程 —— 与模型的提示区别就在这里
     liveEffortMenu.textContent = '';
     var items = [null].concat(liveEfforts);
@@ -919,11 +919,6 @@
     return v === null ? '不用 profile' : v;
   }
 
-  /** 触发钮上的 profile 文案 = profileText 的短形（钮上还有个人形图标在说"这是哪一轴"）。 */
-  function profileTriggerText(v) {
-    return v === null ? '不用' : v;
-  }
-
   /** 菜单顶部那一行"刚改过文件"的提示（只在真的改过时出现）。 */
   function appendProfileStaleRow() {
     if (!liveProfileStale) return;
@@ -943,11 +938,15 @@
 
   /** 重建菜单内容并刷新触发钮文案（体例同 renderEffortMenu，全量重画）。 */
   function renderProfileMenu() {
-    if (!liveProfileLabel || !liveProfileMenu) return;
-    liveProfileLabel.textContent = profileTriggerText(liveProfile);
-    liveProfileBtn.title = liveProfileModelPinned
-      ? '项目级 agent profile：当前 profile 钉住了模型与审批策略，切换会重启 live 子进程'
-      : '项目级 agent profile（.hello-chat/profile.json）：一键切换模型 / 审批策略 / 工具白名单。切换会重启 live 子进程';
+    if (!liveProfileBtn || !liveProfileMenu) return;
+    // 同推理钮：方块图标钮里放不下值，轴与当前 profile 名走 title / aria-label，
+    // 非「不用」时角上点状态点。
+    var now = liveProfile === null ? '不用 profile' : liveProfile;
+    liveProfileBtn.title = '项目 profile：' + now + '。' + (liveProfileModelPinned
+      ? '当前 profile 钉住了模型与审批策略，切换会重启 live 子进程'
+      : '一键切换模型 / 审批策略 / 工具白名单，切换会重启 live 子进程');
+    liveProfileBtn.setAttribute('aria-label', '项目 profile：' + now);
+    liveProfileBtn.classList.toggle('on', liveProfile !== null);
     liveProfileMenu.textContent = '';
     if (!liveProfileAvailable) {
       var noWs = document.createElement('div');

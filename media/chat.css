@@ -1054,7 +1054,8 @@ body.live-busy #send-btn {
   flex: none;
   max-width: 200px;
 }
-.lc-model.open {
+.lc-model.open,
+.lc-knob.open {
   background: var(--dsw-alias-interactive-bg-hover, var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.12)));
   color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
 }
@@ -1080,14 +1081,28 @@ body.live-busy #send-btn {
 .lc-model.open .lc-chev {
   transform: rotate(180deg);
 }
-/* 轴图标（推理档位 / profile）：钮上文案只剩"值"，轴靠这个图标 + title 带出。
-   尺寸/路径全在 HTML 的 <svg> 上（15px，同附件钮），这里只管两件事：
-   竖对齐，以及**别写颜色** —— stroke=currentColor 是它跟主题走的唯一根据，
-   在这儿写死一个色会让它在深/浅主题下各错一半。 */
-.lc-glyph {
-  display: inline-flex;
-  flex: none;
-  align-items: center;
+/* C11/C12 的推理 / profile 钮：**方块图标钮**。外观一个字都不在这里 —— HTML 上挂的是
+   `class="tool-icon lc-knob"`，26×26 / 圆角 / hover / disabled 全从 .tool-icon 来，
+   与左侧附件钮逐字同款（同一份定义，两处不会各自漂移）。
+   这里只留它独有的两件：
+   · `position: relative` —— 角上状态点的定位基准；
+   · `.on::after` —— 非默认态（档位不是「跟随」/ 选了某个 profile）在右上角点一个小点。
+
+   ⚠️ 那个点**必须绝对定位**：这次收窄的全部所得就在宽度上，一个进流的点会吃掉 13px，
+   等于把它换来的宽度又还回去。默认态不点 —— 干净的灰方块本身就是"这个轴没被动过"的读数。
+   ⚠️ 也别在 `.tool-icon` 上写颜色：stroke=currentColor 是图标跟主题走的唯一根据。 */
+.lc-knob {
+  position: relative;
+}
+.lc-knob.on::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--dsw-alias-state-business-primary, var(--vscode-focusBorder, #3794ff));
 }
 /* C12：profile 钉住模型时，箭头槽位换小锁（.lc-model.pinned 由 chat.js 切）。
    默认 display:none ⇒ 没钉住时它一个像素都不占，三个钮的排布与加锁前完全一致。 */
