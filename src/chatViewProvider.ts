@@ -80,6 +80,19 @@ import { readCompactionEvent } from './compactionNotice';
 // 本文件里 `_toolKey` 与 `tool/result` 的三态判定（ok / error / **unknown**）都改成调用它们，
 // 免得检查器与转写对同一件事各说一套。
 import { RunInspector, toolKeyFrom, toolResultVerdict, type RunReadout } from './runInspector';
+// C12：项目级 agent profile（纯模块，零 vscode 依赖，scripts/probe-agent-profile.mjs 直接加载编译产物自检）。
+// 「只能加严」那条性质由 `compileProfile` 一个纯函数守着 —— 本文件里没有第二处决定松紧的地方。
+import {
+  compileProfile,
+  parseProfileFile,
+  profileSummary,
+  readProfileFile,
+  type ApprovalSettings,
+  type EffectiveProfile,
+  type ProfileFile,
+  type ProfileSpec,
+} from './agentProfile';
+import { writeToolPolicyPluginFiles, type ToolPolicyMount } from './toolPolicyPlugin';
 
 /** 附件内容上限：超过这个字节数的文件不读；超过这个字符数的内容截断。 */
 const MAX_FILE_BYTES = 10 * 1024; // 单文件最多 10KB
@@ -87,6 +100,15 @@ const MAX_CONTENT_CHARS = 200 * 1024;
 
 /** globalState 里记住上次用的模式 */
 const MODE_KEY = 'hello.chat.mode';
+
+/**
+ * C12：workspaceState 里记住**本项目**激活的 profile（名字 + 激活时的副本 + 当时的文件原文）。
+ * 存副本而不是只存名字，是因为运行期必须读"激活时的那一份"（见 `_profileActive` 的注释）。
+ */
+const PROFILE_KEY = 'hello.chat.activeProfile';
+
+/** C12：profile 文件相对工作区根的路径 */
+const PROFILE_REL = '.hello-chat/profile.json';
 
 /** harness 模式独立的历史文件名（chat 沿用 sessions.json，互不串） */
 const HARNESS_FILE = 'sessions-harness.json';
@@ -442,6 +464,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    */
   private _thinkingDisabled?: boolean;
 
+  // ---------- C12 项目级 agent profile 状态 ----------
+
+  /**
+   * 本项目**已激活**的 profile 快照（`workspaceState`）。存的是**校验过的原始 spec**，
+   * 不是编译结果 —— 编译要跟当下的设置取并集，现算才新鲜。
+   *
+   * ⚠️ 这条"存副本"是本功能的一道**真防线**：`.hello-chat/profile.json` 在工作区里，
+   * agent 的 write 工具技术上能改它（工作区内的写按 C1 的设计不弹条）。运行期读副本
+   * ⇒ **改文件不生效**，必须用户手动重新激活。配合「字段里没有任何放松方向」，
+   * 会改写这个文件的 agent 能做的只有勒紧自己。
+   */
+  private _profileActive?: ProfileSpec;
+  /** 已激活 profile 的名字（`undefined` = 不用 profile） */
+  private _profileName?: string;
+  /** profile.json 上次被读进来时的内容 —— 用来判"文件改了但还没重新应用" */
+  private _profileText?: string;
+  /** 文件系统监听器：profile.json 一变就置 `_profileStale`（事件驱动，不轮询） */
+  private _profileWatcher?: vscode.FileSystemWatcher;
+  /** 磁盘上的 profile.json 与已激活的那份**不一致**（配置条据此提示"点一下重新应用"） */
+  private _profileStale = false;
+  /** C12：profile 相关告警是否已弹过。**独立旗标**，理由同 `_storageWarned` */
+  private _profileWarned = false;
+
   // ---------- C3a 用量读数（每轮/每会话 token + 上下文占用率）状态 ----------
 
   /** 本轮累计；一轮跑着才有值。轮尾折进 `_active.usage` 后置空（单点折叠 → 不可能双计） */
@@ -469,6 +514,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly _extensionUri: vscode.Uri,
     storageDir: string,
     private readonly _globalState: vscode.Memento,
+    /** C12：**每工作区**的存储 —— 只放"本项目激活了哪个 profile"。
+     *  用它而不是 globalState，是因为 profile 是项目属性：换个项目就该回到该项目自己的选择。
+     *  它是扩展内部存储，不是用户的文件 —— 决定 2「绝不写你的任何文件」不受影响。 */
+    private readonly _workspaceState: vscode.Memento,
     private readonly _secrets: vscode.SecretStorage
   ) {
     this._storageDir = storageDir;
@@ -487,6 +536,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       chat: this._stores.chat.create(),
       harness: this._stores.harness.create(),
     };
+
+    // C12：恢复本项目上次激活的 profile，并读一次 profile.json 让配置条开面板就有东西显示。
+    // 顺序有讲究：先 `_loadProfile()` 再 `_refreshProfileSpecs()` —— 后者要拿"激活时记下的原文"
+    // 去比对磁盘，反了的话 `_profileStale` 会在启动瞬间误报一次。
+    this._loadProfile();
+    this._refreshProfileSpecs();
+    this._ensureProfileWatcher();
 
     // C1：审批开关翻转 → 重建审批服务/派生配置，并重连让子进程带上（策略正则是每次现读，改策略即时生效）。
     // **只认 enabled**：hook 的 matcher 是生成期定的，非得重连才生效；而 patterns /
@@ -641,6 +697,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'set-effort':
         // C11：null/垃圾值一律当「跟随配置」（normalizeEffort 负责，绝不猜）
         this._setLiveEffort(normalizeEffort(msg.effort));
+        break;
+      case 'set-profile':
+        // C12：null = 不用 profile；非字符串一律当 null（同名一律不猜）
+        this._setProfile(typeof msg.profile === 'string' && msg.profile.trim() ? msg.profile.trim() : null);
         break;
       case 'configure-key':
         void this._promptAndStoreApiKey();
@@ -1297,6 +1357,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _setLiveModel(model: string): void {
     if (this._abort) {
       vscode.window.showInformationMessage('当前有回复在生成中，先停止或等它结束，再切换模型。');
+      return;
+    }
+    // C12：profile 钉住模型时**明确拒绝并说清出路**。绝不能默默收下再被 profile 盖掉 ——
+    // "选了没生效"是这个仓库最恨的失效形状（同 C11 档位菜单置灰那条的理由）。
+    const pinned = this._effectiveProfile();
+    if (pinned.model) {
+      vscode.window.showInformationMessage(
+        `模型由当前 profile「${pinned.name}」固定为 ${pinned.model}。想换模型，先把 profile 切成「不用 profile」。`
+      );
       return;
     }
     if (model === this._dshModel()) return;
@@ -2030,21 +2099,179 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  // ---------- C12 项目级 agent profile ----------
+
+  /**
+   * profile 文件的绝对路径：**工作区根**的 `.hello-chat/profile.json`。
+   * 没有工作区就没有项目 —— 返回空串（菜单跟着置灰，不是报错）。
+   * 根取 `workspaceFolders[0]`，与 `_dshCwd()` / `_reviewRoot()` / 选区临时文件同一个惯例。
+   */
+  private _profilePath(): string {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    return root ? path.join(root, PROFILE_REL) : '';
+  }
+
+  /** 设置里的审批三件套（**不带 profile** —— profile 那一层在 `compileProfile` 里叠上去） */
+  private _profileSettings(): ApprovalSettings {
+    return {
+      enabled: this._approvalSettingEnabled(),
+      outsideWorkspace: this._approvalSettingOutside(),
+      patterns: this._approvalSettingPatterns(),
+    };
+  }
+
+  /**
+   * 当下真正生效的策略。**每次现算**，不缓存 —— 编译要跟**当下**的设置取并集/或，
+   * 所以用户改设置（patterns 是每次现读的）能立刻反映进来，profile 不用重新激活。
+   *
+   * 没有选 profile 时返回的就是设置本身（`compileProfile(undefined, …)`），
+   * 于是「装了 C12 但没选 profile」与「没有 C12」在行为上逐字节相同。
+   */
+  private _effectiveProfile(): EffectiveProfile {
+    return compileProfile(this._profileActive, this._profileSettings(), this._profileName ?? null);
+  }
+
+  /** 缓存的 profile 文件内容（菜单用）。由 `_refreshProfileSpecs()` 在启动/激活/文件变动时刷新。 */
+  private _profileSpecs: ProfileFile = { names: [], profiles: {}, errors: [] };
+
+  /**
+   * 重读 profile.json，刷新缓存与 `_profileStale`。
+   * **不抛**：读不到就是"没有 profile"（文件不存在是最正常的状态 —— 这个功能整个是可选的）。
+   */
+  private _refreshProfileSpecs(): void {
+    const filePath = this._profilePath();
+    if (!filePath) {
+      this._profileSpecs = { names: [], profiles: {}, errors: [] };
+      this._profileStale = false;
+      return;
+    }
+    const { text, missing } = readProfileFile(filePath);
+    this._profileDiskText = text;
+    this._profileSpecs = missing
+      ? { names: [], profiles: {}, errors: [] }
+      : parseProfileFile(text);
+    // 磁盘上的内容与激活时记下的那份不一致 ⇒ 提示"点一下重新应用"。
+    // 没激活过 profile 时不提示 —— 那时文件改不改都不影响行为，提示只会是噪音。
+    this._profileStale = this._profileName !== undefined && !missing && text !== this._profileText;
+  }
+
+  /** `_refreshProfileSpecs()` 刚读到的原文 —— 激活时把它当作这份 profile 的"原件"记下来 */
+  private _profileDiskText?: string;
+
+  /** 惰性建文件监听（事件驱动，不轮询）。已经建过就不重复建。 */
+  private _ensureProfileWatcher(): void {
+    if (this._profileWatcher) return;
+    const root = vscode.workspace.workspaceFolders?.[0];
+    if (!root) return;
+    try {
+      const watcher = vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(root, PROFILE_REL)
+      );
+      const onAny = (): void => {
+        this._refreshProfileSpecs();
+        this._postLiveConfig(); // 配置条据此点亮/熄灭"重新应用"
+      };
+      watcher.onDidCreate(onAny);
+      watcher.onDidChange(onAny);
+      watcher.onDidDelete(onAny);
+      this._profileWatcher = watcher;
+      this._globalDisposables.push(watcher);
+    } catch {
+      /* 建不起来就退化成"不提示文件已改" —— 功能本身不依赖它 */
+    }
+  }
+
+  /** 记住本项目的选择。`name === undefined` = 不用 profile（**只有传 null 的那个入口才会走到**）。 */
+  private _persistProfile(): void {
+    void this._workspaceState.update(
+      PROFILE_KEY,
+      this._profileName === undefined
+        ? undefined
+        : { name: this._profileName, spec: this._profileActive, text: this._profileText }
+    );
+  }
+
+  /** activation 时从 workspaceState 恢复本项目上次的选择（**不重读文件** —— 用的是那次激活的副本） */
+  private _loadProfile(): void {
+    const saved = this._workspaceState.get<{ name?: string; spec?: ProfileSpec; text?: string }>(PROFILE_KEY);
+    if (!saved || typeof saved.name !== 'string' || !saved.spec) return;
+    this._profileName = saved.name;
+    this._profileActive = saved.spec;
+    this._profileText = typeof saved.text === 'string' ? saved.text : undefined;
+  }
+
+  /** 切换 profile 时把"少走了一步"说出来。**只弹一次**（每次 activation）—— 旗标必须独立，同 `_storageWarned` */
+  private _profileWarn(text: string): void {
+    console.warn('[profile]', text);
+    if (this._profileWarned) return;
+    this._profileWarned = true;
+    void vscode.window.showWarningMessage(`profile：${text}`);
+  }
+
+  /**
+   * 切到某个 profile（`null` = 不用 profile）。**配置条那三个菜单里唯一必须重连的一个** ——
+   * 模型是 `initialize` 的参数，工具白名单块要重新生成，审批 `enabled` 翻的是 hook matcher。
+   */
+  private _setProfile(name: string | null): void {
+    // 决定 3：正跑着一轮时**拒绝并提示**，什么都不做（同 `_setLiveEffort` / `_setLiveModel` 的口吻）
+    if (this._abort) {
+      vscode.window.showInformationMessage('当前有回复在生成中，先停止或等它结束，再切换 profile。');
+      return;
+    }
+    this._refreshProfileSpecs(); // 先读盘：用户很可能刚在编辑器里改完
+    if (name !== null) {
+      const spec = this._profileSpecs.profiles[name];
+      if (!spec) {
+        vscode.window.showWarningMessage(`profile「${name}」不在 ${PROFILE_REL} 里了（文件被改过？）。`);
+        return;
+      }
+      this._profileName = name;
+      this._profileActive = spec;
+      this._profileText = this._profileDiskText;
+    } else {
+      this._profileName = undefined;
+      this._profileActive = undefined;
+      this._profileText = undefined;
+    }
+    this._profileStale = false;
+    this._persistProfile();
+    if (this._profileSpecs.errors.length > 0) {
+      // 有毛病就说出来，绝不静默 —— 用户明明白白写在文件里的东西没生效，比报错更坏
+      this._profileWarn(this._profileSpecs.errors.join('；'));
+    }
+    this._overlayConfigPath = undefined; // 先作废旧指向，防重连失败时还留着上一份派生文件（同 C10）
+    this._postLiveConfig();
+    this._restartLiveProcess();
+  }
+
   // ---------- C1 事前审批：本机审批服务 + DSH hook 三件套 ----------
 
-  /** 审批开关（hello.chat.approval.enabled，**默认开** —— 破坏性命令执行前来一道确认） */
-  private _approvalEnabled(): boolean {
+  /** 设置里的审批开关原文（**不带 profile** —— C12 那一层在 `_effectiveProfile()` 里叠） */
+  private _approvalSettingEnabled(): boolean {
     return (
       vscode.workspace.getConfiguration('hello.chat').get<boolean>('approval.enabled', true) === true
     );
   }
 
-  /** 当前策略正则（每次现读 → 改设置即时生效，不必重连） */
-  private _approvalPatterns(): string[] {
+  /** 设置里的策略正则原文（不带 profile） */
+  private _approvalSettingPatterns(): string[] {
     const raw = vscode.workspace
       .getConfiguration('hello.chat')
       .get<string[]>('approval.patterns', DEFAULT_APPROVAL_PATTERNS);
     return Array.isArray(raw) ? raw : DEFAULT_APPROVAL_PATTERNS;
+  }
+
+  /** 审批开关（设置 **或** profile 要求 —— 与 profile 取或，所以 profile 只能把它打开、打不开也就关不上） */
+  private _approvalEnabled(): boolean {
+    return this._effectiveProfile().approval.enabled;
+  }
+
+  /**
+   * 当前策略正则（每次现读 → 改设置即时生效，不必重连）。
+   * C12：profile 那几条是**并集**进来的 —— 只会变多，删不掉默认那十条。
+   */
+  private _approvalPatterns(): string[] {
+    return this._effectiveProfile().approval.patterns;
   }
 
   /** 用户等待上限（毫秒，已按可用区间收敛） */
@@ -2062,6 +2289,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** 越界是否弹确认条（hello.chat.approval.outsideWorkspace，默认开）。
    *  **只 gate「问」**：hook 挂着的时候，区外目标照旧进本轮审阅 —— 关掉它等于「不问只记」。 */
   private _approvalOutsideEnabled(): boolean {
+    return this._effectiveProfile().approval.outsideWorkspace;
+  }
+
+  /** 设置里的区外写开关原文（不带 profile） */
+  private _approvalSettingOutside(): boolean {
     return (
       vscode.workspace
         .getConfiguration('hello.chat')
@@ -2264,8 +2496,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const hooksPath = this._approvalFiles?.hooksPath ?? '';
     const compaction = this._compactionOverride();
     const wantEffort = this._effortNeeded();
-    if (!hooksPath && !compaction && !wantEffort) {
-      // 三样都不需要 → 不派生。留着旧的派生文件只会是一份会过期的副本。
+    // C12：工具白名单只在本项目激活的 profile 真的禁了工具时才需要挂块
+    const toolDeny = this._effectiveProfile().toolDeny;
+    if (!hooksPath && !compaction && !wantEffort && toolDeny.length === 0) {
+      // 四样都不需要 → 不派生。留着旧的派生文件只会是一份会过期的副本。
       this._overlayConfigPath = undefined;
       this._effortMounted = false;
       return;
@@ -2293,11 +2527,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._effortWarn(err instanceof Error ? err.message : String(err));
       }
     }
+    // C12：工具策略块。`deny` 已经过 `KNOWN_TOOL_NAMES` 过滤（编译期），所以这里写下去的名字
+    // 必然是可 restrict 的 —— 运行期那道 try/catch 只是最后兜底，不是主防线。
+    let toolPolicy: ToolPolicyMount | undefined;
+    if (toolDeny.length > 0) {
+      try {
+        const files = writeToolPolicyPluginFiles({ storageDir: this._storageDir });
+        toolPolicy = { pluginUrl: files.pluginUrl, deny: toolDeny };
+      } catch (err) {
+        this._profileWarn(err instanceof Error ? err.message : String(err));
+      }
+    }
     try {
-      const r = writeDerivedConfig({ storageDir: this._storageDir, baseConfigPath, hooksPath, compaction, effort });
+      const r = writeDerivedConfig({
+        storageDir: this._storageDir,
+        baseConfigPath,
+        hooksPath,
+        compaction,
+        effort,
+        toolPolicy,
+      });
       // 比例没落上（底本里没有那个插件块等）时仍然要用这份文件 —— hooks 块在里面
       if (r.warning) this._compactionWarn(r.warning);
       if (r.effortWarning) this._effortWarn(r.effortWarning);
+      if (r.toolPolicyWarning) this._profileWarn(r.toolPolicyWarning);
       this._overlayConfigPath = r.cordisPath;
       this._effortMounted = r.effortMounted;
     } catch (err) {
@@ -2765,6 +3018,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private _dshModel(): string {
+    // C12：profile 钉住的模型最优先 —— 它是**项目声明**，比"上次在这台机器上点过哪个"更该赢。
+    // 不静默覆盖：`_setLiveModel` 会明确告诉用户"模型由 profile 固定"，配置条那边也把菜单置灰。
+    const pinned = this._effectiveProfile().model;
+    if (pinned) return pinned;
     // 配置条里选过的模型优先（globalState），否则回退 hello.dsh.model → 内置默认
     const saved = this._globalState.get<string>(LIVE_MODEL_KEY);
     if (saved && saved.trim()) return saved.trim();
@@ -2930,6 +3187,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       efforts: [...EFFORT_VALUES],
       // 底本 thinking: disabled 时三档会抛，界面据此置灰并写明原因
       effortThinkingDisabled: this._thinkingDisabledFlag(),
+      // C12：本项目激活的 profile（名字 + 可选项 + 是否钉住模型 + 文件是否已改动 + 校验错误）。
+      // `profile` 用 null 而不是省略 —— 同 effort：webview 要能区分「不用 profile」与「还没收到」。
+      profile: this._profileName ?? null,
+      profiles: this._profileSpecs.names.map((n) => ({
+        name: n,
+        summary: profileSummary(this._profileSpecs.profiles[n]),
+      })),
+      profileModelPinned: this._effectiveProfile().model !== undefined,
+      profileStale: this._profileStale,
+      profileErrors: this._profileSpecs.errors.length,
+      profileAvailable: this._profilePath() !== '',
     });
   }
 

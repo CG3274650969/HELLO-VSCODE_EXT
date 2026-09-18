@@ -1129,6 +1129,20 @@ body.live-busy #send-btn {
   color: var(--dsw-alias-state-business-primary, var(--vscode-focusBorder, #3794ff));
   font-weight: 700;
 }
+/* C12：profile 菜单里那行摘要 —— 让人**不点开就知道**这个 profile 要干什么。
+   独占第二行（靠父级 flex-wrap + 自身 flex-basis:100%），沿用 secondary 文本色、压得比名字小。 */
+.lc-model-item.has-sub {
+  flex-wrap: wrap;
+  white-space: normal;
+  align-items: flex-start;
+}
+.lc-mi-sub {
+  flex-basis: 100%;
+  margin-top: 1px;
+  font-size: 11px;
+  line-height: 15px;
+  color: var(--dsw-alias-label-secondary, var(--vscode-dropdown-foreground, #999));
+}
 .lc-model-sep {
   height: 1px;
   margin: 3px 4px;

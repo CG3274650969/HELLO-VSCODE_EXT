@@ -645,6 +645,146 @@ check('C11 档位：底本 thinking: disabled → 三档置灰且点了不发，
   ok(/thinking: disabled/.test($('live-effort-btn').title), '触发钮 title 没说清当前配置的限制');
 });
 
+// ---------- C12 项目 profile 菜单（同款影子） ----------
+
+/** 菜单项按文案找（渲染函数把名字写在 `.lc-mi-name` 上，摘要另起一行 `.lc-mi-sub`） */
+const profileRow = (label) => $('live-profile-menu').children.find((r) => hasText(r, label));
+
+/** 一份完整的 live-config 载荷；C12 的六个字段都可按需覆盖 */
+const liveConfig = (over) =>
+  send(
+    Object.assign(
+      {
+        type: 'live-config',
+        model: 'deepseek-v4-flash',
+        models: ['deepseek-v4-flash'],
+        apiConfigured: true,
+        dshConfigured: true,
+        effort: null,
+        efforts: ['off', 'low', 'high', 'max'],
+        effortThinkingDisabled: false,
+        profiles: [
+          { name: '严格', summary: '模型 deepseek-reasoner · 禁 bash' },
+          { name: '省钱', summary: '模型 deepseek-chat' },
+        ],
+        profile: null,
+        profileModelPinned: false,
+        profileStale: false,
+        profileErrors: 0,
+        profileAvailable: true,
+      },
+      over
+    )
+  );
+
+check('C12 profile：payload 字段与渲染函数对得上（默认「不用 profile」），首项就是退路', () => {
+  send({ type: 'mode-set', mode: 'harness' });
+  posted.length = 0;
+  liveConfig({});
+  eq($('live-profile-label').textContent, 'profile · 不用 profile', '未选 profile 时的文案不对');
+  ok(!$('live-config-bar').hidden, '配置条没显示');
+  ok(profileRow('不用 profile'), '菜单首项不是「不用 profile」');
+  ok(profileRow('严格'), '菜单里没有「严格」');
+  ok(profileRow('省钱'), '菜单里没有「省钱」');
+  // 名字顺序 == 扩展下发的顺序（文件里的声明顺序）
+  const names = $('live-profile-menu')
+    .children.map((r) => (r.children[0] ? r.children[0].textContent : ''))
+    .filter((t) => t);
+  eq(names.slice(0, 3).join(','), '不用 profile,严格,省钱', `菜单顺序不对：${names.join(',')}`);
+  // 摘要要**不点开就知道**这个 profile 要干什么
+  ok(hasText($('live-profile-menu'), '禁 bash'), 'profile 摘要行没渲染出来');
+});
+
+check('C12 profile：选中一项 → 触发钮跟着走、当前项打勾、其余不打', () => {
+  liveConfig({ profile: '严格' });
+  eq($('live-profile-label').textContent, 'profile · 严格', '触发钮没跟着 profile 走');
+  const checkOf = (label) => profileRow(label).children.find((c) => c.className === 'lc-mi-check');
+  eq(checkOf('严格').hidden, false, '当前 profile 没打勾');
+  eq(checkOf('省钱').hidden, true, '非当前 profile 也打勾了');
+  eq(checkOf('不用 profile').hidden, true, '「不用 profile」不该打勾');
+});
+
+check('C12 profile：点一项 → **恰好一条** set-profile；点「不用 profile」发 null', () => {
+  posted.length = 0;
+  profileRow('省钱').click();
+  eq(posted.length, 1, '点一下菜单项该只发一条消息');
+  eq(posted[0].type, 'set-profile', `发的不是 set-profile：${posted[0].type}`);
+  eq(posted[0].profile, '省钱', 'profile 名没带上');
+  posted.length = 0;
+  profileRow('不用 profile').click();
+  eq(posted.length, 1, '「不用 profile」该发一条');
+  eq(posted[0].profile, null, '「不用 profile」该发 null（扩展据此清掉激活项）');
+});
+
+check('C12 profile：钉住模型 → 模型菜单整片置灰、**连监听器都不挂**、且不给自定义入口', () => {
+  posted.length = 0;
+  liveConfig({ profile: '严格', profileModelPinned: true, model: 'deepseek-reasoner' });
+  eq($('live-model-label').textContent, '模型 · 由 profile 固定', '模型钮没说清是被 profile 固定的');
+  const modelRows = $('live-model-menu').children.filter((r) => r.children[0] && /^deepseek-/.test(r.children[0].textContent));
+  ok(modelRows.length > 0, '模型菜单里一行都没有（置灰也就无从谈起）');
+  for (const r of modelRows) {
+    ok(r.classList.contains('lc-item-disabled'), `${r.children[0].textContent} 没置灰`);
+    r.click();
+  }
+  eq(posted.length, 0, '置灰的模型行竟然点出了消息 —— 灰了还能点是最坏的一种');
+  ok(!hasText($('live-model-menu'), '自定义模型'), '钉住时仍提供了「自定义模型…」入口（它同样不会生效）');
+  ok(hasText($('live-model-menu'), '由 profile「严格」固定'), '菜单里没写明是谁钉的');
+  // 触发钮的 title 必须说两件事：**它被固定了**，以及**往哪退**
+  const pinTitle = $('live-model-btn').title;
+  ok(/固定/.test(pinTitle) && /严格/.test(pinTitle), `模型钮 title 没说清是被谁固定的：${pinTitle}`);
+  ok(/不用 profile/.test(pinTitle), `模型钮 title 没给出退路（用户只会以为按钮坏了）：${pinTitle}`);
+});
+
+check('C12 profile：没钉模型时模型菜单照旧能点（上面那条不是"永远置灰"）', () => {
+  posted.length = 0;
+  liveConfig({ profile: '省钱', profileModelPinned: false, model: 'deepseek-v4-flash' });
+  const row = $('live-model-menu').children.find((r) => hasText(r, 'deepseek-v4-flash'));
+  ok(row && !row.classList.contains('lc-item-disabled'), '没钉住却把模型行置灰了');
+  ok(hasText($('live-model-menu'), '自定义模型'), '没钉住时「自定义模型…」入口不见了');
+});
+
+check('C12 profile：`profile.json 已改动` 那一行发得出去（点的就是当前项，故意不比 v !== liveProfile）', () => {
+  posted.length = 0;
+  liveConfig({ profile: '严格', profileStale: true });
+  ok(hasText($('live-profile-menu'), 'profile.json 已改动'), '改过文件却没有那一行提示');
+  const stale = $('live-profile-menu').children.find((r) => hasText(r, 'profile.json 已改动'));
+  stale.click();
+  eq(posted.length, 1, '「重新应用」那一行点了没发消息（那就是个死按钮）');
+  eq(posted[0].profile, '严格', '重新应用该发当前项');
+  // 没改过时那一行不该在
+  liveConfig({ profile: '严格', profileStale: false });
+  ok(!hasText($('live-profile-menu'), 'profile.json 已改动'), '没改过也显示"已改动"');
+});
+
+check('C12 profile：文件有问题 → 菜单里露出条数；没工作区 → 明说读不了且整个钮禁用', () => {
+  liveConfig({ profileErrors: 3 });
+  ok(hasText($('live-profile-menu'), '3 处问题'), '解析错误没在菜单里说出来');
+  liveConfig({ profileAvailable: false });
+  ok(hasText($('live-profile-menu'), '没有打开工作区'), '没有工作区时没说清为什么读不了');
+  eq($('live-profile-btn').disabled, true, '没有工作区时按钮该禁用（点了也没有 profile 可谈）');
+  liveConfig({ profileAvailable: true });
+  eq($('live-profile-btn').disabled, false, '有工作区了按钮还禁用着');
+});
+
+check('C12 profile：正有一轮在跑 → profile 钮禁用 + 菜单收起（点不到，这是第一道；扩展侧还会拒绝一次）', () => {
+  // ⚠️ 这里**不去点菜单行**：影子没有排版，`.click()` 无视 CSS 的 `display:none`，
+  //    点在真界面里根本够不着的行上，只会得到一个不存在的 bug。真正该钉的是
+  //    「忙碌时这个菜单打不开」—— 关着的菜单 display:none，用户碰不到那些行。
+  liveConfig({ profile: '严格' });
+  $('live-profile-btn').click();
+  ok($('live-profile-menu').classList.contains('open'), '前提不成立：菜单没打开（这条就是在测"开着的时候来了一轮"）');
+  send({ type: 'run-busy', busy: true });
+  eq($('live-profile-btn').disabled, true, '忙碌时 profile 钮该禁用');
+  eq($('live-profile-menu').classList.contains('open'), false, '忙碌时菜单没收起 —— 那些行就还够得着');
+  $('live-profile-btn').click(); // 禁用态的钮点了不该再打开
+  eq($('live-profile-menu').classList.contains('open'), false, '忙碌时点开了 profile 菜单');
+  send({ type: 'run-busy', busy: false });
+  eq($('live-profile-btn').disabled, false, '跑完了按钮没解禁');
+  $('live-profile-btn').click();
+  eq($('live-profile-menu').classList.contains('open'), true, '跑完了菜单打不开');
+  $('live-profile-btn').click(); // 收起来，别把开着的菜单留给后面
+});
+
 console.log('');
 if (failures.length) {
   console.log(`✗ ${failures.length} 条未过（共 ${passed + failures.length} 条）：`);

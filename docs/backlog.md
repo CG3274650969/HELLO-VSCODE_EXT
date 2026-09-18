@@ -22,7 +22,7 @@
 | C9 | Run inspector（本轮帧时间线/耗时/工具统计） | P1 | 无（现有帧已够）。**已实现、自检 31/31 + DOM 影子自检、四项探针无回归、F5 通过（2026-09-17 用户真机）** —— 耗时全靠信封自带 `time` 相减（零计时器），体积故事 = 丢弃 819/823 条 chunk；F5 先后推翻三条预设（「配对失败恒 0」「按 `isError` 判成败」，以及**「DSH 一步一次工具」**—— 实测一步可带 2–3 次并行调用），见正文 | [x] |
 | C10 | 上下文窗口指示 + 超限压缩/归档 | P1 | 数据前置已解（C3a 已透出窗口/占用）。**已实现；F5 的 ①②⑤ 过了（真压缩 6 次：5 成功 1 失败；wire note 与落盘 note 逐字相同）；③ 的两半分头都过了但组合未验、④ 百分比那半过了（⚠ 那半与续聊回落未验）** —— 三个前提被推翻：压缩 DSH 早已自己做（`compaction-basic`，已 compose）、那三个事件早就在流里而我们从没读、**「归档旧轮」按字面做不到**（无 wire RPC + 日志 append-only）。另，`DSH_CORDIS_CONFIG` env 赢过位置参数这条命脉（C1 与 C10 共用）**首次被反控证住**。⚠️ **F5 之后揪出一个真 bug（C10b）**：`request/context` 只在路由**变化**时才发，续聊时一条都不发 ⇒ 分母恒缺、整条占用指示安静地不存在（那次真机的读数里就没有百分比）。已修：分母记在会话上，新增纯模块 `contextWindow.ts` + `probe-context-window.mjs`（14/14），见正文 | [~] |
 | C11 | 会话级推理档位（reasoningEffort） | P1 | **原判「受限：需 runtime 先支持」已推翻** —— 机制早就在（provider 按请求解析档位、`agent/request` 瀑布的返回值就是请求 config），缺的只是入口。**已实现：自检 25/25 全绿；F5 五项全过**（④ 当场揪出一个真 bug：换会话不重播配置条，已修 `a7e5bab` + 加了结构守卫，复验通过；③ 有盘上留痕 —— 两会话各拿各的档位，且拿到「`reason=change` ⇒ 不重启就改档」的直接证据）（热切 + 真会话级；DSH 侧一行不改、用户配置一行不碰，纯追加一个我们自己的插件块） | [x] |
-| C12 | 项目级 agent profile（工具白名单/默认模型/审批策略） | P1 | 与 C1 同源 | [ ] |
+| C12 | 项目级 agent profile（工具白名单/默认模型/审批策略） | P1 | **原文「扩展负责写回 runtime 配置」只对了三分之一** —— 模型是 `initialize` 参数（必重连）、审批是扩展内部三个读口（零新机制）、**工具白名单运行时压根没有配置键**（要靠自挂插件调 `tools.restrict`，见正文源码坐标）。**已实现：自检 32/32 + webview 段 8 条全绿**（含端到端反控：盘上 `request/header.header.tools` 里 bash 真的没了）；profile 文件落在工作区 `.hello-chat/profile.json`，**不写用户任何文件**，「只能加严」由 `compileProfile` 一个纯函数守死；F5 待真机 | [x] |
 | C13 | Windows / 跨环境 shell 与路径收口 | P1 | 无（扩展侧为主） | [ ] |
 | C14 | 事前 diff 预览（近似实现） | P2 | 受 wire 无 file 事件限制 | [ ] |
 | C15 | 多会话并行 / 分支对照视图 | P2 | 无 | [ ] |
@@ -592,7 +592,8 @@ if (!this._abort || !this._reviewChangesOn()) return;  // 对
   - [scripts/probe-context-window.mjs](../scripts/probe-context-window.mjs)（新，C10b）**14/14**：见上面 C10b 那条。
   - ✅ **`ApprovalServer` 被改过一行**（2026-09-18）：新探针抓到拒绝话术写死「该命令」，对 fs 工具说错了名词 —— 改成按 `toolName` 选（`nounOf()`）。动了 C1 的代码，所以 C1 的两条探针都重跑过（见下）。
   - [scripts/probe-compaction-override.mjs](../scripts/probe-compaction-override.mjs)（新）**31/31**：以仓库里真的 `runtime/cordis.default.yml` 为黄金输入 —— 恰好 2 行不同、CRLF 保持、幂等、行内注释/尾随空格、相邻块同名键不误伤、`modelPolicies[].thresholdRatio` 不受影响、9 个拒绝用例、全范围 `retainRatio < thresholdRatio` 不变量、以及「默认值 ⇒ 逐字节相同」。
-  - [scripts/probe-webview-render.mjs](../scripts/probe-webview-render.mjs)（新，**重建并入库**）**34/34**：用最小 DOM 影子把 `media/chat.js` 载进 Node（加载期依赖只有 `acquireVsCodeApi()` 与 `window.addEventListener('message')` 两处），断言 D1 的 near / stale / compacted 各态与 `.near` 类的挂/摘、D4 的折叠条数与位置（折的是头部、首条渲染的是第 41 条）、点「显示」后全部回来、同会话刷新保持展开而**换会话复位**；外加 C9 运行条与浮层的一小段回归样、**C11 档位菜单**（默认「跟随配置」；当前档位才打勾；点一次只发一条 `set-effort` 且带对值；点当前项**不发**；`thinking: disabled` 下三档既置灰**又根本没挂 click 监听** —— 所以"置灰的行点不动"是结构保证、不是靠回调里再判一次），以及一段 **D4 真数据**（最长真实会话 99 条 / 56 张工具卡：折 39 / 渲 60）。
+  - [scripts/probe-webview-render.mjs](../scripts/probe-webview-render.mjs)（新，**重建并入库**）**42/42**：用最小 DOM 影子把 `media/chat.js` 载进 Node（加载期依赖只有 `acquireVsCodeApi()` 与 `window.addEventListener('message')` 两处），断言 D1 的 near / stale / compacted 各态与 `.near` 类的挂/摘、D4 的折叠条数与位置（折的是头部、首条渲染的是第 41 条）、点「显示」后全部回来、同会话刷新保持展开而**换会话复位**；外加 C9 运行条与浮层的一小段回归样、**C11 档位菜单**（默认「跟随配置」；当前档位才打勾；点一次只发一条 `set-effort` 且带对值；点当前项**不发**；`thinking: disabled` 下三档既置灰**又根本没挂 click 监听** —— 所以"置灰的行点不动"是结构保证、不是靠回调里再判一次）、**C12 profile 菜单** 8 条，以及一段 **D4 真数据**（最长真实会话 99 条 / 56 张工具卡：折 39 / 渲 60）。
+  - [scripts/probe-agent-profile.mjs](../scripts/probe-agent-profile.mjs)（新）**32/32**：C12 四段（解析 / 「只能加严」表驱动 / 插件决策表 / 端到端 `header.tools` 正反双控），详见 C12 正文。
     - 真数据那两条断言各假红过一次，都是**断言写错了而不是代码错了**：① 拿 `msg.text` 去比 `role: 'tool'` 的消息（工具卡渲的是 `msg.toolName`）⇒ 改成按 role 取签名；② 真实助手消息里有反引号与 `D:\…` 反斜杠，markdown 渲染会转义 ⇒ 改成归一化后再比（`plainText()` 只留实词）。**探针的红要先怀疑自己**。
     - **这次它又抓到两个真 bug**，且第 ① 个正是「不忠实的影子比没有影子更坏」的又一例：① 影子的 `className` setter **换掉了**那个 `Set`，而 `classList` 的闭包捕获的是构造时那一个 ⇒ `wrap.className = 'msg msg-user'` 之后 `classList.contains('msg')` 为假、`removeAllMessages` 一个都删不掉（断言全空转）。改成**原地改**。② 我自己按旧影子抄的期望值是过期的（`24K` 应为 `24.0K`、C9 条文案已改成三后缀并列）。③ 顺带发现旧脚本以为 `{type:'run-panel', open:true}` 是**入站**消息 —— 它其实是**出站**（扩展据此下发 details），浮层要靠点 `#runs-view` 才开；现在按真路子驱动，并断言那条回执确实发出去了。
   - [scripts/probe-approval-roundtrip.mjs](../scripts/probe-approval-roundtrip.mjs)（新，C1/C4 的决策回路，2026-09-18）**18/18**：真服务 + 真 hook 脚本 + 真 HTTP + 真子进程，整个搬出扩展宿主。逐条见 C1 正文。
@@ -687,10 +688,76 @@ if (!this._abort || !this._reviewChangesOn()) return;  // 对
   - 用户的基础配置若把根写成流式 YAML（`plugins: […]`）或非块状序列 ⇒ 档位块挂不上（warning，功能不生效，其余一切照旧）。
 - **本次不做**：不动 wire、不改 runtime、不给上游提需求（`initialize` 依旧不收 effort）；**不碰用户 `llm-deepseek` 那两行**（这是与 C10 路线最重要的区别 —— C10 是"改已有两行"，C11 是**纯追加**）；不做"每会话默认档位"的设置项、不做"单轮临时档位"、不做 `maxTokens` 的同类覆盖；不做 C12 那套项目级 profile（档位将来并进去）。
 
-### C12 · 项目级 agent profile
-- **现状**：工具白名单、默认模型、审批策略都散在 `cordis.yml`（用户手动改的外部文件）。配置条的模型选择器只覆盖模型这一项。
-- **补法**：定义可共享的 profile（每工作区/每项目一份），扩展负责写回 runtime 配置并重启；含默认模型、审批策略（C1）、工具开关。
-- **验收**：切换 profile 后模型/审批策略随之生效。
+### C12 · 项目级 agent profile（2026-09-18 实现；自检 32/32 + webview 段全绿，F5 待真机）
+- **原文**：**现状**「工具白名单、默认模型、审批策略都散在 `cordis.yml`（用户手动改的外部文件）。配置条的模型选择器只覆盖模型这一项」；**补法**「定义可共享的 profile（每工作区/每项目一份），扩展负责写回 runtime 配置并重启；含默认模型、审批策略（C1）、工具开关」。
+- ⚠️ **backlog 那句「扩展负责写回 runtime 配置并重启」只对了三分之一。** 三件事的机制**各不相同**，拆开看才看得见（逐条核过源码）：
+  1. **模型**：`initialize` 的参数（`_dshInitParams()`）。机制现成，**必须重连**。
+  2. **审批策略**：本来就是扩展内部读设置（三个读口）。加一层 profile 覆盖即可 —— **零新机制**。
+  3. **工具白名单**：**运行时的配置面里根本没有这个键**。`dsh-tools` 的 `ToolRuntime.Config` 只有 `{mode, maxParallelSubCalls}`，**没有** allow / deny / enabled 任何一个。工具集不是一份配置清单 —— 每个模型可见的工具都是一个 `ctx.tools.register(…)` 的插件，可用性 = `cordis.yml` 里挂了哪些。
+- ⇒ **但运行期有一个 API**（C11 那条「wire 没这个方法 ≠ 做不到」的第二次应验，这次是配置面没键而 API 有）：
+  - `ToolRuntime.restrict({allow, deny})`（`dsh-tools/lib/index.js:2779`，*"Restrict global tools for the calling agent scope"*）——
+    要求 **agent 作用域的 ctx**（它明确拒绝上下文全局的限制：*"a context-global restriction would mask every agent"*），
+    且**名字不在已知集合里会 throw**（而且是**整批**校验 —— 一个坏名字废掉整张表，见下面 D1 那条硬约束）。
+  - 闭包里两处现成用法样板：`dsh-subagent/lib/index.js:582`（`childCtx.tools.restrict(composition.toolFilter)`）、
+    `dsh-goal-round-driver/lib/index.js:204`（`ctx.on("agent/created", ({agent}) => …)`）。`Agent.ctx` 就是 agent 作用域的 `Context`（`dsh-agent/lib/types/runtime-types.d.ts:72`）。
+  - ⇒ **挂我们自己的插件，在 `agent/created` 里对 `agent.ctx` 调一次 `restrict` 即可。DSH 侧一行不改、用户的 `cordis.yml` 一行不碰。**
+- **硬判据（不需要人眼看、不需要真模型请求）**：`request/header` 的 `header` 里**带 `tools`**（`dsh-agent-loop/lib/index.js:729` 的 `...tools.length > 0 ? { tools } : {}`），
+  而这份表来自 `dsh-tools` 的 `wireSchemas(scope)` —— 它读的是 `this.view(scope).visible`，也就是**加了限制之后**的视图。
+  ⇒ 被禁的工具**真的不在模型视野里**，这件事**在盘上就能机器验**（`scripts/probe-agent-profile.mjs` 第四段就是这么钉的）。
+- **形状**：DSH 侧一行不改。一份工作区文件 + 一个纯模块（编译）+ 一个小小的自挂插件 + 配置条上第三个菜单。
+- **D1 · 新纯模块** [src/agentProfile.ts](../src/agentProfile.ts)（**不 import vscode** —— 判据必须能在扩展宿主之外加载，C10b 的教训）：
+  - **`compileProfile(profile, settings)` 是本功能的命门，也是「只能加严」唯一住的地方**：
+    `patterns` 与设置**取并集**（并集只会变多，删不掉默认那十条）；`enabled` / `outsideWorkspace` 与设置**取或**（`setting || profile === true`）；
+    `tools` **只有 deny，没有 allow**（allow 表达不了"只能加严"，写进文件是一条**错误**）。
+  - **写 `false` 不是"关掉"，是一条会被说出来的错**：`approval.enabled: false` / `outsideWorkspace: false` 在**解析期**就进不了 spec。
+    静默忽略用户明明白白写下的意图，比报错更坏。
+  - 解析**永不抛**：文件不存在 / 不是 JSON / 根不是对象 / 字段类型不对 / 未知字段 / profile 名空或超长 ⇒ 逐条进 `errors[]`，
+    **好的部分照用**（`errors` 里带上"是哪个 profile、哪个字段" —— 「文件有问题」这种话等于没说）。
+  - ⚠️ **`KNOWN_TOOL_NAMES` 的校验非做不可，而且必须在编译期**：`restrict()` 是**整批**校验名字的，运行期撞上一个未知名字会让**整张 deny 表**一起抛掉 ——
+    于是「禁 bash」会因为旁边写错一个词而**静默失效**。编译期丢掉并告警，就把它变成一条看得见的错（插件里那个 try/catch 是真·最后兜底）。
+- **D2 · 新纯模块** [src/toolPolicyPlugin.ts](../src/toolPolicyPlugin.ts)（体例照抄 `effortPlugin.ts`）：`TOOL_POLICY_PLUGIN_SCRIPT` + `writeToolPolicyPluginFiles()` → `{scriptPath, pluginUrl}`，落在 `<storageDir>/dsh-plugins/`（与 C11 并列）。三条纪律：
+  ① `deny` 为空 ⇒ **一个字节都不动**（惰性 —— "按需挂载能保持零回归"的根据就是它）；② 整段 try/catch（插件里抛一下就是整个会话起不来）；
+  ③ **只挂 `agent/created`，不挂 `agent/pre-step`** —— `restrict` 是**追加式**的，每步调一次会让限制层层累加。
+  - **没有状态文件**（与 C11 档位的关键结构差异，不是风格差异）：档位是**每次请求**现读 ⇒ 热生效、要状态表；
+    工具策略在 **agent 创建期**只读一次、只在切 profile（= 重连）时变 ⇒ 直接把 `deny` 写进派生配置块的 `config` 里。少一个文件、少一次读盘、少一类竞态。
+- **D3 · 派生配置的第四个"只增不改"的块**（[src/dshHooks.ts](../src/dshHooks.ts)）：`writeDerivedConfig` 多一个可选入参 `toolPolicy`，在档位块之后追加 `- id: hello-chat-tool-policy`。
+  同样是**挂不上只 warning 不 throw**（独立一条 `toolPolicyWarning`，不与档位那条共用一句话 —— 挂不上的东西不同，话术也不同）。`hooksPath` 那条既有 throw 一个字没改。
+- **D4 · 提供者接线**（[src/chatViewProvider.ts](../src/chatViewProvider.ts)）：
+  - **活跃 profile 存 `workspaceState`**（每工作区、扩展内部），存的是**校验过的原始 spec + 激活时的文件原文**，不是编译结果
+    —— 编译每次现算（这样用户改设置之后并集仍是新鲜的）。
+    ⇒ 顺带得到一条重要性质：**agent 改写 `profile.json` 没有任何效果**，运行期用的是激活时存下的副本，要重新激活才生效。
+  - 三个审批读口改成分工两层：`_approvalSettingEnabled/Patterns/Outside()` 只读设置原文，`_approvalEnabled/Patterns/OutsideEnabled()` 走 `_effectiveProfile()`。
+    松紧方向全在纯函数里定死，UI 侧没有任何"该不该灰"的判断。
+  - `_dshModel()` 前面多一层：`profile.model` 最优先（它是**项目声明**，比"上次在这台机器上点过哪个"更该赢）。`_setLiveModel()` 里加了**明确拒绝**并指出出路 —— 绝不静默收下再被 profile 盖掉。
+  - `_setProfile(name | null)`：`this._abort` ⇒ 弹「当前有回复在生成中，先停止或等它结束，再切换 profile。」**什么都不做**；否则读盘 → 存 spec → `_postLiveConfig()` → `_restartLiveProcess()`（**三个菜单里唯一必定重连的一个**）。
+  - `workspace.createFileSystemWatcher` 盯 `.hello-chat/profile.json`（事件驱动，不轮询）⇒ 置 `profileStale`，配置条上亮出「profile.json 已改动 · 点这里重新应用」。
+- **D5 · webview**（[media/chat.html](../media/chat.html) / [media/chat.js](../media/chat.js) / [media/chat.css](../media/chat.css)）：配置条里档位菜单之后再挂一个同款浮层，**复用 `.lc-model-*` 全套类**（CSS 只多了 `.lc-model-item.has-sub` + `.lc-mi-sub`，让摘要另起一行）。
+  首项固定是**「不用 profile」**（退路永远排第一，任何 profile 出问题都知道往哪退）。**profile 钉住模型时模型菜单整片置灰 + 触发钮 title 说明被谁固定、往哪退 + 不给"自定义模型…"入口**（那个值同样不会生效）。
+  - ⚠️ `renderLiveConfig` 末尾**必须重画一次 `renderModelMenu()`** —— 模型菜单的画法取决于 profile 有没有钉模型，早画一步就会留着上一份的置灰状态（**同 C10b 那个 bug 的形状**，这次是预防性钉住的：`probe-webview-render.mjs` 里那条"没钉模型时模型菜单照旧能点"就是它的反控）。
+  - `pickProfile` **故意不比 `v !== liveProfile`** —— 「已改动」那一行点的就是当前项，它的语义是"重读并按现在的内容重新激活"，必须发得出去。
+- **自检**：[scripts/probe-agent-profile.mjs](../scripts/probe-agent-profile.mjs)（新，**32/32**）四段 ——
+  ① 解析（含 `readProfileFile` 的读不到/超大/目录当文件）；② **「只能加严」表驱动正反双控**（本节命门）；
+  ③ 插件决策表（把生成的插件文件当纯模块载入，喂假 ctx 抓 `agent/created`：给了 deny ⇒ `restrict` 收到恰好那个 filter；deny 空/缺失 ⇒ **一次都没被调**；`restrict` 抛 ⇒ 不冒泡）；
+  ④ **端到端真跑一轮**：派生配置挂真插件 ⇒ 盘上 `request/header.header.tools` 里**没有** `bash`、**有** `read`；**反控**：不带 profile 那轮 `bash` **必须在**（否则"没有 bash"可能只是这轮压根没装配工具）。
+  第四段与 C11 探针同款：**刻意用假 key**（`sk-000…`，请求 401 但 header 在请求构建期就落盘），"没跑起来"响亮报错、绝不读成"验过了"。
+  - [scripts/probe-webview-render.mjs](../scripts/probe-webview-render.mjs) 加 C12 段 8 条（渲染/打勾/恰好一条 `set-profile`/`null`/钉住置灰且不发/未钉时可点（反控）/「已改动」行发得出去/错误条数/没工作区/忙碌时禁用且菜单收起）。
+- **只能真机 F5 盖住**：
+  1. 放一份 `.hello-chat/profile.json`（两个 profile）⇒ 配置条出现 profile 菜单 ⇒ 选一个 ⇒ **重连一次** ⇒ 模型变成 profile 的、审批变严。盘上证据：新 `request/header` 的 `config.model` 跟着走。
+  2. **工具白名单的真判据**：profile 里 deny `bash` ⇒ 重连后让 agent 做一件需要 shell 的事 ⇒ 它**说没有这个工具**（而不是「命令被拒」）。盘上对拍：`request/header.header.tools` 里没有 `bash`。
+  3. **忙碌时切** ⇒ 弹「当前有回复在生成中…」，且**盘上什么都不变**（配置、profile 名字、模型全不动）。
+  4. **只加严的反证**：把某个 profile 写成想关审批 ⇒ 弹条**照旧出现**。
+  5. 不回归：C1 弹条与「拒绝」、C10 占用条 / 压缩 note、C11 档位菜单、C8「继续」按钮各抽查一次。
+- **已知局限**：
+  - **工作区内的写按 C1 的设计不弹条**，所以 agent 技术上能改 `.hello-chat/profile.json`；而 `.hello-chat` 又已被快照忽略（`fileSnapshot.ts:21`），改了也不会出现在本轮审阅里。**三重缓解**：① 字段里没有任何放松方向；② 运行期读的是激活时的副本；③ 想生效必须用户手动重新激活。**残留**：重新激活时若不看内容，等于签了字。
+  - **profile 是扩展侧行为，不是会话属性**：换个不带我们插件的运行时跑同一份会话，这些策略全都没有。
+  - **`.hello-chat/profile.json` 进 git 是刻意的**（可分享给同事）；代价是它会被 `git status` 看见。不写进 `.gitignore`（写了就没法共享），改由 README 说明。
+  - **两个 VS Code 窗口开同一扩展**时派生配置文件路径共享（C1/C10/C11 的既有性质，非本次引入），profile 只是又一位乘客。本次不修。
+- **本次不做**（含两条**否掉的路**，都记下来免得后人重推）：
+  - 不写 `.vscode/settings.json`、不写用户的 `cordis.yml`、不新增任何 `scope: resource` 的设置项（配置条 + 文件就够）。
+  - 不做 profile 的图形化编辑器（**文件就是接口**，菜单只负责切）；不做继承 / 变量插值 / YAML 格式；不做工作区多根（沿用 `workspaceFolders[0]`，不在 C12 开新战线）。
+  - **❌ 不走 `dsh-user-approval` / `dsh-sandbox-policy` / `dsh-permission-presets` 那条路**：这三个策略插件在闭包里确实存在，但**当前配置里一个都没挂载**；而且它们的 config（presets 表、`defaultPreset`）是**进程级**的、运行期只能"在既有预设里选"。起了它们等于同时换掉 C1 这一整套**已经实测过**的审批机制 —— 与「C1/C4/C12 同源，别拆散」正相反。
+  - **❌ 不做 `allow` 型工具白名单**：allow 表达不了"只能加严"（决定 5 的推论）。
+  - 不动 wire、不改 runtime、不给上游提需求。
 
 ### C13 · Windows / 跨环境 shell 与路径收口
 - **现状**：bash 靠 PATH 找，`System32\bash.exe` 会命中 WSL shim，WSL 无发行版就全线报错（[wire-vocabulary.md](wire-vocabulary.md)）；跨盘/跨环境路径语义有坑。
@@ -727,6 +794,6 @@ if (!this._abort || !this._reviewChangesOn()) return;  // 对
 ## 交叉说明
 
 - **最小可用商业化 = C1 + C2 + C3**（敢用、装得上、花得起）。C3 的用量部分（C3a）已完成，剩 C3b 的费用/拦截。
-- C1/C4/C12 同源（审批策略），做 C1 时一并设计，别拆散。
+- C1/C4/C12 同源（审批策略），做 C1 时一并设计，别拆散。**C12 的落地形态（2026-09-18）**：审批那一半确实"零新机制"（profile 只是一层 `||`/并集，读口从"读设置"变成"读设置 → `compileProfile`"），但**工具白名单那一半不是同一回事** —— 它跟 C1 没有共用机制，靠的是自挂插件调 `tools.restrict`（见 C12 正文）。「同源」说的是**审批策略这一轴**，别据此以为整张 C12 都挂在 C1 上。
 - ~~C3 与 C10 共用「用量可得性」前置验证，建议合并做一次 spike。~~ 该前置已达（C3a 已把窗口与占用透出），C10 只剩压缩动作本身。
 - ~~C11、C14 受 DSH wire 能力限制，属"要等上游"~~ **C11 更正（2026-09-18）**：wire 下不去 ≠ 做不到 —— `cordis.yml` 里挂一个我们自己的插件就能在请求构建期覆盖（见 C11 正文的四条源码坐标）。**别再把「wire 没这个方法」直接读成「这件事做不了」**，先看看 `agent/*` 的瀑布与插件加载器。C14 仍是真受限（wire 里**没有**任何 file 事件可读）。

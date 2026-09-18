@@ -174,6 +174,16 @@
             </button>
             <div id="live-effort-menu" class="lc-model-menu" role="menu" aria-label="推理档位"></div>
           </div>
+          <!-- C12 项目级 profile：同一款浮层菜单。与前两个不同的是它**必定重连**（模型/工具白名单/
+               审批开关都要重建），且它是**整个项目**的一份声明，不是会话级。 -->
+          <div id="live-profile-wrap" class="lc-model-wrap">
+            <button id="live-profile-btn" class="lc-model" type="button"
+                    title="项目级 agent profile（.hello-chat/profile.json）：一键切换模型 / 审批策略 / 工具白名单。切换会重启 live 子进程">
+              <span id="live-profile-label" class="lc-model-label">profile</span>
+              <span class="lc-chev" aria-hidden="true"></span>
+            </button>
+            <div id="live-profile-menu" class="lc-model-menu" role="menu" aria-label="项目 profile"></div>
+          </div>
           <input id="live-model-input" class="lc-input" type="text" spellcheck="false" maxlength="120"
                  hidden placeholder="输入模型 id，回车应用">
           <button id="live-dsh-btn" class="link-button lc-dsh" type="button"

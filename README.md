@@ -243,6 +243,61 @@ the fs side always allows (guardrail degrades, visibility stops with it).
 
 ---
 
+## Project agent profiles (`.hello-chat/profile.json`)
+
+Model, approval policy and the tool whitelist all used to live in `cordis.yml` — a file you edit by
+hand, outside your project. A **profile** moves that decision into the project itself, so it travels
+with the repo and can be shared with everyone working on it.
+
+```json
+{
+  "active": "严格",
+  "profiles": {
+    "严格": {
+      "model": "deepseek-reasoner",
+      "approval": { "enabled": true, "outsideWorkspace": true, "patterns": ["\\bdrop\\s+table\\b"] },
+      "tools": { "deny": ["bash"] }
+    },
+    "省钱": { "model": "deepseek-chat" }
+  }
+}
+```
+
+Pick one from the **profile** menu in the config bar. Switching **always reconnects** the live
+subprocess — the model is an `initialize` parameter, and the tool whitelist and approval switch are
+read when the runtime starts. `active` is only a *suggestion* for whoever opens the repo; your own
+choice is remembered per workspace and wins.
+
+**A profile can only ever tighten, never loosen.** This is the property the whole feature is built
+on, and it is enforced in one place (`compileProfile`):
+
+| Field | What it does | Why it can't loosen anything |
+|---|---|---|
+| `model` | Overrides the model picker | Not a strictness axis. While a profile pins it, the model menu is greyed out and its title tells you to switch to 「不用 profile」 first — a silent no-op is never an option here |
+| `approval.patterns` | **Unioned** with your settings' list | A union can only add; the ten defaults can't be deleted |
+| `approval.enabled` / `outsideWorkspace` | **OR**ed with your settings | `false` is a *parse error*, not “turn it off” — writing it gets you a message, not a silent ignore |
+| `tools.deny` | Those tools **disappear from the model's view** | There is no `tools.allow`; that direction can't express “only tighten” anyway |
+
+The extension never writes your files — not `.vscode/settings.json`, not `cordis.yml`. The active
+profile lives in the extension's own per-workspace storage, and the tool whitelist is applied by a
+small plugin of ours mounted into a **derived** copy of the runtime config.
+
+**Caveat worth knowing:** a write *inside* the workspace doesn't prompt (that's the C1 design), so
+an agent can technically edit this file — and `.hello-chat` is excluded from the review snapshot, so
+the edit wouldn't show up in the turn's diff either. Three things blunt that: the file has no
+loosening direction to express; the runtime uses the copy captured when you activated the profile, so
+editing the file changes nothing; and taking effect requires *you* to re-activate. The residue is
+honest: if you re-activate without reading, you've signed off on whatever the file now says.
+
+Parsing never throws. A bad field becomes one line in a warning and **the rest of the file still
+applies** — check the menu: it shows the error count and the notification says which profile and
+which field.
+
+`.hello-chat/profile.json` is deliberately **not** in `.gitignore` — being shareable is the point.
+It will show up in `git status`.
+
+---
+
 ## Reliability: interrupt & continue
 
 Stopping is a hard constraint of the wire, not a choice: there is **no cancel RPC**, so **stopping a
@@ -384,6 +439,8 @@ finished path.
 | `src/sessionExport.ts` | Transcript → Markdown / JSON, and safe default file names (pure, no `vscode`) |
 | `src/compactionNotice.ts` | Turns DSH's `compaction/summary` / `compaction/end` payloads into a transcript note — degrades to “details missing” rather than going silent, reports success exactly once, and never copies the summary body into the transcript (pure, no `vscode`) |
 | `src/contextWindow.ts` | The occupancy readout's two verdicts: **where the denominator comes from** (look at the live `request/context` value, else the one remembered on the session) and whether the warn line has been crossed. Split out of `chatViewProvider` after a real F5 missed a bug for a whole round — the panic button here is that `request/context` is **never** re-sent when you continue a session (DSH compares against a log-derived `previousContext`), so without the remembered denominator the whole indicator silently doesn't exist (pure, no `vscode`) |
+| `src/agentProfile.ts` | C12 project profiles: reads and validates `.hello-chat/profile.json` (never throws — one bad field is one message, the rest still applies) and compiles profile + settings into the policy actually in force. **The “only tighten” property lives in `compileProfile` and nowhere else** (pure, no `vscode`) |
+| `src/toolPolicyPlugin.ts` | C12's tool whitelist: the small cordis plugin (generated into global storage, mounted into the derived config) that calls `tools.restrict({deny})` on each `agent/created`. No state file, unlike the C11 effort plugin — the policy is read once at agent creation, so it only changes on a reconnect (pure, no `vscode`) |
 | `src/dshPaths.ts` | DSH session-log path algorithm (**copied verbatim from the persistence plugin**) + guarded removal (pure, no `vscode`) |
 | `src/extension.ts` | Extension entry: commands + view registration |
 | `media/chat.{html,js,css}` | Side-panel front end (mode pills + harness status dot; DSH theme tokens with VS Code fallbacks) |
@@ -399,9 +456,10 @@ finished path.
 | `scripts/probe-compaction-notice.mjs` | Self-check for the C10 compaction notice: the plugin's `compaction/summary` and `compaction/end` payloads turn into a transcript note, never silently (`undefined` only for unrelated types), exactly once per successful compaction, and **never** echoing the summary body into the transcript. The second half cross-checks the real `compaction/*` frames in a stored DSH session log against the notes we persisted — **word for word, same order**, with the done-count conserved against the session's `compacted` field (same; no VS Code, no API key) |
 | `scripts/probe-compaction-override.mjs` | Self-check for the C10 threshold override: anchored rewriting of the two `compaction-basic` ratios only (exactly two lines differ, CRLF kept, idempotent, sibling `modelPolicies[].thresholdRatio` untouched, 9 rejection cases), `retainRatio < thresholdRatio` held across the whole range, and **the default value produces a byte-identical file** — which is what makes C1's zero-regression structural rather than luck (same; no VS Code, no API key) |
 | `scripts/probe-context-window.mjs` | Self-check for the C10 occupancy denominator: live value wins, **a missing live value falls back to the one remembered on the session** (the regression case for a bug a whole F5 round missed — continue a session and the bar showed nothing at all), junk values count as “unknown” rather than as a window, the warn line is `threshold × 0.85` (including the `0.02`-threshold arithmetic of that real run), a corrupted threshold falls back to the default, and both the denominator and the last reading survive a store round-trip (same; no VS Code, no API key) |
-| `scripts/probe-webview-render.mjs` | Self-check for `media/chat.js` rendering, run in Node behind a minimal DOM shim (the only way to exercise that code before F5): the usage bar's `near` / `stale` / `compacted` states and its `.near` class, the transcript fold (head folded, correct count, expand restores everything, reset on session switch), the same fold replayed over the **longest real stored session** (99 messages / 56 tool cards), plus a small C9 runs-bar/panel regression sample and the C11 effort menu (default 「跟随配置」, the ✓ on the current row only, the value posted by each pick — and that a `thinking: disabled` base config greys the three rows *and* attaches no click handler at all, so a greyed row cannot post even by accident). It has already caught two real bugs of the “a shadow that lies is worse than no shadow” kind (same; no VS Code, no API key) |
+| `scripts/probe-webview-render.mjs` | Self-check for `media/chat.js` rendering, run in Node behind a minimal DOM shim (the only way to exercise that code before F5): the usage bar's `near` / `stale` / `compacted` states and its `.near` class, the transcript fold (head folded, correct count, expand restores everything, reset on session switch), the same fold replayed over the **longest real stored session** (99 messages / 56 tool cards), plus a small C9 runs-bar/panel regression sample and the C11 effort menu (default 「跟随配置」, the ✓ on the current row only, the value posted by each pick — and that a `thinking: disabled` base config greys the three rows *and* attaches no click handler at all, so a greyed row cannot post even by accident), plus the C12 profile menu (「不用 profile」 always first as the way out, the ✓ on the current row only, exactly one `set-profile` per pick and `null` for the escape hatch, a pinned model greying every model row *and* leaving them with no handler *and* hiding the “custom model” entry — with the counter-control that an unpinned menu is still clickable — the “profile.json 已改动 · 点这里重新应用” row being able to **post**, precisely because it targets the current item, and busy disabling the trigger while collapsing the menu so those rows aren't reachable in the first place). It has already caught two real bugs of the “a shadow that lies is worse than no shadow” kind (same; no VS Code, no API key) |
 | `scripts/probe-derived-config-boot.mjs` | Boots the portable runtime the way the extension spawns it — base config as the **positional** arg, derived config only via `DSH_CORDIS_CONFIG` — with one positive control (a valid override loads) and one negative control (a derived file violating the plugin's load-time `retainRatio < thresholdRatio` rule **must** fail to boot). The negative control is the point: it proves the env var wins, which is the single thread C1 and C10 both hang on (same; no VS Code, no API key) |
 | `scripts/probe-effort-plugin.mjs` | Self-check for the C11 per-session reasoning effort, in three parts: the pure rules (`normalizeEffort` never guesses; `thinkingDisabledInConfig` only reads the `llm-deepseek` block; the generated derived block's quoting when a path contains a single quote; **nothing extra in the derived file when no effort is requested**; an un-mountable block warns instead of throwing — and C1's own throw is still intact); the **plugin's own decision table**, loaded as a plain module with a fake `ctx` (hit / miss returns *the very object upstream returned* / no `agent` in the payload / missing or corrupt state file / an illegal value / `thinking` disabled lets only `off` through / an upstream throw must propagate, not be swallowed) including the “state file is re-read on **every** request” case that *is* the hot-swap claim; and a real end-to-end boot where the derived config mounts the real plugin and the stored `request/header` must read `reasoningEffort: "low"` — with a negative control proving an unset session gets **the base config's own default**, not our value. plus a structural guard born from a real F5 bug: `_actives[this._mode] =` may appear **exactly once** (inside `_setActive`), and that method must replay the config bar — otherwise switching sessions leaves the effort menu showing the *previous* session's value, silently. Runs on a **fake API key**: the request 401s, but `request/header` is written at build time, so the assertions hold and nothing is spent (same; no VS Code, no API key) |
+| `scripts/probe-agent-profile.mjs` | Self-check for the C12 project profiles, in four parts: **parsing** (missing file / not JSON / root is an array / wrong field types / unknown fields / over-long names / unknown tool names — every one of them becomes a message, none of them throws, and the good half of the file still applies); **the “only tighten” table** (settings off + profile `false` ⇒ still off; settings off + `true` ⇒ on; settings on + `false` ⇒ **still on**, with the end-to-end path from file text through parse to compile so `false` can't slip past the parser either; `patterns` as a union that can't delete a default and can't be emptied; `outsideWorkspace` with the same positive/negative controls) — this is the section the whole feature rests on; the **plugin's decision table**, loaded as a plain module with a fake `ctx` (deny given ⇒ `restrict` gets exactly that filter; deny empty/missing/not-an-array ⇒ **`restrict` is never called**, which is what makes an unmounted profile byte-identical to no C12 at all; non-string entries filtered; missing `agent`/`ctx`/`tools` doesn't throw; a throwing `restrict` must not bubble, since that would take the whole session down); and a real end-to-end boot where the derived config mounts the real plugin and the stored `request/header.header.tools` must have **no `bash`** and **still has `read`** — with the counter-control proving an unprofiled run *does* have `bash`, without which “no bash” could just mean the turn never assembled tools at all. Runs on a **fake API key** (the request 401s; the header is written at build time) (same; no VS Code, no API key) |
 | `scripts/probe-c8-runtime.mjs` | Runtime spike for C8: queued second prompt, kill-then-resume turn repair, graceful vs hard kill. **Needs an API key** and spends real model turns |
 | `scripts/update-dsh.mjs` | Runtime-dependency governance: lock the DSH checkout to a tag, check drift, run the upgrade ritual + smoke (see `docs/runtime-dependency.md`) |
 | `docs/runtime-dependency.md` | Governance decision for treating the DSH checkout as a versioned runtime dependency, the upgrade ritual, and the “when to switch to official npm” checklist |
