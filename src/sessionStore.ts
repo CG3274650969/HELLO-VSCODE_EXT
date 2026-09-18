@@ -56,6 +56,14 @@ export interface StoredSession {
    *  它是**上次已知值**不是实时值，读出来会标 `stale`（渲染成「上次」），不冒充实时。
    *  旧数据没有本字段 → 向后兼容。 */
   context?: { usedTokens: number; contextWindow: number; at: number };
+  /** C10b：**本会话见过的上下文窗口（分母）**。窗口是 (provider, model) 的属性，记下来
+   *  就等于永远知道；而 DSH 只在路由**变化**时才发 `request/context`，续聊时一条都不发
+   *  （理由见 contextWindow.ts 的 resolveContextWindow）—— 于是这份记忆是续聊时唯一的分母。
+   *
+   *  ⚠️ 与上面 `context` 的区别：`context` 是**一次读数**（分子 + 分母 + 时间，会 stale），
+   *  本字段只是**分母**，不随时间失效。旧数据没有本字段 → 向后兼容（那些会话要把本条读数
+   *  空着，直到路由真的变一次）。 */
+  contextWindow?: number;
   /** C10：本会话被 DSH 压缩过几次（累计）。只用来在读数条上写「· 已压缩 N 次」——
    *  「发生过压缩」这件事的**正文说明**是转写里那条 note（见 compactionNotice.ts）。
    *  旧数据没有本字段 → 向后兼容。 */

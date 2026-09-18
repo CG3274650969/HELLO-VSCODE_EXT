@@ -17,6 +17,7 @@ import {
   WebviewToExt,
 } from './protocol';
 import { ApprovalAsk, ApprovalOutcome, ApprovalServer, matchesAnyPattern } from './approvalServer';
+import { contextStateOf, resolveContextWindow } from './contextWindow';
 import {
   ApprovalHookFiles,
   CompactionRatios,
@@ -139,14 +140,6 @@ const MAX_OUTSIDE_REVIEW_ROOTS = 20;
 
 /** `hello.chat.approval.outsideWorkspace` 的默认值（只 gate「问」，不 gate「看」） */
 const DEFAULT_APPROVAL_OUTSIDE = true;
-
-/**
- * C10：提前多少报「接近压缩阈值」（占阈值的比例）。
- *
- * 留 15% 余量是为了在 DSH 真的动手**之前**给个信 —— 等它压完了才提示等于没提示。
- * 这个数只影响提示的早晚，不影响任何行为（压缩本身是 DSH 按它自己的判据做的）。
- */
-const CONTEXT_WARN_MARGIN = 0.85;
 
 /** 用户等待上限（秒）的默认值；与 hook 超时形成 540 < 560 < 580 的梯度 */
 const DEFAULT_APPROVAL_TIMEOUT_SEC = 540;
@@ -424,7 +417,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** 本轮累计；一轮跑着才有值。轮尾折进 `_active.usage` 后置空（单点折叠 → 不可能双计） */
   private _turnUsage?: TurnUsage;
-  /** 本次请求的上下文窗口（占用率分母），来自 request/context；换子进程要重取 */
+  /**
+   * 本次连接里收到的上下文窗口（占用率分母），来自 `request/context`。
+   *
+   * ⚠️ **它不是唯一来源、也不是常有的**：续聊时那个事件一条都不发（C10b），所以分母要靠
+   * `StoredSession.contextWindow` 兜底 —— 一律走 `_effectiveContextWindow()`，别直接用它。
+   */
   private _contextWindow?: number;
 
   // ---------- C9 运行检查器（本轮帧时间线）状态 ----------
@@ -1682,10 +1680,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return;
       }
       case 'request/context': {
-        // C3a：本次请求的路由与上下文窗口（占用率的分母）。每会话一条、会话开头就到，
-        // 所以占用率不用等首轮跑完。换子进程会重新发（见 _teardownLive 的清理）。
+        // C3a：本次请求的路由与上下文窗口（占用率的分母）。
+        // ⚠️ C10b 更正了一条曾经的错误认知（就写在这行注释里）：「每会话一条、会话开头就到，
+        // 换子进程会重新发」。**续聊时它一条都不发** —— DSH 的 emit 拿从**日志**折出来的
+        // previousContext 比对，provider/model/窗口三者相同就跳过（实测 1704 条事件的日志里
+        // 只有 1 条，在会话第一次请求那处）。所以这里除了记活值，还要把分母**记进会话**
+        // （落盘），否则整个连接里占用读数都是空的。详见 contextWindow.ts。
         if (typeof d.contextWindow === 'number' && d.contextWindow > 0) {
           this._contextWindow = d.contextWindow;
+          this._active.contextWindow = d.contextWindow;
           this._postUsage();
         }
         return;
@@ -1823,10 +1826,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // C10：顺手把"最后一次已知的上下文占用"落进会话。占用读数本来只活在内存里，
     // 于是重载窗口 / 切回旧会话时那条指示永远是空的 —— 而占用恰恰是它唯一要说的东西。
     // 记的是**上次已知值**，读出来会标 stale（渲染成「上次」），不冒充实时。
-    if (turn.pressureTokens !== undefined && this._contextWindow !== undefined) {
+    // ⚠️ 分母走 `_effectiveContextWindow()`（活值 → 会话记住的）：续聊时活值根本没有，
+    // 用 `this._contextWindow` 直接判的话这条**永远不会落盘**（C10b 修的就是这个）。
+    const window = this._effectiveContextWindow();
+    if (turn.pressureTokens !== undefined && window !== undefined) {
       this._active.context = {
         usedTokens: turn.pressureTokens,
-        contextWindow: this._contextWindow,
+        contextWindow: window,
         at: Date.now(),
       };
     }
@@ -1835,19 +1841,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * 「接近 DSH 的压缩线了吗」。
+   * 这次连接里**可用的分母**：活值优先，缺了用本会话记住的那个。
    *
-   * ⚠️ **两个数不是同一个数，这条判据只是近似**：分子是 provider 上报的 prompt 侧压力
-   * （`turn.pressureTokens`），而 DSH 决定压不压缩用的是 `token-meter` 的 `totalTokens`
-   * ——`CHARS_PER_TOKEN = 4` 的启发式估算，还含输出。分母两边一致（都是 provider 给的窗口）。
-   * 所以文案只能说「接近压缩阈值」，**不许**说「距离压缩线还有 X token」。
-   *
-   * 提前 15% 报（`CONTEXT_WARN_MARGIN`）是刻意的：等 DSH 压完了再提示等于没提示。
+   * 为什么需要回落而不是只用活值：`request/context` 在续聊时一条都不发（见
+   * `contextWindow.ts` 与 `request/context` 那个 case 的注释），于是「继续一个旧会话」
+   * 这条最常见的路径上活值恒为 undefined —— 没有回落，整条占用指示就是空的。
+   */
+  private _effectiveContextWindow(): number | undefined {
+    return resolveContextWindow(this._contextWindow, this._active.contextWindow);
+  }
+
+  /**
+   * 「接近 DSH 的压缩线了吗」。算术与那条近似的口径警告都在纯模块里（`contextStateOf`）。
    */
   private _contextState(usedTokens: number, contextWindow: number): 'ok' | 'near' {
-    const raw = this._compactionThresholdRatio();
-    const ratio = raw > 0 && raw <= 1 ? raw : DEFAULT_COMPACTION_THRESHOLD_RATIO;
-    return usedTokens >= contextWindow * ratio * CONTEXT_WARN_MARGIN ? 'near' : 'ok';
+    return contextStateOf(usedTokens, contextWindow, this._compactionThresholdRatio());
   }
 
   /**
@@ -1877,7 +1885,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       turn && !turn.folded ? turnSum : zeroUsage()
     );
     const used = turn?.pressureTokens;
-    const contextWindow = this._contextWindow;
+    const contextWindow = this._effectiveContextWindow();
     const storedCtx = this._active.context;
     if (
       used === undefined &&
