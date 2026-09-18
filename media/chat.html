@@ -154,25 +154,71 @@
           </svg>
         </button>
         <div id="live-config-bar" class="live-config-bar" hidden>
-          <!-- 模型选择器：DOM 浮层菜单（CC/DSH 同款）。原生 <select> 的弹出列表是系统方形控件、
-               无法圆角/配色，故弃用；此处按钮触发 .lc-model-menu（chat.js 渲染/开关）。 -->
+          <!-- 三个下拉触发钮（模型 / 推理档位 / profile）：**裸文字按钮，与右侧「配置 DSH」「API」
+               逐字同款**（都挂 .link-button），不再是自己一套带边框底色的药丸 —— 三个药丸并排
+               在工具行里太抢眼，也比旁边两个状态钮重得多。样式差异只剩"菜单开着时保持高亮"。
+               原生 <select> 依然不用：它的弹出列表是系统方形控件，无法圆角/配色（这是"方、白底
+               白字"的根源），所以走 DOM 浮层菜单（chat.js 渲染/开关）。
+
+               2026-09-18 二次收窄：连「模型 · 」「推理 · 」「profile · 」这三段轴名也从钮上去掉了，
+               轴改由**图标**（同附件钮那支行内 SVG 的体例：15px、fill:none、
+               stroke=currentColor ⇒ 跟主题走）+ title 带出，钮上只剩**值本身**。这么改的根据是
+               轴名是**常量**（每次都用同样的字数说同一件事），值是**变量** —— 省宽该省常量那一段。
+
+               同日第三次收窄：推理/profile 再退一步，改成**方块图标钮**（.tool-icon，26×26，
+               与左侧附件钮逐字同款）—— 值也放不下了，只能进 title / aria-label / 菜单的 ✓。
+               只有模型钮留着文案：模型名是**唯一必须一眼看见**的东西（"我在跟哪个模型说话"），
+               而档位与 profile 是偶尔才动的旋钮。**这是拿"一眼可见"换宽度的一刀**：
+               非默认态靠角上那个 `.on` 状态点（绝对定位，不占宽）表示"这个轴被动过"。-->
           <div class="lc-model-wrap">
-            <button id="live-model-btn" class="lc-model" type="button"
+            <button id="live-model-btn" class="link-button lc-model" type="button"
                     title="切换模型（需停在运行中后生效，会重启 live 子进程）">
-              <span id="live-model-label" class="lc-model-label">选择模型</span>
+              <span id="live-model-label" class="lc-model-label">未选</span>
               <span class="lc-chev" aria-hidden="true"></span>
+              <!-- C12：profile 钉住模型时，箭头槽位换成小锁（同一个槽二选一 —— "你在这儿改不了"
+                   与"这儿有个下拉"说的是同一件事，并排放两个既挤又多话）。显隐全在 CSS
+                   （.lc-model.pinned），chat.js 只切那一个 class。 -->
+              <span class="lc-lock" aria-hidden="true">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3.5" y="10.5" width="17" height="10.5" rx="2.5"></rect>
+                  <path d="M7.8 10.5V7.2a4.2 4.2 0 0 1 8.4 0v3.3"></path>
+                </svg>
+              </span>
             </button>
             <div id="live-model-menu" class="lc-model-menu" role="menu" aria-label="模型列表"></div>
           </div>
           <!-- C11 推理档位：与模型选择器同款浮层菜单（复用 .lc-model-* 类）。
-               与模型不同的是它**按会话**记、且通常热生效（不重启子进程）。 -->
+               与模型不同的是它**按会话**记、且通常热生效（不重启子进程）。
+               图标取四角星（AI 界面里"思考/推理"的通用符号，且是单色路径，能跟着主题走）。
+               ⚠️ 钮里**只有一个 <svg>**：它是方块图标钮（.tool-icon，与左侧附件钮逐字同款），
+               没有位置放"值"。当前档位改由 title + aria-label 带出，非默认时角上点一个
+               `.on` 的状态点 —— 这一刀是拿"一眼可见"换宽度的，别再把文案加回来。 -->
           <div id="live-effort-wrap" class="lc-model-wrap">
-            <button id="live-effort-btn" class="lc-model" type="button"
+            <button id="live-effort-btn" class="tool-icon lc-knob" type="button"
+                    aria-label="推理档位"
                     title="会话级推理档位（reasoningEffort）：默认跟随 cordis.yml；改档位下一步就生效">
-              <span id="live-effort-label" class="lc-model-label">推理 · 跟随</span>
-              <span class="lc-chev" aria-hidden="true"></span>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 3l2.2 6.3 6.3 2.2-6.3 2.2L12 20l-2.2-6.3L3.5 11.5l6.3-2.2z"></path>
+              </svg>
             </button>
             <div id="live-effort-menu" class="lc-model-menu" role="menu" aria-label="推理档位"></div>
+          </div>
+          <!-- C12 项目级 profile：同一款浮层菜单。与前两个不同的是它**必定重连**（模型/工具白名单/
+               审批开关都要重建），且它是**整个项目**的一份声明，不是会话级。
+               图标取人形：profile 就是"这个项目里的 agent 是谁、守什么规矩"。方块钮，同推理钮。 -->
+          <div id="live-profile-wrap" class="lc-model-wrap">
+            <button id="live-profile-btn" class="tool-icon lc-knob" type="button"
+                    aria-label="项目 profile"
+                    title="项目级 agent profile（.hello-chat/profile.json）：一键切换模型 / 审批策略 / 工具白名单。切换会重启 live 子进程">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="8" r="3.6"></circle>
+                <path d="M4.8 20.2a7.2 7.2 0 0 1 14.4 0"></path>
+              </svg>
+            </button>
+            <div id="live-profile-menu" class="lc-model-menu" role="menu" aria-label="项目 profile"></div>
           </div>
           <input id="live-model-input" class="lc-input" type="text" spellcheck="false" maxlength="120"
                  hidden placeholder="输入模型 id，回车应用">

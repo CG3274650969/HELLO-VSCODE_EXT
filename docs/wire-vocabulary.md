@@ -60,6 +60,17 @@ client session 有 `PendingWait('approval')`）。但当前部署配置下工具
   改配置重启才有意义。~~ **已实现（C11，2026-09-18）**：wire 仍下发不了，但改走
   「派生配置里挂我们自己的插件，按会话覆盖 `agent/request` 的返回值」⇒ 会话级菜单 +
   热生效（不重启）。见上面第 4 条的补记。
+- **工具白名单 / 工具开关（C12）**：**wire 里根本没有这一轴**，连"工具"这个概念都不出现
+  （方法全量清单里一个都没有）。而且这次拦路的不是 wire，是**配置面**：运行时的工具集
+  不是一份配置清单（每个工具都是一个 `ctx.tools.register(…)` 的插件），`dsh-tools` 的
+  `ToolRuntime.Config` 只有 `{mode, maxParallelSubCalls}` —— **allow / deny / enabled 一个键都没有**。
+  ⇒ **能走通的还是同一句话：运行期有 API。** `ToolRuntime.restrict({allow, deny})`
+  要求 **agent 作用域的 ctx**（拒绝上下文全局的限制），所以要在 `agent/created` 里对
+  `agent.ctx` 调一次。**这是 C11 那条更正的第二次应验，而且比上次更远一层：**
+  上次是"wire 少了东西、插件口还在"，这次是"**连配置面都没有这个东西**，插件口依然在"。
+  ⇒ 判据升级：**先看配置面缺不缺，再看 wire 缺不缺，最后都回到 `agent/*` 的瀑布与插件加载器。**
+  副产品：被禁的工具**真的从模型视野里消失**，而这件事有盘上证据 ——
+  `request/header` 的 `header.tools` 来自加了限制之后的视图（见下面那条）。
 
 ## C8 补记：wire 方法全量清单 + 四条运行时行为（2026-09-16 实测）
 
@@ -103,6 +114,15 @@ C1/C5 都是「这条 wire 少东西」的教训。C8 之前把**方法的全量
 前两个是 C10b 就用来判「有没有重连」的；`change` 此前**从没被记下来过**，而它恰恰是判「改档位要不要重启」最直接的那个字。
 实测：同一会话第一轮 `reason=initial / reasoningEffort=max`（底本默认），13 秒后第二轮 `reason=change / reasoningEffort=low`
 —— **没重启就变了档**。（出处见 [backlog.md](backlog.md) 的 C11 ③。）
+
+**`request/header` 的 `header` 里还带 `tools`（2026-09-18，C12 补）**：就是这次请求**实际发给模型的工具表**
+（一串 `{name, description, parameters}`），`dsh-agent-loop` 的 `canonicalHeader` 写的是 `...tools.length > 0 ? { tools } : {}`，
+到真正出网那次调用时又原样传下去（`tools: header.tools`）。它来自 `dsh-tools` 的 `wireSchemas(scope)`，
+而后者读的是 `this.view(scope).visible` —— **加了限制之后的视图**。
+⇒ 「某个工具到底在不在模型视野里」**不必问模型、也不必真发一次请求**：请求一构建，答案就落盘了。
+C12 的工具白名单判据就是它（正反双控：带 profile 那轮没有 `bash`、不带 profile 那轮必须在）。
+⚠️ 元素形态是**对象**（`.name`）不是字符串 —— 断言前先归一化，认不出来要**响亮报错**，
+否则"没有 bash"会因为把表读成了空数组而假绿。
 
 **读 DSH 会话日志的坑**：`dsh-sessions/**/session.jsonl.zstd` 是**一串拼接的 zstd 帧**（每批落盘一个帧），
 而 `zstdDecompressSync` 与 `createZstdDecompress` **都只解第一帧就收工**（实测 15 帧的文件两者都只吐 1 行）。

@@ -12,6 +12,7 @@ export function activate(context: vscode.ExtensionContext) {
     context.extensionUri,
     context.globalStorageUri.fsPath, // 历史会话持久化目录（含 dsh-sessions/ 子目录）
     context.globalState, // 记住上次用的顶部模式（chat / harness）
+    context.workspaceState, // C12：本项目激活的 agent profile（**每工作区**，且不落任何用户文件）
     context.secrets // live 后端从密钥库取 DEEPSEEK_API_KEY（无则回退读 credentialsFile）
   );
   const registerChatView = vscode.window.registerWebviewViewProvider(VIEW_ID, chatProvider, {

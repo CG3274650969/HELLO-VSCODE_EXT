@@ -16,6 +16,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import type { EffortPluginMount } from './effortPlugin';
+import type { ToolPolicyMount } from './toolPolicyPlugin';
 
 /** 生成结果：三个文件的绝对路径 + 实际下发的 hook 命令（自检也用它） */
 export interface ApprovalHookFiles {
@@ -169,6 +170,8 @@ export interface DerivedConfigOptions {
   compaction?: CompactionRatios;
   /** C11：会话级推理档位插件块；undefined = 不追加（行为与没有这个功能时逐字节相同） */
   effort?: EffortPluginMount;
+  /** C12：工具白名单插件块；undefined = 不追加（同上） */
+  toolPolicy?: ToolPolicyMount;
 }
 
 export interface DerivedConfigResult {
@@ -180,6 +183,8 @@ export interface DerivedConfigResult {
   effortWarning?: string;
   /** C11：档位块**真的写进这份文件了吗**。调用方据此判断"改档位要不要重连一次" */
   effortMounted: boolean;
+  /** C12：工具白名单块没落上的原因（根不是块状序列）。同 `effortWarning`，独立一条不让两件事共用一句提示 */
+  toolPolicyWarning?: string;
 }
 
 /**
@@ -224,11 +229,20 @@ export function writeDerivedConfig(opts: DerivedConfigOptions): DerivedConfigRes
       effortWarning = '基础 cordis.yml 的根不是块状列表，推理档位块无法追加（档位功能不生效，其余一切照旧）';
     }
   }
+  // C12：工具白名单块排在档位块之后。同样是"挂不上只 warning 不 throw"那条纪律。
+  let toolPolicyWarning: string | undefined;
+  if (opts.toolPolicy) {
+    if (blockRoot) {
+      appended += toolPolicyBlock(opts.toolPolicy);
+    } else {
+      toolPolicyWarning = '基础 cordis.yml 的根不是块状列表，工具白名单块无法追加（工具开关不生效，其余一切照旧）';
+    }
+  }
   const configDir = path.join(opts.storageDir, 'dsh-config');
   fs.mkdirSync(configDir, { recursive: true });
   const cordisPath = path.join(configDir, 'cordis.yml');
   fs.writeFileSync(cordisPath, text + appended, 'utf8');
-  return { cordisPath, warning, effortWarning, effortMounted };
+  return { cordisPath, warning, effortWarning, effortMounted, toolPolicyWarning };
 }
 
 /**
@@ -634,6 +648,26 @@ function effortBlock(mount: EffortPluginMount): string {
     '  config:\n' +
     '    statePath: ' + yamlLiteral(mount.statePath) + '\n' +
     '    thinkingDisabled: ' + (mount.thinkingDisabled ? 'true' : 'false') + '\n'
+  );
+}
+
+/**
+ * C12 工具白名单块：同样只增不改，`name:` 同样是本机文件的 `file:///…` URL。
+ *
+ * 与档位块的**关键差异**：`deny` 是**写死在配置里的**，没有状态文件 —— 工具策略在
+ * agent 创建期只读一次，只在切 profile（= 重连）时变，没有"现读才热"的需求。
+ * 少一个文件、少一次读盘、少一类竞态。
+ */
+function toolPolicyBlock(mount: ToolPolicyMount): string {
+  const deny = mount.deny.map((n) => '      - ' + yamlLiteral(n) + '\n').join('');
+  return (
+    '\n' +
+    '# --- AlohaDSH 工具白名单（C12）自动追加：由扩展生成，请勿手工编辑 ---\n' +
+    '- id: hello-chat-tool-policy\n' +
+    '  name: ' + yamlLiteral(mount.pluginUrl) + '\n' +
+    '  config:\n' +
+    '    deny:\n' +
+    deny
   );
 }
 

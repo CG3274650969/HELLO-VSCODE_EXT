@@ -261,6 +261,18 @@ export type ExtToWebview =
       efforts: string[];
       /** C11：底本 `thinking: disabled` —— 那时只有 `off` 合法，其余三档界面置灰 */
       effortThinkingDisabled: boolean;
+      /** C12：本项目已激活的 profile 名；**null = 不用 profile**（同 effort，绝不能省略） */
+      profile: string | null;
+      /** C12：`.hello-chat/profile.json` 里声明了哪些 profile（名字 + 一行摘要，供菜单直接显示） */
+      profiles: { name: string; summary: string }[];
+      /** C12：当前 profile 钉住了模型 —— 模型菜单据此置灰（选它等于选了个不会生效的值） */
+      profileModelPinned: boolean;
+      /** C12：磁盘上的 profile.json 与激活时那份不一致（配置条据此提示"重新应用"） */
+      profileStale: boolean;
+      /** C12：解析 profile.json 攒下的错误条数（>0 时配置条要说出来，绝不静默） */
+      profileErrors: number;
+      /** C12：有工作区（才有 profile 文件可谈）；没有时整个菜单置灰 */
+      profileAvailable: boolean;
     }
   /** 2.1：本轮 DSH 改动审阅（一轮 done 后推送整份；新一轮开始时清空/隐藏） */
   | { type: 'review-set'; changes: ReviewChange[] }
@@ -314,6 +326,9 @@ export type WebviewToExt =
   // C11：改会话级推理档位。`null`/缺省 = 跟随配置。与 set-model 不同，**通常不重启** ——
   // 档位是插件每次请求现读的，热生效（只有本进程第一次选档位要重连一次）。
   | { type: 'set-effort'; effort: string | null }
+  // C12：切项目级 profile。`null`/缺省 = 不用 profile。**必定重连**（模型是 initialize 参数、
+  // 工具白名单块要重新生成、审批 enabled 翻的是 hook matcher）；正跑着一轮时扩展会拒绝并提示。
+  | { type: 'set-profile'; profile: string | null }
   | { type: 'configure-key' } // 点"API" → 扩展弹密码输入框写入 SecretStorage
   | { type: 'configure-dsh' } // 点"配置 DSH" → 扩展弹引导向导，写 hello.dsh.*（machine scope）
   // 2.1 改动审阅动作：id 为 ReviewChange.id（跨根唯一）；*-all 不带 id

@@ -71,6 +71,10 @@ function eq(actual, expected, what) {
  * `classList.toggle` 必须认 force 参数（`updateBusy` 用的是 `toggle('live-busy', busy)`），
  * `addEventListener` 必须**真存**（折叠那行按钮点了要能重渲染）。
  * 这三条都是被真 bug 教出来的，不是照着 MDN 抄的。
+ *
+ * `setAttribute`/`getAttribute` 必须**真存真取**（2026-09-18 补）：推理/profile 改成方块
+ * 图标钮后钮里没有文字，`aria-label` 是它**唯一**的可访问名 —— 老影子把 setAttribute 吞掉、
+ * getAttribute 恒返回 null，那这条判据就只能靠肉眼，正是本仓库最恨的那种。
  */
 class El {
   constructor(tag) {
@@ -80,6 +84,7 @@ class El {
     this.dataset = {};
     this._text = '';
     this._classes = new Set();
+    this._attrs = new Map();
     this._listeners = new Map();
     this.hidden = false;
     this.disabled = false;
@@ -148,10 +153,16 @@ class El {
   blur() {}
   select() {}
   setSelectionRange() {}
-  setAttribute(k, v) { if (k === 'class') this.className = v; else if (k === 'hidden') this.hidden = true; }
-  getAttribute() { return null; }
-  hasAttribute() { return false; }
-  removeAttribute() {}
+  setAttribute(k, v) {
+    this._attrs.set(String(k), String(v));
+    if (k === 'class') this.className = v; else if (k === 'hidden') this.hidden = true;
+  }
+  getAttribute(k) { return this._attrs.has(String(k)) ? this._attrs.get(String(k)) : null; }
+  hasAttribute(k) { return this._attrs.has(String(k)); }
+  removeAttribute(k) {
+    this._attrs.delete(String(k));
+    if (k === 'hidden') this.hidden = false;
+  }
   scrollIntoView() {}
   getBoundingClientRect() { return { width: 300, height: 20, top: 0, left: 0, bottom: 20, right: 300 }; }
   cloneNode() { return new El(this.tagName); }
@@ -599,13 +610,13 @@ const effortRow = (label) => $('live-effort-menu').children.find((r) => hasText(
 check('C11 档位：payload 的 effort 字段与渲染函数对得上（默认「跟随」）', () => {
   send({ type: 'mode-set', mode: 'harness' });
   send({ type: 'live-config', model: 'deepseek-v4-flash', models: ['deepseek-v4-flash'], apiConfigured: true, dshConfigured: true, effort: null, efforts: ['off', 'low', 'high', 'max'], effortThinkingDisabled: false });
-  eq($('live-effort-label').textContent, '推理 · 跟随配置', '默认档位文案不对（未设档位 = 跟随配置）');
+  ok(/推理档位：跟随 cordis.yml/.test($('live-effort-btn').title), `默认档位没在 title 里说出来（方块钮里没有文字，值只能在这儿）：${$('live-effort-btn').title}`);
   ok(!$('live-config-bar').hidden, '配置条没显示');
 });
 
 check('C11 档位：选中档位 → 触发钮跟着走、当前项打勾、其余不打', () => {
   send({ type: 'live-config', model: 'deepseek-v4-flash', models: ['deepseek-v4-flash'], apiConfigured: true, dshConfigured: true, effort: 'low', efforts: ['off', 'low', 'high', 'max'], effortThinkingDisabled: false });
-  eq($('live-effort-label').textContent, '推理 · low', '触发钮没跟着 effort 走');
+  ok(/推理档位：low/.test($('live-effort-btn').title), '触发钮没跟着 effort 走');
   // 菜单是关闭态也照渲 —— 打开时会重画，但内容必须已经是对的
   const rows = [['跟随配置', null], ['off · 关闭思考', 'off'], ['low', 'low'], ['high', 'high'], ['max', 'max']];
   for (const [label] of rows) ok(effortRow(label), `菜单里没有「${label}」这一项`);
@@ -643,6 +654,247 @@ check('C11 档位：底本 thinking: disabled → 三档置灰且点了不发，
   eq(posted[0] && posted[0].effort, 'off', 'disabled 下 off 该能选');
   // 触发钮的 title 也要说实话
   ok(/thinking: disabled/.test($('live-effort-btn').title), '触发钮 title 没说清当前配置的限制');
+});
+
+// ---------- C12 项目 profile 菜单（同款影子） ----------
+
+/** 菜单项按文案找（渲染函数把名字写在 `.lc-mi-name` 上，摘要另起一行 `.lc-mi-sub`） */
+const profileRow = (label) => $('live-profile-menu').children.find((r) => hasText(r, label));
+
+/** 一份完整的 live-config 载荷；C12 的六个字段都可按需覆盖 */
+const liveConfig = (over) =>
+  send(
+    Object.assign(
+      {
+        type: 'live-config',
+        model: 'deepseek-v4-flash',
+        models: ['deepseek-v4-flash'],
+        apiConfigured: true,
+        dshConfigured: true,
+        effort: null,
+        efforts: ['off', 'low', 'high', 'max'],
+        effortThinkingDisabled: false,
+        profiles: [
+          { name: '严格', summary: '模型 deepseek-reasoner · 禁 bash' },
+          { name: '省钱', summary: '模型 deepseek-chat' },
+        ],
+        profile: null,
+        profileModelPinned: false,
+        profileStale: false,
+        profileErrors: 0,
+        profileAvailable: true,
+      },
+      over
+    )
+  );
+
+check('C12 profile：payload 字段与渲染函数对得上（默认「不用 profile」），首项就是退路', () => {
+  send({ type: 'mode-set', mode: 'harness' });
+  posted.length = 0;
+  liveConfig({});
+  ok(/项目 profile：不用 profile/.test($('live-profile-btn').title), `未选 profile 时没说清（方块钮里没有文字，值只能在这儿）：${$('live-profile-btn').title}`);
+  ok(!$('live-config-bar').hidden, '配置条没显示');
+  ok(profileRow('不用 profile'), '菜单首项不是「不用 profile」');
+  ok(profileRow('严格'), '菜单里没有「严格」');
+  ok(profileRow('省钱'), '菜单里没有「省钱」');
+  // 名字顺序 == 扩展下发的顺序（文件里的声明顺序）
+  const names = $('live-profile-menu')
+    .children.map((r) => (r.children[0] ? r.children[0].textContent : ''))
+    .filter((t) => t);
+  eq(names.slice(0, 3).join(','), '不用 profile,严格,省钱', `菜单顺序不对：${names.join(',')}`);
+  // 摘要要**不点开就知道**这个 profile 要干什么
+  ok(hasText($('live-profile-menu'), '禁 bash'), 'profile 摘要行没渲染出来');
+});
+
+check('C12 profile：选中一项 → 触发钮跟着走、当前项打勾、其余不打', () => {
+  liveConfig({ profile: '严格' });
+  ok(/项目 profile：严格/.test($('live-profile-btn').title), '触发钮没跟着 profile 走');
+  const checkOf = (label) => profileRow(label).children.find((c) => c.className === 'lc-mi-check');
+  eq(checkOf('严格').hidden, false, '当前 profile 没打勾');
+  eq(checkOf('省钱').hidden, true, '非当前 profile 也打勾了');
+  eq(checkOf('不用 profile').hidden, true, '「不用 profile」不该打勾');
+});
+
+check('C12 profile：点一项 → **恰好一条** set-profile；点「不用 profile」发 null', () => {
+  posted.length = 0;
+  profileRow('省钱').click();
+  eq(posted.length, 1, '点一下菜单项该只发一条消息');
+  eq(posted[0].type, 'set-profile', `发的不是 set-profile：${posted[0].type}`);
+  eq(posted[0].profile, '省钱', 'profile 名没带上');
+  posted.length = 0;
+  profileRow('不用 profile').click();
+  eq(posted.length, 1, '「不用 profile」该发一条');
+  eq(posted[0].profile, null, '「不用 profile」该发 null（扩展据此清掉激活项）');
+});
+
+check('C12 profile：钉住模型 → 模型菜单整片置灰、**连监听器都不挂**、且不给自定义入口', () => {
+  posted.length = 0;
+  liveConfig({ profile: '严格', profileModelPinned: true, model: 'deepseek-reasoner' });
+  // 钮上照旧是**真在用的**模型名（"被钉住"改由 .pinned 的小锁 + title 说 —— 见下面「配置条三钮」那组）
+  eq($('live-model-label').textContent, 'deepseek-reasoner', '钉住时钮上该是真正在用的模型名');
+  const modelRows = $('live-model-menu').children.filter((r) => r.children[0] && /^deepseek-/.test(r.children[0].textContent));
+  ok(modelRows.length > 0, '模型菜单里一行都没有（置灰也就无从谈起）');
+  for (const r of modelRows) {
+    ok(r.classList.contains('lc-item-disabled'), `${r.children[0].textContent} 没置灰`);
+    r.click();
+  }
+  eq(posted.length, 0, '置灰的模型行竟然点出了消息 —— 灰了还能点是最坏的一种');
+  ok(!hasText($('live-model-menu'), '自定义模型'), '钉住时仍提供了「自定义模型…」入口（它同样不会生效）');
+  ok(hasText($('live-model-menu'), '由 profile「严格」固定'), '菜单里没写明是谁钉的');
+  // 触发钮的 title 必须说两件事：**它被固定了**，以及**往哪退**
+  const pinTitle = $('live-model-btn').title;
+  ok(/固定/.test(pinTitle) && /严格/.test(pinTitle), `模型钮 title 没说清是被谁固定的：${pinTitle}`);
+  ok(/不用 profile/.test(pinTitle), `模型钮 title 没给出退路（用户只会以为按钮坏了）：${pinTitle}`);
+});
+
+check('C12 profile：没钉模型时模型菜单照旧能点（上面那条不是"永远置灰"）', () => {
+  posted.length = 0;
+  liveConfig({ profile: '省钱', profileModelPinned: false, model: 'deepseek-v4-flash' });
+  const row = $('live-model-menu').children.find((r) => hasText(r, 'deepseek-v4-flash'));
+  ok(row && !row.classList.contains('lc-item-disabled'), '没钉住却把模型行置灰了');
+  ok(hasText($('live-model-menu'), '自定义模型'), '没钉住时「自定义模型…」入口不见了');
+});
+
+check('C12 profile：`profile.json 已改动` 那一行发得出去（点的就是当前项，故意不比 v !== liveProfile）', () => {
+  posted.length = 0;
+  liveConfig({ profile: '严格', profileStale: true });
+  ok(hasText($('live-profile-menu'), 'profile.json 已改动'), '改过文件却没有那一行提示');
+  const stale = $('live-profile-menu').children.find((r) => hasText(r, 'profile.json 已改动'));
+  stale.click();
+  eq(posted.length, 1, '「重新应用」那一行点了没发消息（那就是个死按钮）');
+  eq(posted[0].profile, '严格', '重新应用该发当前项');
+  // 没改过时那一行不该在
+  liveConfig({ profile: '严格', profileStale: false });
+  ok(!hasText($('live-profile-menu'), 'profile.json 已改动'), '没改过也显示"已改动"');
+});
+
+check('C12 profile：文件有问题 → 菜单里露出条数；没工作区 → 明说读不了且整个钮禁用', () => {
+  liveConfig({ profileErrors: 3 });
+  ok(hasText($('live-profile-menu'), '3 处问题'), '解析错误没在菜单里说出来');
+  liveConfig({ profileAvailable: false });
+  ok(hasText($('live-profile-menu'), '没有打开工作区'), '没有工作区时没说清为什么读不了');
+  eq($('live-profile-btn').disabled, true, '没有工作区时按钮该禁用（点了也没有 profile 可谈）');
+  liveConfig({ profileAvailable: true });
+  eq($('live-profile-btn').disabled, false, '有工作区了按钮还禁用着');
+});
+
+check('C12 profile：正有一轮在跑 → profile 钮禁用 + 菜单收起（点不到，这是第一道；扩展侧还会拒绝一次）', () => {
+  // ⚠️ 这里**不去点菜单行**：影子没有排版，`.click()` 无视 CSS 的 `display:none`，
+  //    点在真界面里根本够不着的行上，只会得到一个不存在的 bug。真正该钉的是
+  //    「忙碌时这个菜单打不开」—— 关着的菜单 display:none，用户碰不到那些行。
+  liveConfig({ profile: '严格' });
+  $('live-profile-btn').click();
+  ok($('live-profile-menu').classList.contains('open'), '前提不成立：菜单没打开（这条就是在测"开着的时候来了一轮"）');
+  send({ type: 'run-busy', busy: true });
+  eq($('live-profile-btn').disabled, true, '忙碌时 profile 钮该禁用');
+  eq($('live-profile-menu').classList.contains('open'), false, '忙碌时菜单没收起 —— 那些行就还够得着');
+  $('live-profile-btn').click(); // 禁用态的钮点了不该再打开
+  eq($('live-profile-menu').classList.contains('open'), false, '忙碌时点开了 profile 菜单');
+  send({ type: 'run-busy', busy: false });
+  eq($('live-profile-btn').disabled, false, '跑完了按钮没解禁');
+  $('live-profile-btn').click();
+  eq($('live-profile-menu').classList.contains('open'), true, '跑完了菜单打不开');
+  $('live-profile-btn').click(); // 收起来，别把开着的菜单留给后面
+});
+
+// ---------- 配置条三个下拉钮的形状（2026-09-18 两次收窄：药丸 → 裸文字 → 图标 + 值） ----------
+
+check('配置条三钮：推理/profile 是**方块图标钮**（轴与值只在 title / aria-label 里），模型名照旧看得见', () => {
+  liveConfig({ profile: null, profileModelPinned: false, model: 'deepseek-v4-flash', effort: null });
+  // 模型钮是唯一还带文案的：模型名是"我在跟谁说话"，必须一眼看见
+  eq($('live-model-label').textContent, 'deepseek-v4-flash', '模型钮文案被改了（模型名自证身份，既不加图标也不加前缀）');
+  ok(/模型/.test($('live-model-btn').title), '模型钮的 title 里没有「模型」');
+  // 两个方块钮里只有一支 <svg aria-hidden> ⇒ aria-label 是它们**唯一**的可访问名，而且必须带值：
+  // 钮里已经放不下值了，读不到值 = 这个钮什么都没说。title 管鼠标，aria-label 管屏读，两边都要有。
+  eq($('live-effort-btn').getAttribute('aria-label'), '推理档位：跟随 cordis.yml', '推理钮的可访问名不对（轴 + 当前值，缺一不可）');
+  eq($('live-profile-btn').getAttribute('aria-label'), '项目 profile：不用 profile', 'profile 钮的可访问名不对（轴 + 当前值）');
+  ok(/推理档位：跟随 cordis.yml/.test($('live-effort-btn').title), `推理钮 title 没带当前值：${$('live-effort-btn').title}`);
+  ok(/项目 profile：不用 profile/.test($('live-profile-btn').title), `profile 钮 title 没带当前 profile：${$('live-profile-btn').title}`);
+  // 值一变，两个地方都得跟着变（否则 title 会安静地停在旧档位上）
+  liveConfig({ effort: 'low', profile: '严格' });
+  eq($('live-effort-btn').getAttribute('aria-label'), '推理档位：low', '推理钮的可访问名没跟着值走');
+  eq($('live-profile-btn').getAttribute('aria-label'), '项目 profile：严格', 'profile 钮的可访问名没跟着值走');
+  ok(/推理档位：low/.test($('live-effort-btn').title), '推理钮 title 没跟着值走');
+  ok(/项目 profile：严格/.test($('live-profile-btn').title), 'profile 钮 title 没跟着值走');
+  liveConfig({ effort: null, profile: null });
+});
+
+check('配置条三钮：非默认态在角上点一个状态点（.on）—— 方块钮上唯一还看得见的"这个轴被动过"', () => {
+  liveConfig({ effort: null, profile: null });
+  eq($('live-effort-btn').classList.contains('on'), false, '默认「跟随」不该点状态点（干净的灰方块本身就是"没被动过"的读数）');
+  eq($('live-profile-btn').classList.contains('on'), false, '「不用 profile」不该点状态点');
+  liveConfig({ effort: 'max', profile: '严格' });
+  eq($('live-effort-btn').classList.contains('on'), true, '非默认档位没点状态点 —— 方块钮里值看不见，只剩这一个信号');
+  eq($('live-profile-btn').classList.contains('on'), true, '选了 profile 却没点状态点');
+  liveConfig({ effort: null, profile: null });
+  eq($('live-effort-btn').classList.contains('on'), false, '退回默认后状态点还赖着');
+  eq($('live-profile-btn').classList.contains('on'), false, '退回默认后状态点还赖着');
+});
+
+check('配置条三钮：钉住时钮上仍是**真在用的模型名** + .pinned（小锁靠这个 class 出）', () => {
+  liveConfig({ profile: '严格', profileModelPinned: true, model: 'deepseek-reasoner' });
+  eq($('live-model-label').textContent, 'deepseek-reasoner', '钉住时钮上不是真在用的模型名 —— 那条信息不该为了"说明是被钉住的"而让位');
+  eq($('live-model-btn').classList.contains('pinned'), true, '钉住时没挂 .pinned —— 箭头槽换不成小锁，钮上就一点看不出被固定了');
+  ok(/固定/.test($('live-model-btn').title) && /严格/.test($('live-model-btn').title), '钉住时 title 没说清是被哪个 profile 固定的');
+  liveConfig({ profile: null, profileModelPinned: false, model: 'deepseek-v4-flash' });
+  eq($('live-model-btn').classList.contains('pinned'), false, 'profile 撤了 .pinned 还赖着 —— 小锁会一直挂在钮上');
+});
+
+check('配置条三钮：轴图标是**两个不同的真 <svg>**（轴名撤出文案后，图标就是唯一还看得见的轴标）', () => {
+  const html = readFileSync(htmlPath, 'utf8');
+  const buttonOf = (id) => {
+    const m = new RegExp(`<button[^>]*\\bid="${id}"[\\s\\S]*?</button>`).exec(html);
+    return m ? m[0] : '';
+  };
+  const svgOf = (b) => {
+    const m = /<svg[\s\S]*?<\/svg>/.exec(b);
+    return m ? m[0] : '';
+  };
+  const effort = buttonOf('live-effort-btn');
+  const profile = buttonOf('live-profile-btn');
+  ok(effort, 'chat.html 里找不到 #live-effort-btn');
+  ok(profile, 'chat.html 里找不到 #live-profile-btn');
+  ok(svgOf(effort), '#live-effort-btn 里没有 <svg> —— 轴名已经不在文案里了，图标再没有，这个钮就是个来路不明的值');
+  ok(svgOf(profile), '#live-profile-btn 里没有 <svg> —— 同上');
+  ok(svgOf(effort) !== svgOf(profile), '两个钮用了同一个图标 —— 轴标退化成"这里有个图标而已"，还不如把轴名写回来');
+  // 图标必须跟主题走：颜色一旦写死，深/浅主题下各错一半
+  for (const [id, b] of [['live-effort-btn', effort], ['live-profile-btn', profile]]) {
+    ok(svgOf(b).includes('stroke="currentColor"'), `#${id} 的图标不是 stroke="currentColor" —— 定色的话深浅主题会各错一半`);
+  }
+});
+
+check('配置条三钮：**每一类钮只有一处定义** —— 方块钮挂 .tool-icon（同附件钮），模型钮挂 .link-button', () => {
+  // 这条盯的是"同一个观感只有一处定义"：一旦有人把 border/background/height 加回 .lc-model
+  // 或 .lc-knob，钮就会各自漂移 —— 而漂移的样子（比旁边的状态钮重一截）正是改掉的东西。
+  const html = readFileSync(htmlPath, 'utf8');
+  const classOf = (id) => {
+    for (const m of html.matchAll(/<[a-zA-Z][^>]*>/g)) {
+      if (!new RegExp(`\\bid="${id}"`).test(m[0])) continue;
+      const c = m[0].match(/\bclass="([^"]*)"/);
+      return c ? c[1].split(/\s+/) : [];
+    }
+    return undefined;
+  };
+  const model = classOf('live-model-btn');
+  ok(model, 'chat.html 里找不到 #live-model-btn');
+  ok(model.includes('link-button') && model.includes('lc-model'), `模型钮的类不对：${model.join(' ')}`);
+  for (const id of ['live-effort-btn', 'live-profile-btn']) {
+    const cls = classOf(id) || [];
+    ok(cls.includes('tool-icon'), `#${id} 没挂 .tool-icon —— 它就长不成左侧附件钮那样的方块`);
+    ok(cls.includes('lc-knob'), `#${id} 丢了 .lc-knob（菜单开着时的高亮与角上那个状态点都挂在它上面）`);
+    ok(!cls.includes('link-button'), `#${id} 同时挂了 .link-button —— 那是带 padding/文字的钮，两套外观会打架`);
+  }
+  // 反向：药丸那几件（边框/底色/固定高度）不该再回到 .lc-model 里
+  const css = readFileSync(join(repoRoot, 'media', 'chat.css'), 'utf8');
+  const block = /\.lc-model\s*\{([^}]*)\}/.exec(css);
+  ok(block, 'chat.css 里找不到 .lc-model 的规则块');
+  for (const dead of ['border:', 'background:', 'height:']) {
+    ok(!block[1].includes(dead), `.lc-model 里又出现了 \`${dead}\` —— 药丸正在长回来（外观该全部来自 .link-button）`);
+  }
+  // 角上那个点**必须绝对定位**：它一旦回到流里就吃掉 13px，这次收窄换来的宽度当场还回去
+  const dot = /\.lc-knob\.on::after\s*\{([^}]*)\}/.exec(css);
+  ok(dot, 'chat.css 里找不到 .lc-knob.on::after（角上那个状态点）');
+  ok(/position:\s*absolute/.test(dot[1]), '角上的状态点不再是绝对定位 —— 它会占掉宽度，方块钮就白改了');
 });
 
 console.log('');

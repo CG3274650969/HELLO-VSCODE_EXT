@@ -1035,29 +1035,29 @@ body.live-busy #send-btn {
   font-size: 12px;
 }
 
-/* 模型选择：自定义 DOM 触发钮 + 浮层菜单（弃用原生 <select>——其弹出列表是系统方形控件，
+/* 模型/档位/profile 的下拉触发钮 + 浮层菜单（弃用原生 <select>——其弹出列表是系统方形控件，
    无法圆角/随主题配色，这正是此前“方、白底白字”的根源）。全部样式走 DSH 令牌。 */
 .lc-model-wrap {
   position: relative; /* 菜单 absolute 的定位基准 */
 }
+/* ⚠️ 触发钮的**外观一个字都不在这里** —— HTML 上挂的是 `class="link-button lc-model"`，
+   边框/底色/hover/圆角/字号全从 .link-button 来，与旁边「配置 DSH」「API」逐字同款。
+   这里只留它独有的三件，**别再往回加 border/background/height**（那正是被去掉的药丸）：
+
+   · `flex: none` —— 工具行是 flex，不加会被压窄（标签已经在省略号兜底了）；
+   · `max-width` —— 模型名可能很长，得有个上限，长出去走 .lc-model-label 的省略号；
+   · `.open` 的高亮 —— .link-button 只在 :hover 亮，菜单开着时鼠标可能已经移开了。
+
+   （`padding` 也不覆盖：.link-button 的 `2px 10px` 让三块裸文字之间留出 20px 呼吸，
+   比原来药丸贴着药丸更清楚。） */
 .lc-model {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  max-width: 150px;
-  height: 26px;
-  padding: 0 6px 0 12px;
-  border: 1px solid var(--dsw-alias-border-l2, var(--vscode-input-border, transparent));
-  border-radius: 999px;
-  background: var(--dsw-alias-bg-layer-2, var(--vscode-input-background, rgba(128, 128, 128, 0.12)));
-  color: var(--dsw-alias-label-primary, var(--vscode-input-foreground));
-  font-family: inherit;
-  font-size: 12px;
-  cursor: pointer;
+  flex: none;
+  max-width: 200px;
 }
-.lc-model:hover:not(:disabled),
-.lc-model.open {
-  background: var(--dsw-alias-interactive-bg-hover, var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.18)));
+.lc-model.open,
+.lc-knob.open {
+  background: var(--dsw-alias-interactive-bg-hover, var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.12)));
+  color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
 }
 .lc-model:disabled {
   opacity: 0.5;
@@ -1080,6 +1080,42 @@ body.live-busy #send-btn {
 }
 .lc-model.open .lc-chev {
   transform: rotate(180deg);
+}
+/* C11/C12 的推理 / profile 钮：**方块图标钮**。外观一个字都不在这里 —— HTML 上挂的是
+   `class="tool-icon lc-knob"`，26×26 / 圆角 / hover / disabled 全从 .tool-icon 来，
+   与左侧附件钮逐字同款（同一份定义，两处不会各自漂移）。
+   这里只留它独有的两件：
+   · `position: relative` —— 角上状态点的定位基准；
+   · `.on::after` —— 非默认态（档位不是「跟随」/ 选了某个 profile）在右上角点一个小点。
+
+   ⚠️ 那个点**必须绝对定位**：这次收窄的全部所得就在宽度上，一个进流的点会吃掉 13px，
+   等于把它换来的宽度又还回去。默认态不点 —— 干净的灰方块本身就是"这个轴没被动过"的读数。
+   ⚠️ 也别在 `.tool-icon` 上写颜色：stroke=currentColor 是图标跟主题走的唯一根据。 */
+.lc-knob {
+  position: relative;
+}
+.lc-knob.on::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--dsw-alias-state-business-primary, var(--vscode-focusBorder, #3794ff));
+}
+/* C12：profile 钉住模型时，箭头槽位换小锁（.lc-model.pinned 由 chat.js 切）。
+   默认 display:none ⇒ 没钉住时它一个像素都不占，三个钮的排布与加锁前完全一致。 */
+.lc-lock {
+  display: none;
+  flex: none;
+  align-items: center;
+}
+.lc-model.pinned .lc-chev {
+  display: none;
+}
+.lc-model.pinned .lc-lock {
+  display: inline-flex;
 }
 
 /* 浮层菜单：anchored 到触发钮上方（composer 在面板底部，向下会出界），
@@ -1128,6 +1164,20 @@ body.live-busy #send-btn {
   flex: none;
   color: var(--dsw-alias-state-business-primary, var(--vscode-focusBorder, #3794ff));
   font-weight: 700;
+}
+/* C12：profile 菜单里那行摘要 —— 让人**不点开就知道**这个 profile 要干什么。
+   独占第二行（靠父级 flex-wrap + 自身 flex-basis:100%），沿用 secondary 文本色、压得比名字小。 */
+.lc-model-item.has-sub {
+  flex-wrap: wrap;
+  white-space: normal;
+  align-items: flex-start;
+}
+.lc-mi-sub {
+  flex-basis: 100%;
+  margin-top: 1px;
+  font-size: 11px;
+  line-height: 15px;
+  color: var(--dsw-alias-label-secondary, var(--vscode-dropdown-foreground, #999));
 }
 .lc-model-sep {
   height: 1px;

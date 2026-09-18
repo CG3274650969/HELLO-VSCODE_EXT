@@ -57,10 +57,12 @@
   var liveModelMenu = document.getElementById('live-model-menu'); // 浮层菜单
   var liveModelWrap = document.getElementById('live-model-wrap');
   var liveModelInput = document.getElementById('live-model-input');
-  var liveEffortBtn = document.getElementById('live-effort-btn'); // C11 推理档位触发钮
-  var liveEffortLabel = document.getElementById('live-effort-label');
+  var liveEffortBtn = document.getElementById('live-effort-btn'); // C11 推理档位触发钮（方块图标钮）
   var liveEffortMenu = document.getElementById('live-effort-menu'); // 浮层菜单
   var liveEffortWrap = document.getElementById('live-effort-wrap');
+  var liveProfileBtn = document.getElementById('live-profile-btn'); // C12 项目 profile 触发钮（方块图标钮）
+  var liveProfileMenu = document.getElementById('live-profile-menu'); // 浮层菜单
+  var liveProfileWrap = document.getElementById('live-profile-wrap');
   var liveApiBtn = document.getElementById('live-api-btn');
   var liveDshBtn = document.getElementById('live-dsh-btn');
   var liveModels = []; // 扩展下发的可选模型
@@ -69,6 +71,12 @@
   var liveEfforts = ['off', 'low', 'high', 'max']; // C11 可选档位（扩展下发的为准）
   var liveEffort = null; // C11 当前会话档位；**null = 跟随配置**（扩展为真相）
   var liveEffortThinkingOff = false; // C11 底本 thinking: disabled → 只有 off 合法
+  var liveProfiles = []; // C12 文件里声明了哪些 profile（{name, summary}）
+  var liveProfile = null; // C12 当前激活的 profile；**null = 不用 profile**（扩展为真相）
+  var liveProfileModelPinned = false; // C12 当前 profile 钉住了模型 → 模型菜单置灰
+  var liveProfileStale = false; // C12 文件改过但还没重新应用
+  var liveProfileErrors = 0; // C12 解析文件攒下的错误条数
+  var liveProfileAvailable = false; // C12 有工作区（才有 profile 文件可谈）
   var apiConfigured = false; // API key 是否已配
   var dshConfigured = false; // DSH 运行路径（nodePath && entry）是否已配
   var customModelActive = false; // 是否正显示"自定义模型"输入框
@@ -624,18 +632,21 @@
     if (!show) {
       closeModelMenu(); // 切走 harness 时收起模型菜单
       closeEffortMenu();
+      closeProfileMenu();
     }
     liveConfigBar.hidden = !show;
   }
 
-  /** 运行在途（sending/runBusy）→ 模型 / 档位 / API / DSH 配置一律禁改。 */
+  /** 运行在途（sending/runBusy）→ 模型 / 档位 / profile / API / DSH 配置一律禁改。 */
   function refreshLiveConfigEnabled() {
     var busy = sending || runBusy;
     liveModelBtn.disabled = busy;
     liveEffortBtn.disabled = busy;
+    liveProfileBtn.disabled = busy || !liveProfileAvailable; // 没有工作区就没有项目，也就没有 profile 可谈
     if (busy) {
       closeModelMenu(); // 开始运行了就把打开的菜单收起
       closeEffortMenu();
+      closeProfileMenu();
     }
     liveModelInput.disabled = busy;
     liveApiBtn.disabled = busy;
@@ -665,13 +676,26 @@
     var list = liveModels.slice();
     if (liveModel && list.indexOf(liveModel) === -1) list.unshift(liveModel);
     liveModelList = list;
-    renderModelMenu();
 
     // C11 档位：会话字段（不是全局设置），扩展为真相；null/缺省 = 跟随配置
     if (data.efforts) liveEfforts = data.efforts;
     liveEffort = typeof data.effort === 'string' ? data.effort : null;
     if (typeof data.effortThinkingDisabled === 'boolean') liveEffortThinkingOff = data.effortThinkingDisabled;
     renderEffortMenu();
+
+    // C12 profile：整个项目的一份声明。扩展为真相，null = 不用 profile。
+    if (data.profiles) liveProfiles = data.profiles;
+    liveProfile = typeof data.profile === 'string' ? data.profile : null;
+    if (typeof data.profileModelPinned === 'boolean') liveProfileModelPinned = data.profileModelPinned;
+    if (typeof data.profileStale === 'boolean') liveProfileStale = data.profileStale;
+    if (typeof data.profileErrors === 'number') liveProfileErrors = data.profileErrors;
+    if (typeof data.profileAvailable === 'boolean') liveProfileAvailable = data.profileAvailable;
+    renderProfileMenu();
+    // 钉住模型时自定义输入框也在骗人（那个值同样会被 profile 盖掉）—— 收掉它
+    if (liveProfileModelPinned && customModelActive) exitCustomModelInput(false);
+    // 模型菜单的画法取决于 profile 有没有钉住模型 —— 上面刚更新过，这里必须**重画一次**，
+    // 否则切 profile 后模型菜单会留着上一份的置灰状态（同 C10b/`_setActive` 那个 bug 的形状）。
+    renderModelMenu();
 
     refreshLiveConfigVisibility();
     refreshLiveConfigEnabled();
@@ -683,7 +707,18 @@
   /** 重建菜单内容并刷新触发钮文案。全量重画，模型数量很小可忽略。 */
   function renderModelMenu() {
     if (!liveModelLabel || !liveModelMenu) return;
-    liveModelLabel.textContent = liveModel || '选择模型';
+    // C12：profile 钉住模型时，这个菜单**不可用**且要说清为什么 —— 选它等于选一个不会生效的值。
+    // 与 C11 档位菜单置灰同一套道理：宁可明确告知，也不做"选了没反应"的静默覆盖。
+    // 钮上只剩模型名（轴名交给 title）：模型名本身就自证身份，旁边两个钮才需要图标 ——
+    // 硬给它配个"芯片"图标，等于多一个要认的符号，换不来一点辨识度。**钉住时也一样显示真名**
+    // （那才是当下真在用的模型），钉这件事由 .pinned 的小锁 + title 说，不改文案。
+    liveModelLabel.textContent = liveModel || '未选';
+    liveModelBtn.classList.toggle('pinned', liveProfileModelPinned);
+    // 触发钮的 title 也必须跟着改：chat.html 里那句「切换模型…会重启 live 子进程」在钉住时是**假话**
+    // —— 选了根本不生效（同 C11 档位菜单的「底本 thinking: disabled」那条）。
+    liveModelBtn.title = liveProfileModelPinned
+      ? '模型由当前 profile「' + liveProfile + '」固定（profile.json 里的 model 是项目声明）。想临时换模型，先把 profile 切成「不用 profile」'
+      : '切换模型（需停在运行中后生效，会重启 live 子进程）';
     liveModelMenu.textContent = '';
     for (var i = 0; i < liveModelList.length; i++) {
       (function (m) {
@@ -693,18 +728,35 @@
         var name = document.createElement('span');
         name.className = 'lc-mi-name';
         name.textContent = m;
-        name.title = m;
+        name.title = liveProfileModelPinned
+          ? '模型由当前 profile 固定；想换模型，先把 profile 切成「不用 profile」'
+          : m;
+        if (liveProfileModelPinned) row.classList.add('lc-item-disabled');
         var check = document.createElement('span');
         check.className = 'lc-mi-check';
         check.textContent = '✓';
         check.hidden = m !== liveModel; // 当前模型右侧打勾
         row.appendChild(name);
         row.appendChild(check);
-        row.addEventListener('click', function () {
-          pickModel(m);
-        });
+        // 置灰行**连监听器都不挂**（同 C11 档位菜单）—— 灰了还能点出消息是最坏的一种
+        if (!liveProfileModelPinned) {
+          row.addEventListener('click', function () {
+            pickModel(m);
+          });
+        }
         liveModelMenu.appendChild(row);
       })(liveModelList[i]);
+    }
+    if (liveProfileModelPinned) {
+      var pinSep = document.createElement('div');
+      pinSep.className = 'lc-model-sep';
+      liveModelMenu.appendChild(pinSep);
+      var pinHint = document.createElement('div');
+      pinHint.className = 'lc-model-item lc-model-custom';
+      pinHint.textContent = '由 profile「' + liveProfile + '」固定';
+      pinHint.title = 'profile 里的 model 是项目声明，优先于这里的选择器';
+      liveModelMenu.appendChild(pinHint);
+      return; // 钉住时不提供"自定义模型"入口 —— 它同样不会生效
     }
     var sep = document.createElement('div');
     sep.className = 'lc-model-sep';
@@ -775,19 +827,27 @@
     return v;
   }
 
+  /** 触发钮上的档位文案：钮上只有图标 + 值，所以这里给**短形**（跟随 / off / low…）。
+   *  菜单里仍用 effortText()——那边有地方，也要把 off 说清是"关闭思考"。 */
   /** 该档位现在能不能选：底本 thinking: disabled 时只有 off（与「跟随」）合法 —— 其余三档
    *  会让 provider 在请求期抛 UNSUPPORTED_REASONING_EFFORT，所以置灰并说明原因。 */
   function effortBlocked(v) {
     return liveEffortThinkingOff && v !== null && v !== 'off';
   }
 
-  /** 重建菜单内容并刷新触发钮文案（体例同 renderModelMenu，全量重画）。 */
+  /** 重建菜单内容并刷新触发钮（体例同 renderModelMenu，全量重画）。
+   *  钮是**方块图标钮**（.tool-icon），里面没有位置放值 —— 轴与当前值只能走
+   *  title / aria-label（看不见但读得到），以及非默认时的那个 `.on` 角点。 */
   function renderEffortMenu() {
-    if (!liveEffortLabel || !liveEffortMenu) return;
-    liveEffortLabel.textContent = '推理 · ' + effortText(liveEffort);
-    liveEffortBtn.title = liveEffortThinkingOff
-      ? '会话级推理档位：底本 llm-deepseek 是 thinking: disabled，只有 off 可用'
-      : '会话级推理档位（reasoningEffort）：默认跟随 cordis.yml；改档位下一步就生效';
+    if (!liveEffortBtn || !liveEffortMenu) return;
+    var now = liveEffort === null ? '跟随 cordis.yml' : effortText(liveEffort);
+    liveEffortBtn.title = '推理档位：' + now + '。' + (liveEffortThinkingOff
+      ? '底本 llm-deepseek 是 thinking: disabled，只有 off 可用'
+      : '会话级（reasoningEffort），改档位下一步就生效');
+    // 方块钮里只有一支 <svg aria-hidden>，没有文字 ⇒ aria-label 是它**唯一**的可访问名。
+    // 值也带上：不动鼠标的人（屏读）本来就拿不到 title。
+    liveEffortBtn.setAttribute('aria-label', '推理档位：' + now);
+    liveEffortBtn.classList.toggle('on', liveEffort !== null); // 非「跟随」才点角上的状态点
     // 档位是会话级的，但它不重启子进程 —— 与模型的提示区别就在这里
     liveEffortMenu.textContent = '';
     var items = [null].concat(liveEfforts);
@@ -850,6 +910,124 @@
     closeEffortMenu();
     if (v !== liveEffort) post({ type: 'set-effort', effort: v });
     // 触发钮文案等扩展 live-config 回执刷新（所见为准）
+  }
+
+  // ---------- C12 项目 profile 菜单（同款浮层；但它**必定重启子进程**） ----------
+
+  /** 菜单里的 profile 文案：不用 profile 时直说「不用 profile」，别让空字符串长得像加载失败。 */
+  function profileText(v) {
+    return v === null ? '不用 profile' : v;
+  }
+
+  /** 菜单顶部那一行"刚改过文件"的提示（只在真的改过时出现）。 */
+  function appendProfileStaleRow() {
+    if (!liveProfileStale) return;
+    var sep = document.createElement('div');
+    sep.className = 'lc-model-sep';
+    liveProfileMenu.appendChild(sep);
+    var row = document.createElement('div');
+    row.className = 'lc-model-item lc-model-custom';
+    row.textContent = 'profile.json 已改动 · 点这里重新应用';
+    row.title = '磁盘上的 .hello-chat/profile.json 与当前生效的那份不一致。运行期用的是激活时的那一份，所以改文件不会自动生效。';
+    // 这一行是可点的：点它 = 重新读文件并重新激活当前项（没激活过就只是重读）
+    row.addEventListener('click', function () {
+      pickProfile(liveProfile);
+    });
+    liveProfileMenu.appendChild(row);
+  }
+
+  /** 重建菜单内容并刷新触发钮文案（体例同 renderEffortMenu，全量重画）。 */
+  function renderProfileMenu() {
+    if (!liveProfileBtn || !liveProfileMenu) return;
+    // 同推理钮：方块图标钮里放不下值，轴与当前 profile 名走 title / aria-label，
+    // 非「不用」时角上点状态点。
+    var now = liveProfile === null ? '不用 profile' : liveProfile;
+    liveProfileBtn.title = '项目 profile：' + now + '。' + (liveProfileModelPinned
+      ? '当前 profile 钉住了模型与审批策略，切换会重启 live 子进程'
+      : '一键切换模型 / 审批策略 / 工具白名单，切换会重启 live 子进程');
+    liveProfileBtn.setAttribute('aria-label', '项目 profile：' + now);
+    liveProfileBtn.classList.toggle('on', liveProfile !== null);
+    liveProfileMenu.textContent = '';
+    if (!liveProfileAvailable) {
+      var noWs = document.createElement('div');
+      noWs.className = 'lc-model-item lc-model-custom';
+      noWs.textContent = '没有打开工作区，无法读取 profile';
+      noWs.title = 'profile 文件放在工作区根的 .hello-chat/profile.json；没有工作区时这个功能整体不适用。';
+      liveProfileMenu.appendChild(noWs);
+      return;
+    }
+    // 首项固定是「不用 profile」（同档位菜单的 [null, ...] 体例）—— 它是**退路**，
+    // 永远排第一，任何 profile 出问题时用户都知道往哪退。
+    var items = [null].concat(liveProfiles.map(function (p) { return p.name; }));
+    var summaryOf = {};
+    for (var k = 0; k < liveProfiles.length; k++) summaryOf[liveProfiles[k].name] = liveProfiles[k].summary;
+    for (var i = 0; i < items.length; i++) {
+      (function (v) {
+        var row = document.createElement('div');
+        row.className = 'lc-model-item';
+        row.setAttribute('role', 'menuitem');
+        var name = document.createElement('span');
+        name.className = 'lc-mi-name';
+        name.textContent = profileText(v);
+        var hint = v === null ? '完全跟随你的设置（不读 profile 文件）' : (summaryOf[v] || '（未做任何覆盖）');
+        name.title = hint;
+        var check = document.createElement('span');
+        check.className = 'lc-mi-check';
+        check.textContent = '✓';
+        check.hidden = v !== liveProfile; // 当前项右侧打勾
+        row.appendChild(name);
+        row.appendChild(check);
+        // 摘要行单独一行显示 —— 让人**不点开就知道**这个 profile 要干什么
+        if (hint) {
+          row.classList.add('has-sub');
+          var sub = document.createElement('span');
+          sub.className = 'lc-mi-sub';
+          sub.textContent = hint;
+          row.appendChild(sub);
+        }
+        row.addEventListener('click', function () {
+          pickProfile(v);
+        });
+        liveProfileMenu.appendChild(row);
+      })(items[i]);
+    }
+    appendProfileStaleRow();
+    if (liveProfileErrors > 0) {
+      var sep2 = document.createElement('div');
+      sep2.className = 'lc-model-sep';
+      liveProfileMenu.appendChild(sep2);
+      var errRow = document.createElement('div');
+      errRow.className = 'lc-model-item lc-model-custom';
+      errRow.textContent = 'profile.json 有 ' + liveProfileErrors + ' 处问题（已忽略，详见通知）';
+      errRow.title = '文件里认不出来的部分已被逐条忽略，并弹过一次通知说明。好的部分照常生效。';
+      liveProfileMenu.appendChild(errRow);
+    }
+  }
+
+  function toggleProfileMenu() {
+    if (liveProfileBtn.disabled) return;
+    if (liveProfileMenu.classList.contains('open')) {
+      closeProfileMenu();
+      return;
+    }
+    closeModelMenu();
+    closeEffortMenu();
+    renderProfileMenu(); // 打开前重画，勾到当前项
+    liveProfileMenu.classList.add('open');
+    liveProfileBtn.classList.add('open');
+  }
+
+  function closeProfileMenu() {
+    liveProfileMenu.classList.remove('open');
+    liveProfileBtn.classList.remove('open');
+  }
+
+  /** 选一个 profile（null = 不用 profile）。busy 由 disabled 兜住；点的就是当前项 → 只收起。 */
+  function pickProfile(v) {
+    closeProfileMenu();
+    // 注意这里**不比 v !== liveProfile**：`profile.json 已改动` 那一行点的就是当前项，
+    // 它的语义是"重新读一遍并按现在的内容重新激活"，必须发得出去。
+    post({ type: 'set-profile', profile: v });
   }
 
   /**
@@ -2209,10 +2387,15 @@
     liveEffortBtn.addEventListener('click', function () {
       toggleEffortMenu();
     });
+    // C12 项目 profile：同款触发钮 + 浮层菜单
+    liveProfileBtn.addEventListener('click', function () {
+      toggleProfileMenu();
+    });
     document.addEventListener('click', function (e) {
-      // 两个菜单各自判断"点在外面"：一个处理函数里连判两次，比注册两条互不知情的监听器稳
+      // 三个菜单各自判断"点在外面"：一个处理函数里连判三次，比注册三条互不知情的监听器稳
       if (liveModelMenu.classList.contains('open') && !liveModelWrap.contains(e.target)) closeModelMenu();
       if (liveEffortMenu.classList.contains('open') && !liveEffortWrap.contains(e.target)) closeEffortMenu();
+      if (liveProfileMenu.classList.contains('open') && !liveProfileWrap.contains(e.target)) closeProfileMenu();
     });
     liveModelInput.addEventListener('keydown', function (e) {
       if (e.key === 'Enter') {
