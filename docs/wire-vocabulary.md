@@ -44,14 +44,22 @@ client session 有 `PendingWait('approval')`）。但当前部署配置下工具
 `cwd / provider / model / maxTokens`，其余静默忽略。要调 effort 只能改
 `cordis.yml` 里 `llm-deepseek`（当前写死 `reasoningEffort: max`）后重启运行时。
 
+> ⚠️ **补记（2026-09-18，C11）**：上面这段只说对了"**wire** 下发不了"，**别读成"做不到"**。
+> provider 本来就按请求解析档位（`dsh-llm-deepseek` 的 `resolveThinking(options, defaults)`），
+> 而 `dsh-agent-loop` 每步都跑 `dispatch.waterfall("agent/request", …)` 且**它的返回值就是这次
+> 请求的 config** ⇒ 在派生 `cordis.yml` 里挂一个我们自己的插件就能按会话覆盖，**热生效、不重启**。
+> 详见 [backlog.md](backlog.md) 的 C11（含四条源码坐标与两条实测证据）。**wire 依然是死的，这条路不是。**
+
 ## 对扩展功能设计的含义
 
 - **2.1 diff 审阅 + Keep/Revert**：扩展侧做（live 轮开始 git 快照 → 收尾 diff）。
   没有「官方 file 事件」可等。
 - **审批（2.x）**：扩展侧自造（破坏性工具命令预审 / 确认条）。运行时当前不给任何
   wire 级审批入口；除非先在 DSH 配置层启用审批策略再另行评估。
-- **3.1 Shield 的 reasoningEffort 菜单**：不是高优先 —— 这条 wire 下发不了，
-  改配置重启才有意义。
+- **3.1 Shield 的 reasoningEffort 菜单**：~~不是高优先 —— 这条 wire 下发不了，
+  改配置重启才有意义。~~ **已实现（C11，2026-09-18）**：wire 仍下发不了，但改走
+  「派生配置里挂我们自己的插件，按会话覆盖 `agent/request` 的返回值」⇒ 会话级菜单 +
+  热生效（不重启）。见上面第 4 条的补记。
 
 ## C8 补记：wire 方法全量清单 + 四条运行时行为（2026-09-16 实测）
 
@@ -89,6 +97,12 @@ C1/C5 都是「这条 wire 少东西」的教训。C8 之前把**方法的全量
   ⇒ `stdin.end()` 与 `child.kill()` 放在**同一 tick** 等于扔掉那批必然还在内存里的事件。
   实测：空闲进程 `stdin.end()` 后 **~25 ms** 就 `exit(0)`（3/3 轮），所以「先优雅、2 s 后硬杀」是划算的。
   ⚠️ 但**优雅停止只争取一次 flush，不是事务**：超时后仍是硬杀，那 ≤200 ms 的窗口只是变小、没消失。
+
+**`request/header` 的 `reason` 有三个取值（2026-09-18，C11 的 F5 实测补）**：`initial`（进程/会话的第一次请求）、
+`resume`（重连后接着跑）、**`change`（同一条连接内 config 变了 —— 就是"热切"的痕迹）**。
+前两个是 C10b 就用来判「有没有重连」的；`change` 此前**从没被记下来过**，而它恰恰是判「改档位要不要重启」最直接的那个字。
+实测：同一会话第一轮 `reason=initial / reasoningEffort=max`（底本默认），13 秒后第二轮 `reason=change / reasoningEffort=low`
+—— **没重启就变了档**。（出处见 [backlog.md](backlog.md) 的 C11 ③。）
 
 **读 DSH 会话日志的坑**：`dsh-sessions/**/session.jsonl.zstd` 是**一串拼接的 zstd 帧**（每批落盘一个帧），
 而 `zstdDecompressSync` 与 `createZstdDecompress` **都只解第一帧就收工**（实测 15 帧的文件两者都只吐 1 行）。

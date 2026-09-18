@@ -87,6 +87,11 @@ export function runTurn({
   apiKey,
   bootTimeoutMs = BOOT_TIMEOUT_MS,
   turnTimeoutMs = TURN_TIMEOUT_MS,
+  /** 追加/覆盖的环境变量，**最后展开**（同一个键以这里为准）。
+   *  给 probe-derived-config-boot.mjs 用：它要复现扩展那个「位置参数给底本、派生文件只走
+   *  `DSH_CORDIS_CONFIG`」的形状 —— 不放开这个口子的话，那个探针就只能两个都指派生文件，
+   *  于是"env 到底赢没赢"永远验不出来（那正是它唯一要问的事）。 */
+  env: envOverrides,
 }) {
   return new Promise((resolvePromise) => {
     const frames = [];
@@ -104,6 +109,7 @@ export function runTurn({
         DSH_CWD: cwd,
         DSH_SESSION_ROOT: sessionRoot,
         ...(apiKey ? { DEEPSEEK_API_KEY: apiKey } : {}),
+        ...(envOverrides && typeof envOverrides === 'object' ? envOverrides : {}),
       },
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,

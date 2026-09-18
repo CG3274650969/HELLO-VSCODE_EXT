@@ -760,6 +760,21 @@ body.vscode-high-contrast .brand-mark {
   font-variant-numeric: tabular-nums;
 }
 
+/* C10：上下文接近 DSH 的压缩阈值。**只换配色、不动尺寸** —— 条的高度一变，
+   composer 整块会跳，而这条会在流式刷新里反复进出这个状态（阈值附近来回摆动时）。
+   配色沿用别处的警示色 triad，别自创。 */
+.usage-bar.near {
+  border-color: var(--dsw-alias-state-warning-primary, var(--vscode-editorWarning-foreground, #d29922));
+  background: color-mix(
+    in srgb,
+    var(--dsw-alias-state-warning-primary, var(--vscode-editorWarning-foreground, #d29922)) 10%,
+    transparent
+  );
+}
+.usage-bar.near .usage-summary {
+  color: var(--dsw-alias-state-warning-primary, var(--vscode-editorWarning-foreground, #d29922));
+}
+
 /* 通用附件 chip：待发送可移除 / 气泡里只读 */
 .chip {
   display: inline-flex;
@@ -1122,6 +1137,15 @@ body.live-busy #send-btn {
 .lc-model-custom {
   color: var(--dsw-alias-label-secondary, var(--vscode-dropdown-foreground, #999));
 }
+/* C11：底本 thinking: disabled 时不可选的档位（点了会被 provider 在请求期拒掉）。
+   置灰 + 去掉指针，但**不隐藏** —— 让用户看见"有这几档、只是当前配置下不行"。 */
+.lc-item-disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.lc-item-disabled:hover {
+  background: none;
+}
 /* 自定义模型输入：临时出现，低调小字段（定宽，避免把卡片底行撑开） */
 .lc-input {
   flex: none;
@@ -1192,6 +1216,31 @@ body.live-busy #send-btn {
 }
 .msg-note::after {
   content: ' —';
+}
+
+/* C10 转写折叠行：把「更早的 N 条」压成顶部一行。
+   视觉上刻意比 msg-note 更轻（它是排版产物，不是对话内容），但要**可点** —— 所以不是纯文字，
+   而是一个带虚线边的按钮。整行居中、不参与气泡的左右对齐。 */
+.msg-fold {
+  align-self: center;
+  max-width: 100%;
+  display: flex;
+  justify-content: center;
+}
+.msg-fold-btn {
+  border: 1px dashed var(--dsw-alias-border-l2, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.35)));
+  border-radius: 10px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.5;
+  padding: 2px 10px;
+  cursor: pointer;
+}
+.msg-fold-btn:hover {
+  color: var(--vscode-foreground, #ccc);
+  border-color: var(--vscode-focusBorder, #007fd4);
 }
 
 /* ---------- 真 DSH 对话组件的宿主区（harness + DSH 直播） ---------- */

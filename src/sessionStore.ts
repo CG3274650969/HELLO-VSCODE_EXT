@@ -16,6 +16,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { randomBytes, randomUUID } from 'crypto';
 import { ChatMessage, UsageBuckets } from './protocol';
+// C11：档位取值。同样只取类型 —— effortPlugin 那边没有 import vscode，也不会反向依赖本文件。
+import type { ReasoningEffort } from './effortPlugin';
 // 只取类型：编译后不留 require，与 turnState.ts 的 `import type { StoredSession }` 相抵，
 // 运行时没有环。C8 的「继续」按钮判据就靠这个字段（见 turnState.ts）。
 import type { LastTurn } from './turnState';
@@ -49,6 +51,34 @@ export interface StoredSession {
    *
    *  用户一发新消息就清掉；所以按钮的失效不需要额外逻辑。旧数据没有本字段 → 向后兼容。 */
   lastTurn?: LastTurn;
+  /** C10：**最后一次已知的上下文占用**，轮尾写入。
+   *
+   *  为什么非落盘不可：占用读数本来只活在内存里（`_turnUsage` / `_contextWindow`），
+   *  重载窗口或切回一个旧会话时它是空的 —— 而占用恰恰是这条指示唯一要说的东西。
+   *  它是**上次已知值**不是实时值，读出来会标 `stale`（渲染成「上次」），不冒充实时。
+   *  旧数据没有本字段 → 向后兼容。 */
+  context?: { usedTokens: number; contextWindow: number; at: number };
+  /** C10b：**本会话见过的上下文窗口（分母）**。窗口是 (provider, model) 的属性，记下来
+   *  就等于永远知道；而 DSH 只在路由**变化**时才发 `request/context`，续聊时一条都不发
+   *  （理由见 contextWindow.ts 的 resolveContextWindow）—— 于是这份记忆是续聊时唯一的分母。
+   *
+   *  ⚠️ 与上面 `context` 的区别：`context` 是**一次读数**（分子 + 分母 + 时间，会 stale），
+   *  本字段只是**分母**，不随时间失效。旧数据没有本字段 → 向后兼容（那些会话要把本条读数
+   *  空着，直到路由真的变一次）。 */
+  contextWindow?: number;
+  /** C10：本会话被 DSH 压缩过几次（累计）。只用来在读数条上写「· 已压缩 N 次」——
+   *  「发生过压缩」这件事的**正文说明**是转写里那条 note（见 compactionNotice.ts）。
+   *  旧数据没有本字段 → 向后兼容。 */
+  compacted?: number;
+  /** C11：**会话级推理档位**（`off|low|high|max`）。
+   *
+   *  ⚠️ 语义是「**未设 = 跟随配置**」，不是「默认 low」—— 未设时我们不覆盖任何东西，
+   *  DSH 用它自己 `cordis.yml` 里那个值（当前底本是 `max`）。
+   *
+   *  它是**扩展侧行为**不是 DSH 会话属性：档位是我们在请求构建期覆盖的 config，
+   *  DSH 只记下"这次请求用了什么"。换个不带我们这个插件的运行时跑同一个会话，档位就没了。
+   *  旧数据没有本字段 → 向后兼容（= 跟随配置）。 */
+  reasoningEffort?: ReasoningEffort;
 }
 
 /** 由首条用户消息生成一句话标题（单行、截断）。 */

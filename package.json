@@ -200,6 +200,14 @@
             "maximum": 3650,
             "markdownDescription": "**回收站留存（天）**：回收站页会出现一个「清理 N 个过期会话」按钮，把**回收站里**删除时间早于 N 天的会话，连同它们在磁盘上的 DSH 记忆日志一起**彻底删除**（不可撤销；日志仍被分支引用的会保留）。**`0` = 关闭**（默认），按钮不出现。**没有任何自动清理** —— 不点就一直留着。\n\n两个要点。**只清回收站**：从没被删过的在列会话，哪怕很久没动也不入选（按钮的确认框会额外告诉你有多少条属于这种情况，本次不动）。**计时按删除那一刻算**，不是最后修改时间。\n\n**单窗口使用**：存储按 VS Code profile 共享，多个窗口各持一份内存里的会话列表 —— A 窗口删掉的条目，可能被 B 窗口的下一次保存**推回磁盘**（而它的 DSH 日志已经不在了）。\n\n**Trash retention (days)**: shows a *purge expired* button on the trash tab that permanently deletes trashed sessions whose deletion is older than N days, together with their on-disk DSH memory logs (irreversible; a log still referenced by a fork is kept). **`0` = off** (default). Nothing is ever purged automatically. Only trashed sessions are eligible — live ones are reported but never touched — and the clock runs from the deletion time, not the last edit. Intended for single-window use.",
             "scope": "window"
+          },
+          "hello.chat.compaction.thresholdRatio": {
+            "type": "number",
+            "default": 0.8,
+            "minimum": 0.001,
+            "maximum": 1,
+            "markdownDescription": "**DSH 压缩阈值**（占上下文窗口的比例，**默认 0.8 = DSH 原值**）。超过这条线时，DSH 会把一段旧事件**摘要压缩**成一个检查点，之后模型看到的是摘要而不是原文。\n\n**这是 DSH 那一侧的线，不是本扩展的** —— 本扩展只是把它的配置改写一份（派生配置写在扩展存储目录，不动你的 cordis.yml）。默认的 0.8 在 1M 窗口下等于 80 万 token，日常用法基本碰不到：**想让它真的发生就得往下调**。压缩**有损且不可撤销**，调低前请想清楚（每次触发时转写里会留一条说明，读数条上也会写「已压缩 N 次」）。\n\n`retainRatio` 会按阈值的 0.2 倍自动同步（这是 DSH 的硬约束：保留量必须小于阈值，否则插件加载失败），**不要也不能单独设**。范围 `(0, 1]`。\n\n改完**需重连**才生效（cordis 的插件配置只在启动时读一次）。若你的基础 cordis.yml 里没有 `compaction-basic` 这一块（比如自己精简过），设置不会生效 —— 控制台与弹窗会明确告诉你，而不是静默失效。\n\n**Context compaction threshold** (fraction of the context window; **default 0.8 = DSH's own value**). Above this line DSH summarises a span of older events into a checkpoint, and the model sees the summary instead of the original. This is **DSH's** threshold, not this extension's — we only rewrite a copy of its config. At the default 0.8 with a 1M window that is 800K tokens, so it essentially never fires in normal use; **lower it to make compaction actually happen**. Compaction is lossy and irreversible. `retainRatio` is derived automatically as 0.2× the threshold (a DSH constraint), and is not separately configurable. Reconnect after changing.",
+            "scope": "window"
           }
         }
       }

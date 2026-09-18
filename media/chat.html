@@ -164,6 +164,16 @@
             </button>
             <div id="live-model-menu" class="lc-model-menu" role="menu" aria-label="模型列表"></div>
           </div>
+          <!-- C11 推理档位：与模型选择器同款浮层菜单（复用 .lc-model-* 类）。
+               与模型不同的是它**按会话**记、且通常热生效（不重启子进程）。 -->
+          <div id="live-effort-wrap" class="lc-model-wrap">
+            <button id="live-effort-btn" class="lc-model" type="button"
+                    title="会话级推理档位（reasoningEffort）：默认跟随 cordis.yml；改档位下一步就生效">
+              <span id="live-effort-label" class="lc-model-label">推理 · 跟随</span>
+              <span class="lc-chev" aria-hidden="true"></span>
+            </button>
+            <div id="live-effort-menu" class="lc-model-menu" role="menu" aria-label="推理档位"></div>
+          </div>
           <input id="live-model-input" class="lc-input" type="text" spellcheck="false" maxlength="120"
                  hidden placeholder="输入模型 id，回车应用">
           <button id="live-dsh-btn" class="link-button lc-dsh" type="button"
