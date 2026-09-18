@@ -159,8 +159,30 @@ export interface UsageReadout {
   turn: UsageBuckets;
   /** 本会话累计（跨轮、跨重开：随会话一起落盘） */
   session: UsageBuckets;
+  /** C10：本会话被 DSH 压缩过几次。0 或缺省 = 没压过（条上就不显示这一段）。
+   *  「发生过压缩」的正文说明是转写里那条 note；这里只是个持久的提醒 —— note 会滚走。 */
+  compacted?: number;
   /** 上下文占用：拿不到上限或缺压力样本时整体缺省 */
-  context?: { usedTokens: number; contextWindow: number };
+  context?: {
+    usedTokens: number;
+    contextWindow: number;
+    /**
+     * C10：是否已接近 DSH 的压缩阈值。**判据在扩展侧算**（同 `runLine` 的分工，webview 只排版）。
+     *
+     * ⚠️ 口径必须诚实：这里的分子是 **provider 上报的 prompt 侧压力**，而 DSH 决定要不要压缩用的是
+     * `token-meter` 的启发式估算（`CHARS_PER_TOKEN = 4`，还含输出）—— **两个不是同一个数**。
+     * 所以界面只能说「接近」，绝不能说「距离压缩线还有 X」。
+     */
+    state?: 'ok' | 'near';
+    /**
+     * C10：这份读数**不是**本轮的实时值，而是上次落盘样本的回落。
+     *
+     * 上下文占用本来只活在内存里（`_turnUsage` / `_contextWindow`），于是"打开一个旧会话"
+     * 时那条指示永远是空的 —— 而占用恰恰是这条读数唯一要说的东西。所以轮尾把最后一个样本
+     * 存进会话，缺活值时拿出来用，并标上这个标志（渲染成「上次」，不冒充实时）。
+     */
+    stale?: boolean;
+  };
 }
 
 /**

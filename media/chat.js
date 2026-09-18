@@ -913,23 +913,46 @@
       );
     }
     var ctx = u.context;
+    var near = !!(ctx && ctx.state === 'near');
     if (ctx && ctx.contextWindow > 0) {
       var seg2 = '上下文 ' + fmtTokens(ctx.usedTokens) + ' / ' + fmtTokens(ctx.contextWindow);
       var pct = fmtPercent(ctx.usedTokens, ctx.contextWindow);
       if (pct !== null && pct >= 1) seg2 += '（' + pct + '%）';
+      // C10：这两个后缀**并列**，不是 else if —— 「上次」说的是这份读数有多旧，
+      // 「接近压缩阈值」说的是它的量级，两者可以同时成立（旧会话 + 已接近上限）。
+      if (ctx.stale) seg2 += ' · 上次';
+      if (near) seg2 += ' · ⚠ 接近压缩阈值';
       parts.push(seg2);
     }
+    if (u.compacted > 0) parts.push('已压缩 ' + u.compacted + ' 次');
     if (!parts.length) {
       usageBar.hidden = true;
       usageSummary.textContent = '';
       usageSummary.title = '';
+      usageBar.classList.remove('near');
       return;
     }
     var line = parts.join(' · ');
     // title 给全量（含被 ellipsis 截掉的中段）+ 口径说明：读数条窄，侧栏一窄就截。
-    usageSummary.title =
+    var title =
       line + '\n↑ 计费输入（未命中 + 缓存读）· ↓ 输出（含 reasoning）· 缓存 = 缓存读占输入比';
+    if (ctx && ctx.stale) {
+      title += '\n「上次」= 这份占用不是本轮的实时值，而是上一次跑完时留下的样本。';
+    }
+    if (near) {
+      // 口径必须诚实：我们的分子与 DSH 的判据不是同一个数（详见 src/protocol.ts 的 UsageReadout）。
+      // 所以这里只说「接近」，**不说**「距离压缩线还有 X」。
+      title +=
+        '\n⚠ 上下文已接近 DSH 的压缩阈值：再往上，DSH 可能把一段旧事件折叠成摘要' +
+        '（有损、不可撤销；真发生时转写里会留一条说明）。\n' +
+        '注意：这里的占用率按 provider 上报的输入算，DSH 的压缩判据是它自己的估算，两者不是同一个数。';
+    }
+    usageSummary.title = title;
     usageSummary.textContent = line;
+    // 用 add/remove 而不是 classList.toggle(cls, force) —— 后者在 DOM 影子里要额外支持 force 参数，
+    // 而这行代码没有任何理由依赖那个细节。
+    if (near) usageBar.classList.add('near');
+    else usageBar.classList.remove('near');
     usageBar.hidden = false;
   }
 
@@ -1794,20 +1817,67 @@
     }
   }
 
-  /** 只清掉消息气泡，保留 #messages 里的空状态提示元素。 */
+  /** 只清掉消息气泡（与折叠行），保留 #messages 里的空状态提示元素。 */
   function removeAllMessages() {
     var children = Array.prototype.slice.call(messagesEl.children);
     for (var k = 0; k < children.length; k++) {
-      if (children[k].classList.contains('msg')) {
+      if (children[k].classList.contains('msg') || children[k].classList.contains('msg-fold')) {
         children[k].remove();
       }
     }
   }
 
+  /**
+   * C10 转写折叠：只渲染**尾部** `FOLD_KEEP` 条，前面插一行「更早的 N 条已折叠」。
+   *
+   * 治的是「越跑越重」：`renderSnapshot` 是「清空 + 全量重建 DOM」，几百条消息的会话每来一帧
+   * 就整批重建一遍，而这个函数在流式刷新里被反复调用。折掉头部之后，重建量不再随会话长度增长。
+   *
+   * ⚠️ **它只省 DOM，别的什么都不省** —— 这句必须留着，否则下一个人会以为折叠 = 归档：
+   *   · 消息一条没丢，还在扩展侧的 `_active.messages` 里（这里只是不给它们建 DOM）；
+   *   · `snapshot` 下发的 payload **一个字节都没少**（扩展照旧发全量）；
+   *   · 更不省 DSH 的上下文占用 —— 那由 DSH 自己管，要那个去看 `hello.chat.compaction.thresholdRatio`。
+   * 也就是说：**它不影响任何"记忆"，纯排版**。
+   */
+  var FOLD_KEEP = 60;
+  /** 用户点过「显示」。**会话级**状态：换会话复位（见 snapshot 分支）。 */
+  var foldExpanded = false;
+  /**
+   * 最近一次快照的消息（点「显示」时拿它整帧重渲染）。
+   *
+   * ⚠️ **别把它与上面那个 `lastSnapshotMessages`（react-live 的回放前缀）合并或重名** ——
+   * 两者装的内容确实一样（都是最近一幅快照），但语义与初值都不同：那个初值是 `null`
+   * （React 挂载早于任何快照时要靠它跳过回放），这个是数组。同名的话 `var` 会提升成同一个变量，
+   * 于是 `maybeBridgeReplay` 会在该跳过的时候拿到一个空数组照发一遍。
+   */
+  var foldSource = [];
+
+  function buildFoldRow(n) {
+    var row = document.createElement('div');
+    row.className = 'msg-fold';
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'msg-fold-btn';
+    btn.textContent = '更早的 ' + n + ' 条已折叠（仅界面，DSH 记忆未变）· 显示';
+    btn.title =
+      '折叠只影响这一屏的渲染量。消息一条没丢，DSH 那边的记忆也没有被改动 —— ' +
+      '真正的上下文压缩是 DSH 按它自己的阈值做的，与这里无关。';
+    btn.addEventListener('click', function () {
+      foldExpanded = true;
+      renderSnapshot(foldSource);
+    });
+    row.appendChild(btn);
+    return row;
+  }
+
   function renderSnapshot(messages) {
     byId.clear();
     removeAllMessages();
-    for (var i = 0; i < messages.length; i++) {
+    foldSource = messages;
+    // 折的是**头部**：尾部是正在生长的对话，滚动位置与流式气泡都在那一头。
+    var head = !foldExpanded && messages.length > FOLD_KEEP ? messages.length - FOLD_KEEP : 0;
+    if (head > 0) messagesEl.appendChild(buildFoldRow(head));
+    for (var i = head; i < messages.length; i++) {
       addMessage(messages[i]);
     }
     toggleEmptyHint();
@@ -2260,6 +2330,9 @@
 
       case 'snapshot':
         sending = false; // 视图重建/切换会话时复位在途发送标记
+        // C10：折叠状态是**会话级**的 —— 换会话就复位，否则「上一条长对话点开的显示」
+        // 会把下一条的头部也整批渲染出来，而折叠本来就是为了省掉那一批。
+        if ((data.sessionId || null) !== activeId) foldExpanded = false;
         activeId = data.sessionId || null;
         if (!titleEditing) {
           currentTitle = data.sessionTitle || '';

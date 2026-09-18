@@ -772,11 +772,11 @@ check('★ 最新一份抓帧：RunInspector 与直算式 oracle 全等', () => 
 console.log('\n· 真实 DSH 会话日志（zstd）：补平帧不许被算成我们的 bug');
 
 /**
- * 找最新的 `session.jsonl.zstd`。**不硬编码机器路径** —— 从 globalStorage 根往下走，
- * 也允许 `HELLO_DSH_SESSIONS_DIR` 覆盖（别的机器 / CI 上跑就有路子）。
+ * 列出所有 `session.jsonl.zstd`（旧 → 新）。**不硬编码机器路径** —— 从 globalStorage 根往下走，
+ * 也允许 `HELLO_DSH_SESSIONS_DIR` 追加一个根（别的机器 / CI 上跑就有路子）。
  * logs/ 与 globalStorage 都不在仓库里，缺了要**响亮地跳过**，别把通过当成验过了。
  */
-function findLatestSessionLog() {
+function findSessionLogs() {
   const override = process.env.HELLO_DSH_SESSIONS_DIR;
   const roots = [];
   if (override) roots.push(override);
@@ -807,7 +807,7 @@ function findLatestSessionLog() {
   };
   for (const r of roots) walk(r, 0);
   found.sort((a, b) => a.m - b.m);
-  return found.length ? found[found.length - 1].p : undefined;
+  return found.map((x) => x.p);
 }
 
 /**
@@ -842,13 +842,9 @@ function readZstdFrames(file) {
   return text.join('');
 }
 
-check('★★ 真日志回放：补平帧既不许算成 unmatched，也不许被静默吞掉', () => {
-  const log = findLatestSessionLog();
-  if (!log) {
-    console.log('    ⚠ 跳过：本机没有 DSH 会话日志（设 HELLO_DSH_SESSIONS_DIR 可指定），别把这次通过当成验过了');
-    return 'skipped';
-  }
-  const events = readZstdFrames(log)
+/** 把一份 zstd 会话日志解成事件数组（解不动的行丢掉，不抛）。 */
+function readSessionEvents(log) {
+  return readZstdFrames(log)
     .split('\n')
     .filter(Boolean)
     .flatMap((l) => {
@@ -858,23 +854,59 @@ check('★★ 真日志回放：补平帧既不许算成 unmatched，也不许�
         return [];
       }
     });
+}
+
+/**
+ * oracle：独立地按**帧面特征**数补平帧（不调 isRepairResult，免得拿被测对象给自己作证）。
+ * 也用来挑样本 —— 见下方 check 里的注释。
+ */
+function countRepairFrames(events) {
+  let n = 0;
+  for (const ev of events) {
+    if (ev.type !== 'tool/result') continue;
+    const d = ev.data ?? {};
+    const idOk = typeof d.message?.id === 'string' && d.message.id.startsWith('interrupted-tool-result-');
+    const codeOk = d.error?.code === 'TOOL_NOT_STARTED';
+    if (idOk || codeOk) n += 1;
+  }
+  return n;
+}
+
+check('★★ 真日志回放：补平帧既不许算成 unmatched，也不许被静默吞掉', () => {
+  const logs = findSessionLogs();
+  if (!logs.length) {
+    console.log('    ⚠ 跳过：本机没有 DSH 会话日志（设 HELLO_DSH_SESSIONS_DIR 可指定），别把这次通过当成验过了');
+    return 'skipped';
+  }
+
+  // ⚠️ 样本要挑**含补平帧的那一份**，不能无脑取最新那份：补平帧只在「一轮被中断」时才产生，
+  // 是稀有事件 —— 取最新 = 拿一次运气当判据，之后每跑一轮 F5 都会红一次假警（2026-09-18 实测：
+  // 最新的那份 0 条，而 09-17 那份有 8 条）。从新往旧找第一份有补平帧的；一份都没有就**响亮跳过**。
+  let log;
+  let events;
+  let repairFrames = 0;
+  for (let i = logs.length - 1; i >= 0; i -= 1) {
+    const evs = readSessionEvents(logs[i]);
+    const n = countRepairFrames(evs);
+    if (n > 0) {
+      log = logs[i];
+      events = evs;
+      repairFrames = n;
+      break;
+    }
+  }
+  if (!log) {
+    console.log(
+      `    ⚠ 跳过：${logs.length} 份会话日志里一份含补平帧的都没有（补平帧只在轮被中断时产生），别把这次通过当成验过了`
+    );
+    return 'skipped';
+  }
   ok(events.length > 0, '日志解出来 0 条事件（格式变了？）');
 
   const insp = new RunInspector();
   for (const ev of events) insp.apply({ sessionId: 'real', event: ev }, UI);
   const runs = insp.details(UI);
   ok(runs.length > 0, '这份日志里没有完整的轮');
-
-  // ---- oracle：独立地按帧面特征数补平帧（不调 isRepairResult）----
-  let repairFrames = 0;
-  for (const ev of events) {
-    if (ev.type !== 'tool/result') continue;
-    const d = ev.data ?? {};
-    const idOk = typeof d.message?.id === 'string' && d.message.id.startsWith('interrupted-tool-result-');
-    const codeOk = d.error?.code === 'TOOL_NOT_STARTED';
-    if (idOk || codeOk) repairFrames += 1;
-  }
-  ok(repairFrames > 0, '这份日志里没有补平帧 —— 换个日志，或这份样本已经不是当初那份了');
 
   const totalUnmatched = runs.reduce((a, r) => a + r.unmatched, 0);
   const totalRepaired = runs.reduce((a, r) => a + r.repaired, 0);

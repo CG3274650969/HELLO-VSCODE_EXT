@@ -20,7 +20,7 @@
 | C8 | 运行可靠性：中断续跑 + 超时幂等（原「/ 重试 / 大转写分片」，收窄，见正文） | P1 | 受「无 cancel RPC」限制。**已实现、自检全绿；F5 真机全过**（2026-09-17，用户确认） | [x] |
 | C8c | 存储层写入：`persist()` 原子写 / 写入成本 / `toolInput` 上限（从 C8 ③ 拆出） | P1 | 无。**已实现、自检 64/64 + 真实数据往返无回归；F5 待办** —— 实测推翻了「`toolInput` 无上限导致增长」与「需要写入防抖」两条预设，分片/异步/防抖按实测不做，见正文 | [ ] |
 | C9 | Run inspector（本轮帧时间线/耗时/工具统计） | P1 | 无（现有帧已够）。**已实现、自检 31/31 + DOM 影子自检、四项探针无回归、F5 通过（2026-09-17 用户真机）** —— 耗时全靠信封自带 `time` 相减（零计时器），体积故事 = 丢弃 819/823 条 chunk；F5 先后推翻三条预设（「配对失败恒 0」「按 `isError` 判成败」，以及**「DSH 一步一次工具」**—— 实测一步可带 2–3 次并行调用），见正文 | [x] |
-| C10 | 上下文窗口指示 + 超限压缩/归档 | P1 | 数据前置已解（C3a 已透出窗口/占用）；压缩动作本身待做 | [ ] |
+| C10 | 上下文窗口指示 + 超限压缩/归档 | P1 | 数据前置已解（C3a 已透出窗口/占用）。**已实现、五项自检全绿（12/12 + 31/31 + 25/25 + 4/4 + 三项不回归）；F5 待办** —— 三个前提被推翻：压缩 DSH 早已自己做（`compaction-basic`，已 compose）、那三个事件早就在流里而我们从没读、**「归档旧轮」按字面做不到**（无 wire RPC + 日志 append-only）。另，`DSH_CORDIS_CONFIG` env 赢过位置参数这条命脉（C1 与 C10 共用）**首次被反控证住**，见正文 | [~] |
 | C11 | 会话级推理档位（reasoningEffort） | P1 | **受限**：wire 下发不了，需 runtime 先支持 | [ ] |
 | C12 | 项目级 agent profile（工具白名单/默认模型/审批策略） | P1 | 与 C1 同源 | [ ] |
 | C13 | Windows / 跨环境 shell 与路径收口 | P1 | 无（扩展侧为主） | [ ] |
@@ -528,10 +528,55 @@ if (!this._abort || !this._reviewChangesOn()) return;  // 对
   - **条上那三种后缀已改成并列**（2026-09-18，`media/chat.js` 的 `runLine`）。旧版是 `else if` 链（错误 → 失败 → 结果未知），同时命中时只显示优先级最高的那个：实测中断轮「1 未知 + 3 失败」，条上只剩「3 失败」—— 而「结果未知」恰恰是中断轮里最该被看见的一条（**工具可能跑了也可能没跑，别盲重试**，与 C8 的措辞同源）。并列后为 `本轮已中断 · 11 工具 · 59.1s · 3 失败 · 1 结果未知`，顺序固定（重 → 轻），所以「条与浮层对同一轮的后缀逐字一样」那条断言仍然成立。
     **只动条这一层的排版，浮层与工具卡一个字没改**：它们本来就分别写「未知」和「? 无结果」，信息从没丢过（这正是当初把它记成「局限」而不是 bug 的原因）。DOM 影子钉死了新形状（含 F5 那一轮的比例：3 失败 + 1 未知）；**真机 F5 复看未做** —— 这条改动没有新的运行时行为，C9 索引行的 `[x]` 依据仍是 2026-09-17 那次。
 
-### C10 · 上下文窗口指示 + 超限压缩/归档
-- **现状**：无窗口占用感知，长对话无策略。
-- **补法**：依赖用量可得（C3）或本地长度估算；超限时提示并给出「归档旧轮 / 摘要压缩」策略。
-- **验收**：接近上限时 UI 提示；选择归档后新轮正常且记忆有说明。
+### C10 · 上下文窗口指示 + 超限压缩/归档（2026-09-18 实现，F5 待办）
+- **原文验收**：接近上限时 UI 提示；选择归档后新轮正常且记忆有说明。
+- **调研后，这条的形状跟 backlog 写的不一样 —— 三个前提被推翻**：
+  1. **「压缩」DSH 自己已经做了，而且已经接在便携运行时上。** `runtime/cordis.default.yml:90-96` compose 了 `@deepseek-ai/dsh-compaction-basic`（`thresholdRatio: 0.8` / `retainRatio: 0.16` / `auto` 默认 `true`）。它在 `agent/pre-step` 压力（`totalTokens >= floor(contextWindow × 0.8)`）或 provider 报 `CONTEXT_WINDOW_EXCEEDED_CODE` 时，把一段旧事件摘要成 `<compacted-summary>` checkpoint，并 append `compaction/start|summary|end` 三个会话事件。
+  2. **但它现在是完全静默的。** 那三个事件按 wire 的全量转发规则**已经到扩展手里了**，而 `_onDshEvent` 的 case 只有 6 个（`assistant/chunk` / `assistant/message` / `request/context` / `tool/call` / `tool/result` / `turn/end`），**一个都没读**；压缩写回的那条 `user/message` 也没有 case，被整个忽略。⇒ 一旦触发，模型记忆被折叠成摘要，界面上一个字都没有。
+  3. **「归档旧轮」按 backlog 的字面意思做不到。** ① wire 上没有任何 compaction 方法（全量清单只有 `initialize` / `session/prompt` / `shutdown`），`/compact` 那条命令插件没 compose，且 `CommandRuntime.execute()` 在 JSON-RPC 通路里**没有调用方** ⇒ 无法按需触发；② DSH 的 `session.jsonl.zstd` 是 append-only + zstd 帧边界 + offset 修复的日志，改它 = 续聊全废（C7 已实证）。⇒ 能做的是**让压缩可见、让阈值可调**，不是自己去裁记忆。
+- **实测锚点（决定阈值政策的那两个数）**：`request/context` 一致报 **`contextWindow: 1000000`**（`deepseek-official` / `deepseek-v4-flash`，8 个会话全同）；同一批抓帧里 prompt 侧压力**峰值只有 2K–6K token**（`inputTokens + cacheReadTokens`，缓存读占 ~94%）。⇒ DSH 那条线（0.8 × 1M = **80 万**）离日常用量差**两位数量级**。要让它触发，阈值得压到 0.01–0.02，而压缩**有损且不可撤销**。
+- **用户拍板（2026-09-18）**：四件都做 —— ① 占用指示 + 接近上限提示；② 把 DSH 的压缩变成可见；③ 调低阈值让它真的会发生；④ 折叠我们自己的转写（旧轮）。提示落在 **`#usage-bar`**（不新开条/浮层）。阈值**做成设置项、默认仍 0.8**（零行为改变）。
+- **D1 · 占用指示（扩 `#usage-bar`）**：数据与 UI 位都已有了，缺的只是「接近上限喊一声」。
+  - [src/protocol.ts](../src/protocol.ts) 的 `UsageReadout.context` 加 `state?: 'ok' | 'near'` 与 `stale?: boolean`，`UsageReadout` 加 `compacted?: number`。**判据在扩展侧算**（同 `runLine` / `_summary` 的分工，webview 只排版）。
+  - [src/chatViewProvider.ts](../src/chatViewProvider.ts)：警告线 = `thresholdRatio × 0.85`（默认 0.8 → **0.68**），留 15% 余量是为了在 DSH 真的动手**之前**给个信。
+  - ⚠️ **口径必须诚实，且写进了 title 与注释**：分子是 **provider 上报的 prompt 侧压力**（`turn.pressureTokens`），而 DSH 的判据是 `token-meter` 的 `totalTokens`（`CHARS_PER_TOKEN = 4` 的启发式估算，还含输出）—— **两个不是同一个数**。所以界面只说「接近压缩阈值」，**绝不说**「距离压缩线还有 X」。这条有探针钉着（断言 title 里必须出现「不是同一个数」、且不许出现「还有」）。
+  - **「打开旧会话」那条永远是空的** —— 占用本来只活在内存里（`_turnUsage` / `_contextWindow`），而占用恰恰是这条读数唯一要说的东西。⇒ 轮尾把最后一个样本存进 `StoredSession.context?: { usedTokens; contextWindow; at }`（**新落盘字段**），`_usageReadout()` 在活值缺席时回落到它并置 `stale: true`，界面标「上次」（不冒充实时）。
+  - [media/chat.js](../media/chat.js) 的 `renderUsageBar()`：`state === 'near'` 时追加 `⚠ 接近压缩阈值` 并给条挂 `.usage-bar.near`；`stale` 时标「· 上次」；`compacted > 0` 时加一段「已压缩 N 次」。**这两个后缀是并列的不是 `else if`** ——「上次」说的是读数有多旧，「接近阈值」说的是量级，两者可同时成立。
+  - **不动**现有分段与那个 `pct >= 1` 才显示百分比的规矩 —— 有警告状态时百分比必然远超 1%，自己就出来了。
+- **D2 · 压缩可见**：[src/compactionNotice.ts](../src/compactionNotice.ts)（新，**纯模块**：绝不 import vscode，入参是结构型载荷，于是探针能在扩展宿主之外加载它 —— 同 `runInspector.ts` / `turnState.ts` 的体例）。`readCompactionEvent(type, data)` 认 `compaction/summary` 与 `compaction/end`，其余类型返回 `undefined`，垃圾输入不抛。
+  - 三条写进文件头的约束：**① 压缩发生了就绝不沉默**（字段漂移时降级成「细节缺失」，而不是返回 undefined —— 静默正是这个功能要消灭的东西）；**② 成功只报一次**（成功路径上 `summary` 后面紧跟一个无 `error` 的 `end`，两边都报就重复了）；**③ 不读摘要正文**（note 里不许出现 `data.summary` 的正文 —— 那是往转写里灌二手记忆）。
+  - 载荷形状**逐字抄自**插件 `commitCompactionBody` 与 `compactRegion` 的 catch 分支：`summary` = `{compactionId, sourceCommandId?, summary, rawOutput?, llmStreamCall?, shadowedRange:{start,end}, shadowedSeqs[], shadowedTokenCount, provider, model, maxTokens?, usage?}`；`end` = `{compactionId, sourceCommandId?, turn}` 或同样内容加 `error`（`errorChain(error)` 返回的是**字符串**，已对照 `dsh-llm/lib/index.js:313` 验证）。
+  - [src/chatViewProvider.ts](../src/chatViewProvider.ts) 的 `_onDshEvent` 加两个 case，命中就 `this._pushNote(text)`（C8 那条中断 note 走的同一个口子）；note 入 `_active.messages`、随轮尾 `persist()` 落盘。另记一个计数（`StoredSession.compacted?: number`）让 D1 的条能写「已压缩 N 次」—— note 会滚走，条上那段才持久。
+  - **不做**：不渲染那条 checkpoint `user/message`（它是 DSH 内部的 surface 操作，不是用户说的话）；不读 `summary` 正文。
+- **D3 · 阈值设置项（派生配置）—— 风险最高的一环**：新设置项 `hello.chat.compaction.thresholdRatio`（number，默认 **0.8** = DSH 原值，范围 `(0,1]`，`scope: "window"`，中英双语 description），进「AlohaDSH · 发送与审阅」块。
+  - **结构障碍**：原来的派生（`dshHooks.ts`）是「用户原文 + 末尾追加一个**写死的** hooks 块」，**没有覆盖已有插件 config 的机制**；而且派生**只在 C1 审批就绪时发生**。
+  - **锚点文本替换**（照 `scripts/runtime-patch.mjs` 的成例：锚点出现次数 ≠ 1 就 throw，不用 `includes`）：`patchCompactionRatios()` 只改 `- id: compaction-basic` 块**内部**的两行比例。行匹配排除注释行，且不许跨出该块（块的结束 = 下一个缩进归零的行）；按检测到的行尾重组，**不把 CRLF 洗成 LF**；值本来就相等 ⇒ **原样返回**（于是默认设置下产出与今天**逐字节相同**）。
+  - ⚠️ **必须同时改 `retainRatio`**：插件有硬约束 `retainRatio >= thresholdRatio` → **加载期** throw（`validateRatioRetention`，已逐字核对）。默认 0.16 与 0.8 是 1:5 的关系，所以按 `retainRatio = thresholdRatio × 0.2` 同步缩放 —— **只调 thresholdRatio 会让插件加载失败**，这是这一项最容易踩的坑。
+  - `retainRatio` **缺失时补插**（不能假定基础配置里一定有它），插在 `thresholdRatio` 行之后；底本改用绝对 `retainTokens` 的（与 `retainRatio` 互斥）**拒绝改写**并响亮告警。
+  - **「派生」从「审批」里拆出来**：`_overlayConfigPath` 与 `_approvalFiles` 分开（生命周期不同 —— 审批关掉时后者会被清空，而压缩阈值覆盖必须继续生效）；`_refreshDerivedConfig()` 是**唯一**的刷新点，位于 `_doConnectLive()` 里 `await this._ensureApproval()` **之后**（那一行就是「审批关着时覆盖也生效」的落点，因为 `_ensureApproval` 在关着时是空返回）。**补丁失败绝不 throw** —— `_setupApproval` 的 catch 会 `server.dispose()` 并禁用 C1，为可选旋钮换掉主功能是荒谬的；失败以 `warning` 返回、走独立的告警旗标、`_overlayConfigPath` 置空（回到用户原配置），绝不阻断连接。
+  - **零回归是构造保证的，不是靠运气**：默认 ratio 下 `compactionOverride()` 返回 `undefined` ⇒ `writeDerivedConfig` 根本不调补丁 ⇒ 派生文件与今天逐字节一致。
+  - ⚠️ **顺手证掉的一颗雷**：便携运行时那条路上位置参数给的是 `runtime.config`（**基础**配置），派生文件**只走 `env.DSH_CORDIS_CONFIG`**（`_makeSpawnRequest`）。C1 能生效说明 env 赢，但这件事此前**从没被单独钉过**，而它失效的样子是「一切正常，只是护栏与旋钮从不生效、无任何报错」。⇒ 新增 [scripts/probe-derived-config-boot.mjs](../scripts/probe-derived-config-boot.mjs)（**4/4**）一正一反：正控 = 合法比例的派生配置能 `initialize`；**反控 = 故意写成 `retainRatio >= thresholdRatio` 的派生配置必须起不来**。反控如实失败——DSH 原话 `BasicCompactionConfig: retainRatio (0.5) must be less than the resolved thresholdRatio (0.02)` ⇒ **`DSH_CORDIS_CONFIG` 确实赢过位置参数**，C1 与 C10 共用这条命脉，现在有证据了。
+- **D4 · 折叠我们自己的转写（仅界面）**：[media/chat.js](../media/chat.js) 的 `renderSnapshot()` 是「清空 + 全量重建 DOM」，几百条消息的会话每来一帧就整批重建一遍 —— 那就是「越跑越重」的来源。改成只渲尾部 `FOLD_KEEP = 60` 条，前面插一行 `.msg-fold`「更早的 N 条已折叠（仅界面，DSH 记忆未变）· 显示」，点一下整帧重渲染（消息一条不丢，还在 `_active.messages` 里）。展开状态是**会话级**的：`case 'snapshot'` 里 sessionId 变了就复位（否则「上一条长对话点开的显示」会把下一条的头部也整批渲染出来，而折叠本来就是为了省掉那一批）。
+  - ⚠️ **别把它说成省内存**：它只省 DOM 重建，**不减少 `snapshot` 下发的 payload**（`_postSnapshot` 照旧发全量），也不碰 DSH 的上下文占用。这句写进了函数注释与按钮 title，探针也钉着（按钮文案必须含「仅界面」与「DSH 记忆未变」）。
+- **自检（全部零依赖、零 key、不过模型）**：
+  - [scripts/probe-compaction-notice.mjs](../scripts/probe-compaction-notice.mjs)（新）**12/12**：载荷逐字抄自插件；断言禁止摘要正文、成功不重复上报、错误截断、**降级而非静默**、垃圾输入安全、`fmtTokens` 档位。⚠️ 这是**唯一**一条没有真帧可回放的探针 —— `logs/dsh-frames/` 里 5270 条已抓事件中**一条 `compaction/*` 都没有**（默认阈值太高，从没触发过），所以用例全是合成帧。
+  - [scripts/probe-compaction-override.mjs](../scripts/probe-compaction-override.mjs)（新）**31/31**：以仓库里真的 `runtime/cordis.default.yml` 为黄金输入 —— 恰好 2 行不同、CRLF 保持、幂等、行内注释/尾随空格、相邻块同名键不误伤、`modelPolicies[].thresholdRatio` 不受影响、9 个拒绝用例、全范围 `retainRatio < thresholdRatio` 不变量、以及「默认值 ⇒ 逐字节相同」。
+  - [scripts/probe-webview-render.mjs](../scripts/probe-webview-render.mjs)（新，**重建并入库**）**25/25**：用最小 DOM 影子把 `media/chat.js` 载进 Node（加载期依赖只有 `acquireVsCodeApi()` 与 `window.addEventListener('message')` 两处），断言 D1 的 near / stale / compacted 各态与 `.near` 类的挂/摘、D4 的折叠条数与位置（折的是头部、首条渲染的是第 41 条）、点「显示」后全部回来、同会话刷新保持展开而**换会话复位**；外加 C9 运行条与浮层的一小段回归样。
+    - **这次它又抓到两个真 bug**，且第 ① 个正是「不忠实的影子比没有影子更坏」的又一例：① 影子的 `className` setter **换掉了**那个 `Set`，而 `classList` 的闭包捕获的是构造时那一个 ⇒ `wrap.className = 'msg msg-user'` 之后 `classList.contains('msg')` 为假、`removeAllMessages` 一个都删不掉（断言全空转）。改成**原地改**。② 我自己按旧影子抄的期望值是过期的（`24K` 应为 `24.0K`、C9 条文案已改成三后缀并列）。③ 顺带发现旧脚本以为 `{type:'run-panel', open:true}` 是**入站**消息 —— 它其实是**出站**（扩展据此下发 details），浮层要靠点 `#runs-view` 才开；现在按真路子驱动，并断言那条回执确实发出去了。
+  - 不回归：`probe-approval-shell` **19/19**（D3 动了派生，这条是 C1 的主力证据）／`probe-session-tools` **64/64**（D1 加了落盘字段）／`probe-run-inspector` **31/31**／`probe-turn-state` **13/13**／`probe-purge` **20/20**／`smoke-runtime --runtime dist-runtime` exit 0。
+  - 静态守卫：`grep "import \* as vscode" src/compactionNotice.ts` 无输出。
+  - **顺带修掉一条探针的假红**：`probe-run-inspector` 的真日志回放原本**无脑取最新那份**会话日志，而补平帧只在「一轮被中断」时才产生（稀有）——新会话一多它必然变红。改成**从新往旧找第一份含补平帧的**，一份都没有才响亮跳过；现在跑的是 09-17 那份（1722 事件 / 8 轮 / 6 条补平帧）。
+- **本次不做**：不按需触发压缩（wire 没口子）；不改 DSH 的 `session.jsonl.zstd`；不新开 `#context-bar` / 第三个浮层（用户选了扩 `#usage-bar`）；不做「把旧消息真的折成一段摘要文本」（要动存储，且那是 DSH 那侧的事）；不改 `token-meter`（它没有任何可配置项，加任何键都会加载失败）。
+- **已知局限（要留着）**：
+  - **我们的分子 ≠ DSH 的判据**：指示条显示的是 provider 上报的 prompt 侧压力，压缩判据是 `token-meter` 的启发式 `totalTokens`。⇒ 指示是**近似**，不能承诺「到了这条线就一定会压缩」。
+  - 默认阈值下（0.8 × 1M）这条线在日常用法里**基本不可能接近**：指示与警告长期不会出现。这是实测结论，不是 bug。
+  - **压缩按需触发不了**（无 wire RPC；`/compact` 未 compose 且 `commands.execute` 在 JSON-RPC 通路里没有调用方）。
+  - **归档 DSH 日志做不到**（append-only + 帧边界 + offset 修复）。
+  - **折叠只省 DOM，不省 payload**。
+  - **打开旧会话、发第一条消息之前拿不到窗口大小**：`request/context` 是在请求准备时、且相对上次**有变化**才 append 的。D1 的 `stale` 回落是缓解，不是解决。
+  - 顺带记一笔（本次未改）：`_openSession()` **不清 `_contextWindow`**（只有 `_teardownLive()` 清），所以切会话后它可能仍留着上一次请求的值。
+  - **便携运行时那条路上派生配置只靠 `env.DSH_CORDIS_CONFIG` 传**：位置参数给的仍是基础配置，两条通路指的不是同一个文件。现已由 `probe-derived-config-boot.mjs` 的反控证住；若哪天 DSH 改了优先级，**C1 与 C10 会一起静默失效**，那个探针是唯一的警报。
+- **只能真机 F5 盖住**：① **压缩事件到底会不会透传 —— 全项唯一没被实证过的一环**（5270 条已抓事件里一条 `compaction/*` 都没有）：把设置调到 0.02 → 重启 → 跑一段足够长的对话 → 看 note 与条上「已压缩 N 次」是否出现；② 阈值改非默认值后**重连生效**，且 `DSH_CORDIS_CONFIG` 指的那份 `dsh-config/cordis.yml` 里确实只有那两行变了、`retainRatio` 跟着缩放；③ **审批关掉时覆盖仍生效**（D3 那个调用点的落点），同时审批打开时弹条行为不回归；④ 占用指示在长会话里真的会 `near`；⑤ 折叠：几百条消息的会话滚动与切会话不卡、展开正常。
 
 ### C11 · 会话级推理档位（reasoningEffort）
 - **现状**：`initialize` 只认 `cwd/provider/model/maxTokens`，`reasoningEffort` 静默忽略；改只能动 `cordis.yml` 的 `llm-deepseek`（当前 max）后重启（[wire-vocabulary.md](wire-vocabulary.md)）。

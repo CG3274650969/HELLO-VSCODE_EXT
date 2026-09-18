@@ -19,12 +19,16 @@ import {
 import { ApprovalAsk, ApprovalOutcome, ApprovalServer, matchesAnyPattern } from './approvalServer';
 import {
   ApprovalHookFiles,
+  CompactionRatios,
+  compactionOverride,
+  DEFAULT_COMPACTION_THRESHOLD_RATIO,
   nextShellCheck,
   probeShell,
   ShellCheckAttempt,
   ShellKind,
   testApprovalHook,
   writeApprovalHookFiles,
+  writeDerivedConfig,
 } from './dshHooks';
 import { isAbortError, streamMockReply } from './mockAssistant';
 import {
@@ -60,6 +64,7 @@ import {
 } from './dshRuntime';
 // C8：轮次状态判据（纯模块，零 vscode 依赖，scripts/probe-turn-state.mjs 直接加载编译产物自检）
 import { needsContinue, TurnStatus } from './turnState';
+import { readCompactionEvent } from './compactionNotice';
 // C9：运行时间线累积器 + 配对/成败判据（纯模块，零 vscode 依赖，
 // scripts/probe-run-inspector.mjs 直接加载编译产物自检）。后两个导出是**唯一的一份实现** ——
 // 本文件里 `_toolKey` 与 `tool/result` 的三态判定（ok / error / **unknown**）都改成调用它们，
@@ -134,6 +139,14 @@ const MAX_OUTSIDE_REVIEW_ROOTS = 20;
 
 /** `hello.chat.approval.outsideWorkspace` 的默认值（只 gate「问」，不 gate「看」） */
 const DEFAULT_APPROVAL_OUTSIDE = true;
+
+/**
+ * C10：提前多少报「接近压缩阈值」（占阈值的比例）。
+ *
+ * 留 15% 余量是为了在 DSH 真的动手**之前**给个信 —— 等它压完了才提示等于没提示。
+ * 这个数只影响提示的早晚，不影响任何行为（压缩本身是 DSH 按它自己的判据做的）。
+ */
+const CONTEXT_WARN_MARGIN = 0.85;
 
 /** 用户等待上限（秒）的默认值；与 hook 超时形成 540 < 560 < 580 的梯度 */
 const DEFAULT_APPROVAL_TIMEOUT_SEC = 540;
@@ -395,6 +408,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** 与视图无关的订阅（全局配置变更监听），dispose 时统一清 */
   private readonly _globalDisposables: vscode.Disposable[] = [];
 
+  // ---------- C10 派生配置（压缩阈值覆盖）状态 ----------
+
+  /**
+   * 真正下发的 cordis.yml（`DSH_CORDIS_CONFIG` 指它）。**非空 = 用派生文件，空 = 用底本**。
+   *
+   * 与 `_approvalFiles` 分开是因为**它们的生命周期不同**：审批关掉时 `_approvalFiles` 会被清空，
+   * 而压缩阈值覆盖必须继续生效 —— 它跟审批没有任何关系（详见 `_refreshDerivedConfig`）。
+   */
+  private _overlayConfigPath?: string;
+  /** C10：压缩阈值覆盖相关告警是否已弹过。**独立旗标**，理由同 `_storageWarned` */
+  private _compactionWarned = false;
+
   // ---------- C3a 用量读数（每轮/每会话 token + 上下文占用率）状态 ----------
 
   /** 本轮累计；一轮跑着才有值。轮尾折进 `_active.usage` 后置空（单点折叠 → 不可能双计） */
@@ -444,6 +469,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       vscode.workspace.onDidChangeConfiguration((e) => {
         if (!e.affectsConfiguration('hello.chat.approval.enabled')) return;
         if (this._abort || this._liveRunning) return; // 跑着的时候不动，下次连接自然带上
+        void this._ensureApproval().then(() => this._restartLiveProcess());
+      })
+    );
+    // C10：压缩阈值同样**只在插件构造期读**（cordis 没有插件配置热加载），所以改了要重连一次。
+    // 独立一条而不是并进上面那条：上面那条认的是 approval.enabled，混在一起会让
+    // 「改了审批开关」与「改了阈值」共用一个早退判断，将来任何一边加条件都会误伤另一边。
+    this._globalDisposables.push(
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (!e.affectsConfiguration('hello.chat.compaction.thresholdRatio')) return;
+        if (this._abort || this._liveRunning) return; // 同审批：跑着不动，下次连接带上
+        this._overlayConfigPath = undefined; // 先作废旧指向，防重连失败时还留着上一份派生文件
         void this._ensureApproval().then(() => this._restartLiveProcess());
       })
     );
@@ -1549,6 +1585,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // C1：审批必须在 spawn **之前**就绪 —— _makeSpawnRequest 是同步的，它读的就是
     // _approvalFiles（派生配置路径）。准备失败会在内部告警并降级，不阻断连接。
     await this._ensureApproval();
+    // C10：派生配置的**唯一**刷新点，故意放在这道屏障之后。
+    // 它必须在这儿（而不是散进 _ensureApproval 的各条分支）有两个理由：
+    //   1. **覆盖要跟审批解耦** —— 审批关着时 _ensureApproval 是空返回，只有这里有保障；
+    //   2. 到这里 _approvalFiles 必然是本次连接要用的最终值，而 _makeSpawnRequest 是同步的、
+    //      在 _getRuntime() 的懒 spawn 里才读 _effectiveConfigPath()，顺序刚好够。
+    // 顺序错了（挪到 _makeSpawnRequest 之后、或放进懒加载回调）就会下发上一轮的旧配置。
+    this._refreshDerivedConfig();
     let runtime: DshRuntime;
     try {
       runtime = this._getRuntime();
@@ -1644,6 +1687,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (typeof d.contextWindow === 'number' && d.contextWindow > 0) {
           this._contextWindow = d.contextWindow;
           this._postUsage();
+        }
+        return;
+      }
+      case 'compaction/summary':
+      case 'compaction/end': {
+        // C10：DSH 把一段旧事件折叠成摘要（或折不动失败了）。**这两个 case 是"记忆被改动了"
+        // 唯一的告知通路** —— 在此之前它是完全静默的（事件早就转发过来了，只是没人读）。
+        // 判据全在纯模块里（`readCompactionEvent`），这里只负责落一条说明。
+        const note = readCompactionEvent(ev.type, d);
+        if (note) {
+          this._pushNote(note.text);
+          if (note.kind === 'done') this._active.compacted = (this._active.compacted ?? 0) + 1;
         }
         return;
       }
@@ -1765,8 +1820,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     let sum = zeroUsage();
     for (const b of turn.byStep.values()) sum = addBuckets(sum, b);
     this._active.usage = addBuckets(this._active.usage ?? zeroUsage(), sum);
+    // C10：顺手把"最后一次已知的上下文占用"落进会话。占用读数本来只活在内存里，
+    // 于是重载窗口 / 切回旧会话时那条指示永远是空的 —— 而占用恰恰是它唯一要说的东西。
+    // 记的是**上次已知值**，读出来会标 stale（渲染成「上次」），不冒充实时。
+    if (turn.pressureTokens !== undefined && this._contextWindow !== undefined) {
+      this._active.context = {
+        usedTokens: turn.pressureTokens,
+        contextWindow: this._contextWindow,
+        at: Date.now(),
+      };
+    }
     turn.folded = true;
     this._postUsage();
+  }
+
+  /**
+   * 「接近 DSH 的压缩线了吗」。
+   *
+   * ⚠️ **两个数不是同一个数，这条判据只是近似**：分子是 provider 上报的 prompt 侧压力
+   * （`turn.pressureTokens`），而 DSH 决定压不压缩用的是 `token-meter` 的 `totalTokens`
+   * ——`CHARS_PER_TOKEN = 4` 的启发式估算，还含输出。分母两边一致（都是 provider 给的窗口）。
+   * 所以文案只能说「接近压缩阈值」，**不许**说「距离压缩线还有 X token」。
+   *
+   * 提前 15% 报（`CONTEXT_WARN_MARGIN`）是刻意的：等 DSH 压完了再提示等于没提示。
+   */
+  private _contextState(usedTokens: number, contextWindow: number): 'ok' | 'near' {
+    const raw = this._compactionThresholdRatio();
+    const ratio = raw > 0 && raw <= 1 ? raw : DEFAULT_COMPACTION_THRESHOLD_RATIO;
+    return usedTokens >= contextWindow * ratio * CONTEXT_WARN_MARGIN ? 'near' : 'ok';
   }
 
   /**
@@ -1797,12 +1878,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
     const used = turn?.pressureTokens;
     const contextWindow = this._contextWindow;
-    if (used === undefined && contextWindow === undefined && isZeroUsage(turnSum) && isZeroUsage(session)) {
+    const storedCtx = this._active.context;
+    if (
+      used === undefined &&
+      contextWindow === undefined &&
+      storedCtx === undefined &&
+      this._active.compacted === undefined &&
+      isZeroUsage(turnSum) &&
+      isZeroUsage(session)
+    ) {
       return undefined;
     }
     const readout: UsageReadout = { turn: turnSum, session };
+    if (this._active.compacted) readout.compacted = this._active.compacted;
     if (used !== undefined && contextWindow !== undefined) {
-      readout.context = { usedTokens: used, contextWindow };
+      readout.context = { usedTokens: used, contextWindow, state: this._contextState(used, contextWindow) };
+    } else if (storedCtx) {
+      // 活值缺席（刚打开旧会话 / 刚重载窗口）：回落到上次落盘的样本，**标上 stale**。
+      // 下限也过一遍 asCount：手改坏了 sessions-harness.json 时别让读数显示 NaN。
+      const sUsed = asCount(storedCtx.usedTokens);
+      const sWin = asCount(storedCtx.contextWindow);
+      if (sWin > 0) {
+        readout.context = {
+          usedTokens: sUsed,
+          contextWindow: sWin,
+          state: this._contextState(sUsed, sWin),
+          stale: true,
+        };
+      }
     }
     return readout;
   }
@@ -2051,12 +2154,76 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return path.isAbsolute(raw) ? raw : path.resolve(this._dshRunCwd(), raw);
   }
 
-  /** spawn 时真正下发的 cordis.yml：审批就绪 → 派生配置；否则用户原配置。 */
+  /** spawn 时真正下发的 cordis.yml：有派生配置 → 派生配置；否则用户原配置。 */
   private _effectiveConfigPath(): string {
+    // C10 在前：`_overlayConfigPath` 是 hooks 块 + 比例补丁的**合成物**，是更新的那一份。
+    // 它为空（没开审批、也没调阈值）时往下走，行为与 C1 时期完全一致。
+    if (this._overlayConfigPath) return this._overlayConfigPath;
     if (this._approvalFiles) return this._approvalFiles.cordisPath;
     const runtime = this._runtime();
     if (runtime) return runtime.ok ? runtime.config : '';
     return String(this._dshConfig().get('config') ?? '').trim();
+  }
+
+  // ---------- C10：压缩阈值覆盖 ----------
+
+  /** 设置项 `hello.chat.compaction.thresholdRatio`。每次现读（同 `_approvalPatterns` 的体例）。 */
+  private _compactionThresholdRatio(): number {
+    return vscode.workspace
+      .getConfiguration('hello.chat')
+      .get<number>('compaction.thresholdRatio', DEFAULT_COMPACTION_THRESHOLD_RATIO);
+  }
+
+  /** 用户把阈值调离默认值时的覆盖；仍是默认 → undefined（= 完全不派生，行为与没有这个功能时逐字节相同） */
+  private _compactionOverride(): CompactionRatios | undefined {
+    return compactionOverride(this._compactionThresholdRatio());
+  }
+
+  /**
+   * 压缩阈值告警：控制台始终留痕、用户侧每次 activation 只弹一条。
+   * 体例同 `_approvalWarn` / `_storageWarn`，**旗标必须是独立的** —— 共用一个的话先到的会吞掉后到的。
+   */
+  private _compactionWarn(text: string): void {
+    console.warn('[compaction]', text);
+    if (this._compactionWarned) return;
+    this._compactionWarned = true;
+    void vscode.window.showWarningMessage(`压缩阈值设置未生效：${text}`);
+  }
+
+  /**
+   * 重写派生配置，并把「下发改用它」这件事定下来（幂等，**永不抛**）。
+   *
+   * 输入只有两个，且互相独立：
+   *   · `_approvalFiles?.hooksPath` —— 审批就绪时追加 hooks 块（C1 的既有行为，一字不改）
+   *   · `_compactionOverride()`    —— 调低了阈值时改底本里 compaction-basic 那两行
+   *
+   * **为什么它必须跟审批解耦**：C10 的这条旋钮跟审批没有任何关系，用户完全可以关掉审批只用它。
+   * 旧结构里「派生的时机」挂在审批就绪上，所以那里必须多出一个独立入口 —— 就是本函数
+   * 唯一的调用点（`_doConnectLive` 里 `_ensureApproval()` 之后那行）。
+   */
+  private _refreshDerivedConfig(): void {
+    const hooksPath = this._approvalFiles?.hooksPath ?? '';
+    const compaction = this._compactionOverride();
+    if (!hooksPath && !compaction) {
+      // 两样都不需要 → 不派生。留着旧的派生文件只会是一份会过期的副本。
+      this._overlayConfigPath = undefined;
+      return;
+    }
+    const baseConfigPath = this._baseConfigPathAbs();
+    if (!baseConfigPath) {
+      this._overlayConfigPath = undefined;
+      return;
+    }
+    try {
+      const r = writeDerivedConfig({ storageDir: this._storageDir, baseConfigPath, hooksPath, compaction });
+      // 比例没落上（底本里没有那个插件块等）时仍然要用这份文件 —— hooks 块在里面
+      if (r.warning) this._compactionWarn(r.warning);
+      this._overlayConfigPath = r.cordisPath;
+    } catch (err) {
+      // 只剩「底本读不出来」会走到这。降级到「不用派生配置」，绝不阻断连接 —— 与 _ensureApproval 同一条纪律。
+      this._overlayConfigPath = undefined;
+      if (compaction) this._compactionWarn(err instanceof Error ? err.message : String(err));
+    }
   }
 
   /**

@@ -234,6 +234,7 @@ A second group lives under `hello.chat` (`scope: window`) — guardrails and rev
 | `hello.chat.approval.timeoutSec` | `540` | Seconds to wait before denying by timeout. |
 | `hello.chat.reviewChanges` | `true` | Diff file changes after each turn and show a review bar (added/modified/deleted, inline diff, keep/revert). Changes **outside** the workspace are listed too, tagged with their directory. |
 | `hello.chat.retention.days` | `0` | Trash retention in days. `0` (default) = off, no button. Otherwise the trash tab gains a "purge N expired" button that permanently deletes items deleted more than N days ago, **DSH logs included** (irreversible). Trash only, and it never runs on its own. |
+| `hello.chat.compaction.thresholdRatio` | `0.8` | **DSH's** context-compaction threshold, as a fraction of the window. Above the line DSH summarises a span of older events into a checkpoint — lossy and irreversible. `retainRatio` is derived automatically as `0.2 ×` this (a DSH constraint; the plugin refuses to load otherwise), so never set it yourself. At the default `0.8` with a 1M window that is 800K tokens, i.e. **it essentially never fires in normal use — lower it to make compaction actually happen.** Changes need a reconnect (the plugin reads its config at load time). |
 
 **Known limitation (not a bug):** the guardrail only inspects `write`/`edit` tool targets — paths
 inside a bash command string are **not** parsed. So an agent writing outside the workspace via
@@ -307,6 +308,42 @@ word-for-word the same in both places.
 
 ---
 
+## Context window & compaction
+
+**DSH already compacts on its own — you just cannot see it.** The portable runtime composes
+`@deepseek-ai/dsh-compaction-basic` (`runtime/cordis.default.yml`), and once prompt pressure crosses
+its threshold it folds a span of older events into a summary checkpoint. That is DSH replacing its own
+memory: **lossy, and not undoable from here.** Up to now the three session events it emits
+(`compaction/start` / `summary` / `end`) were forwarded to the extension and **simply not read**, so the
+moment your model's memory got folded, the UI said nothing at all. Now:
+
+- **The transcript gets a note** ("上下文已压缩：前 N 条事件（约 X token）已折叠成摘要…") plus a count on
+  the usage bar (**已压缩 N 次** — the note scrolls away, the count does not). A failed compaction says so
+  too, and says the memory was **not** touched. The summary body itself is deliberately **not** echoed
+  into the transcript — that would be pouring a second-hand recollection into your record.
+- **The usage bar carries the occupancy**, appended to the existing readout: `上下文 24.0K / 1.0M`, with
+  `⚠ 接近压缩阈值` once you are near the line and `· 上次` when the number is the last sample from a
+  previous run rather than live.
+  ⚠️ **The two numbers are not the same number.** The bar's occupancy is the provider-reported prompt-side
+  pressure; DSH decides to compact using its own `token-meter` heuristic. So the UI says "near" and never
+  "X tokens until compaction" — the tooltip spells this out.
+- **You can move the line**: `hello.chat.compaction.thresholdRatio` (default `0.8`, i.e. DSH's own value).
+  It is written into a *derived* copy of your `cordis.yml` in the extension's storage dir — your file is
+  never modified — and `retainRatio` is rescaled with it, because the plugin refuses to load if retention
+  is not below the threshold. Requires a reconnect. At the default this line is ~800K tokens on a 1M
+  window, so **in normal use it will never trigger**; lower it if you want to see compaction happen.
+- **Folding the transcript is a different thing entirely.** Once a session grows past 60 messages the
+  older ones collapse behind a 「更早的 N 条已折叠」 row. That is **purely a rendering change** — no
+  message is lost, the snapshot payload is not one byte smaller, and DSH's context is untouched. It
+  exists because the webview rebuilds the whole message DOM on every frame.
+
+**Cannot be done from here** (checked, not assumed): compaction cannot be triggered on demand — the wire
+has no compaction RPC, the `/compact` command is not composed, and its executor has no caller in the
+JSON-RPC path. DSH's `session.jsonl.zstd` cannot be archived either: it is an append-only log with zstd
+frame boundaries and offset repair, so editing it breaks continuation outright.
+
+---
+
 ## Real DSH components (react-live, optional)
 
 When the harness transcript is rendered with DSH's own React components, the panel pulls in the
@@ -345,6 +382,7 @@ finished path.
 | `src/runInspector.ts` | Run inspector: the per-turn frame timeline (tool sequence / turn·step·tool durations / this turn's error). **Memory only, last 20 turns**, every duration is a subtraction of the `time` the envelope already carries (pure, zero imports) |
 | `src/sessionSearch.ts` | Full-text search over stored transcripts (pure, no `vscode`) |
 | `src/sessionExport.ts` | Transcript → Markdown / JSON, and safe default file names (pure, no `vscode`) |
+| `src/compactionNotice.ts` | Turns DSH's `compaction/summary` / `compaction/end` payloads into a transcript note — degrades to “details missing” rather than going silent, reports success exactly once, and never copies the summary body into the transcript (pure, no `vscode`) |
 | `src/dshPaths.ts` | DSH session-log path algorithm (**copied verbatim from the persistence plugin**) + guarded removal (pure, no `vscode`) |
 | `src/extension.ts` | Extension entry: commands + view registration |
 | `media/chat.{html,js,css}` | Side-panel front end (mode pills + harness status dot; DSH theme tokens with VS Code fallbacks) |
@@ -354,7 +392,11 @@ finished path.
 | `scripts/probe-purge.mjs` | Self-check for path parity / guarded removal / retention boundaries (same; **path parity needs Node ≥ 22.15** and points you at `dist-runtime/node/node.exe` otherwise) |
 | `scripts/probe-turn-state.mjs` | Self-check for the Continue-button verdict + online status tracking (same; no VS Code, no API key) |
 | `scripts/probe-approval-shell.mjs` | Self-check for the C1 approval hook's shell-form verdict: at least one form runs, the two are mutually exclusive, and the second form rescues a wrong first guess — plus the pure-function rules for the platform prior and for inconclusive failures (timeout / silent non-zero exit), which are retried exactly once (same; no VS Code, no API key) |
-| `scripts/probe-run-inspector.mjs` | Self-check for the C9 run inspector: frame filtering (5000 `assistant/chunk` must change nothing), call/result pairing (including DSH repair frames' three-state verdict and a conservation law over them), the outcome precedence table, ring/dropped caps, and a replay of both the newest capture in `logs/dsh-frames/` **and** a real `session.jsonl.zstd` cross-checked against independently derived oracles (same; no VS Code, no API key) |
+| `scripts/probe-run-inspector.mjs` | Self-check for the C9 run inspector: frame filtering (5000 `assistant/chunk` must change nothing), call/result pairing (including DSH repair frames' three-state verdict and a conservation law over them), the outcome precedence table, ring/dropped caps, and a replay of both the newest capture in `logs/dsh-frames/` **and** a real `session.jsonl.zstd` cross-checked against independently derived oracles (same; no VS Code, no API key). The session log is picked as the newest one that actually **carries repair frames** — those only appear when a turn is interrupted, so always taking the newest just meant a false red every few sessions |
+| `scripts/probe-compaction-notice.mjs` | Self-check for the C10 compaction notice: the plugin's `compaction/summary` and `compaction/end` payloads turn into a transcript note, never silently (`undefined` only for unrelated types), exactly once per successful compaction, and **never** echoing the summary body into the transcript (same; no VS Code, no API key) |
+| `scripts/probe-compaction-override.mjs` | Self-check for the C10 threshold override: anchored rewriting of the two `compaction-basic` ratios only (exactly two lines differ, CRLF kept, idempotent, sibling `modelPolicies[].thresholdRatio` untouched, 9 rejection cases), `retainRatio < thresholdRatio` held across the whole range, and **the default value produces a byte-identical file** — which is what makes C1's zero-regression structural rather than luck (same; no VS Code, no API key) |
+| `scripts/probe-webview-render.mjs` | Self-check for `media/chat.js` rendering, run in Node behind a minimal DOM shim (the only way to exercise that code before F5): the usage bar's `near` / `stale` / `compacted` states and its `.near` class, the transcript fold (head folded, correct count, expand restores everything, reset on session switch), plus a small C9 runs-bar/panel regression sample. It has already caught two real bugs of the “a shadow that lies is worse than no shadow” kind (same; no VS Code, no API key) |
+| `scripts/probe-derived-config-boot.mjs` | Boots the portable runtime the way the extension spawns it — base config as the **positional** arg, derived config only via `DSH_CORDIS_CONFIG` — with one positive control (a valid override loads) and one negative control (a derived file violating the plugin's load-time `retainRatio < thresholdRatio` rule **must** fail to boot). The negative control is the point: it proves the env var wins, which is the single thread C1 and C10 both hang on (same; no VS Code, no API key) |
 | `scripts/probe-c8-runtime.mjs` | Runtime spike for C8: queued second prompt, kill-then-resume turn repair, graceful vs hard kill. **Needs an API key** and spends real model turns |
 | `scripts/update-dsh.mjs` | Runtime-dependency governance: lock the DSH checkout to a tag, check drift, run the upgrade ritual + smoke (see `docs/runtime-dependency.md`) |
 | `docs/runtime-dependency.md` | Governance decision for treating the DSH checkout as a versioned runtime dependency, the upgrade ritual, and the “when to switch to official npm” checklist |

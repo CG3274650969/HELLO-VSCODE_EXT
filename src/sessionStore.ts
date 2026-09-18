@@ -49,6 +49,17 @@ export interface StoredSession {
    *
    *  用户一发新消息就清掉；所以按钮的失效不需要额外逻辑。旧数据没有本字段 → 向后兼容。 */
   lastTurn?: LastTurn;
+  /** C10：**最后一次已知的上下文占用**，轮尾写入。
+   *
+   *  为什么非落盘不可：占用读数本来只活在内存里（`_turnUsage` / `_contextWindow`），
+   *  重载窗口或切回一个旧会话时它是空的 —— 而占用恰恰是这条指示唯一要说的东西。
+   *  它是**上次已知值**不是实时值，读出来会标 `stale`（渲染成「上次」），不冒充实时。
+   *  旧数据没有本字段 → 向后兼容。 */
+  context?: { usedTokens: number; contextWindow: number; at: number };
+  /** C10：本会话被 DSH 压缩过几次（累计）。只用来在读数条上写「· 已压缩 N 次」——
+   *  「发生过压缩」这件事的**正文说明**是转写里那条 note（见 compactionNotice.ts）。
+   *  旧数据没有本字段 → 向后兼容。 */
+  compacted?: number;
 }
 
 /** 由首条用户消息生成一句话标题（单行、截断）。 */
