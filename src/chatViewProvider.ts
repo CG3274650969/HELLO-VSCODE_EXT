@@ -24,13 +24,28 @@ import {
   compactionOverride,
   DEFAULT_COMPACTION_THRESHOLD_RATIO,
   nextShellCheck,
-  probeShell,
+  probeBash,
+  shellGuessOnTimeout,
   ShellCheckAttempt,
   ShellKind,
   testApprovalHook,
   writeApprovalHookFiles,
   writeDerivedConfig,
 } from './dshHooks';
+import {
+  adviceFor,
+  classifyBashPath,
+  gitBashCandidateDirs,
+  prependPathDir,
+  readPosixTarget,
+  resolveOnPath,
+  shellPin,
+  shellStatusSegment,
+  shellWarnFor,
+  usabilityOf,
+  wslCodeOf,
+  ShellDiagnosis,
+} from './shellDiag';
 import {
   EFFORT_VALUES,
   EffortPluginMount,
@@ -186,6 +201,14 @@ function oneLine(text: string, max: number): string {
 
 /** 单条工具输出在转写里最多展示的字符数（超出截断 + 提示） */
 const MAX_TOOL_OUTPUT_CHARS = 4000;
+
+/**
+ * C13：shell 诊断那一次 probe 的超时预算。与 `probeShell` 的 8 s 相同 —— 能答的 bash 答得极快
+ * （Git Bash 实测约 130 ms），撞到 8 s 的只可能是正在冷启动的 WSL。
+ */
+const SHELL_PROBE_TIMEOUT_MS = 8000;
+/** C13：坏了之后最多实测几个备选目录（每个都要起一次进程，别让一台坏机器被探成启动风暴） */
+const MAX_SHELL_FIX_PROBES = 3;
 /** 1.1 选区注入的兜底摘录护栏（正常走 @临时文件，只在写盘失败时用）：行数/字符双上限，防整段大选区刷爆对话。 */
 const SNIPPET_LINE_CAP = 100;
 const SNIPPET_CHAR_CAP = 8000;
@@ -420,13 +443,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _approvalSetup?: Promise<void>;
   /** 挂起审批的命令原文（id → 命令），结算时写留痕用 */
   private readonly _approvalCmds = new Map<string, string>();
+  /** C13：挂起审批的路径两读法说明（id → note）。**与 `_approvalCmds` 分开存** ——
+   *  它只在 POSIX 形态的 write/edit 上才有，而 `_approvalCmds` 每条都必须有（留痕要用） */
+  private readonly _approvalNotes = new Map<string, string>();
   /** 审批相关告警是否已弹过（每次 activation 最多烦用户一次） */
   private _approvalWarned = false;
   /**
    * 「不可判的失败」那次重试是否已用掉（每次 activation 一次）。冷启动只发生一次，
    * 重试也只该给一次 —— 否则每发一条消息都要先干等两轮自检超时。
+   *
+   * ⚠️ C13 起这是**审批自检与 shell 诊断共用**的预算，名字不再只属于审批：诊断先探到「不可判」
+   * 就用掉它（那时 WSL 正在开机，等一会儿再探通常就过），审批那边于是不再重试一遍 ——
+   * 反过来也一样。共享的理由很实在：两台功能探的是**同一把 bash、同一个冷启动**，
+   * 各给一次等于在最慢的那台机器上白烧两轮超时。
    */
-  private _approvalRetried = false;
+  private _coldStartRetried = false;
   /** C8c：存储相关告警是否已弹过。**独立旗标** —— 与审批共用一个的话，先到的那个会把后到的整条吞掉 */
   private _storageWarned = false;
   /** 与视图无关的订阅（全局配置变更监听），dispose 时统一清 */
@@ -443,6 +474,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _overlayConfigPath?: string;
   /** C10：压缩阈值覆盖相关告警是否已弹过。**独立旗标**，理由同 `_storageWarned` */
   private _compactionWarned = false;
+
+  // ---------- C13 shell 诊断（agent 的 bash 会命中谁、能不能用）状态 ----------
+
+  /** 算好的诊断（引用非空 = 本次已经算过一轮；设置一变就作废，见 `_invalidateShellDiag`） */
+  private _shellDiag?: ShellDiagnosis;
+  /** 进行中的诊断（幂等：并发调用共享同一个 promise —— 诊断与审批的首猜都要它） */
+  private _shellDiagSetup?: Promise<ShellDiagnosis>;
+  /** shell 诊断告警是否已弹过。**独立旗标**，理由同 `_storageWarned` */
+  private _shellWarned = false;
+  /**
+   * 本次会话**实测通过**的备选 bash 目录（只有它非空才给「钉住这个 bash」按钮）。
+   * 绝不凭形状推荐：形状是启发式，能跑不能跑只有探过才知道。
+   */
+  private _shellFixDirs: string[] = [];
 
   // ---------- C11 会话级推理档位状态 ----------
 
@@ -564,6 +609,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (this._abort || this._liveRunning) return; // 同审批：跑着不动，下次连接带上
         this._overlayConfigPath = undefined; // 先作废旧指向，防重连失败时还留着上一份派生文件
         void this._ensureApproval().then(() => this._restartLiveProcess());
+      })
+    );
+    // C13：钉住的 bash 变了 → 诊断作废 + 审批重跑 + 重连（子进程的 PATH 是 spawn 时定的，
+    // 不重连换不掉）。**也认 runtimeDir / nodePath / command** 那三个：它们决定"跑哪份字节"，
+    // 而诊断里「哪个 node 会在哪个 cwd 里跑」的读数跟着它们变。第三条独立监听器，
+    // 理由同上面两条：并进去的话，将来任何一边加条件都会误伤另一边。
+    this._globalDisposables.push(
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        const bashChanged = e.affectsConfiguration('hello.dsh.bashPath');
+        const runtimeChanged =
+          e.affectsConfiguration('hello.dsh.runtimeDir') ||
+          e.affectsConfiguration('hello.dsh.nodePath') ||
+          e.affectsConfiguration('hello.dsh.command');
+        if (!bashChanged && !runtimeChanged) return;
+        if (this._abort || this._liveRunning) return; // 跑着不动，下次连接自然带上
+        this._invalidateShellDiag();
+        void this._ensureApproval().then(() => this._restartLiveProcess());
+      })
+    );
+    // C13：区外写开关翻了 ⇒ 诊断里那句「能不能出工作区」要跟着变。**只更新那一个字段再重发状态** ——
+    // 重算整份诊断等于再起一次 shell 进程，纯属白搭。
+    this._globalDisposables.push(
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (!e.affectsConfiguration('hello.chat.approval.outsideWorkspace')) return;
+        if (this._shellDiag) this._shellDiag.outsideGated = this._approvalOutsideEnabled();
+        this._postBackendStatus();
       })
     );
   }
@@ -1698,6 +1769,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     } catch {
       /* key 解析失败不阻断握手：让子进程侧（llm-deepseek）报更具体的错 */
     }
+    // C13：**启动** shell 诊断但**不 await** 它 —— 它是「读数 + 告警」，不该拖连接。但必须赶在
+    // 审批之前**启动**：`_setupApproval` 的首猜就是它的结论（两者共享同一次 probe）。
+    // 不 await 的理由是延迟：await 会让激活变成「诊断 + 审批」两段**之和**（冷启动最坏
+    // 16s + 15s），而共享同一个 promise 是 **max** 而不是 sum，且 WSL 只被唤醒一次。
+    void this._ensureShellDiag().then((d) => {
+      this._postBackendStatus(); // 补上顶栏那段 bash 读数
+      const warn = shellWarnFor(d);
+      if (warn) this._shellWarn(warn);
+    });
     // C1：审批必须在 spawn **之前**就绪 —— _makeSpawnRequest 是同步的，它读的就是
     // _approvalFiles（派生配置路径）。准备失败会在内部告警并降级，不阻断连接。
     await this._ensureApproval();
@@ -2731,22 +2811,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     // hook 由 DSH 用 `bash -c` 跑，而 bash 既可能是 WSL 也可能是 Git Bash —— 命令里的路径形态
     // 完全不同（WSL 下 `D:\…\node.exe` 连可执行文件都算不上，直接 command not found）。
-    // probeShell 只是**首猜**（超时会按平台先验落到 wsl，见 shellGuessOnTimeout），真正的判据是
-    // **自检本身**：哪种形态的命令在同一把 shell 里跑得起来，就是它。两种形态互斥（A 形态的
-    // 命令在 B 里必然 command not found），所以「谁过」是无歧义的。
+    //
+    // C13 起首猜改从**诊断**来（`_ensureShellDiag`）：两者本就探的是同一把 bash，各起一次 probe
+    // 只会把一个冷启动叠成两份超时。诊断说不出形态时（不可判 / 坏）回落到平台先验，
+    // 与从前 `probeShell` 的行为一致。首猜仍然只是**首猜**，真正的判据是**自检本身**：
+    // 哪种形态的命令在同一把 shell 里跑得起来，就是它。两种形态互斥（A 形态的命令在 B 里必然
+    // command not found），所以「谁过」是无歧义的。
     //
     // 排程交给 nextShellCheck（纯函数，探针钉着）：它额外负责**冷启动那次不算数** —— 重载那一刻
     // WSL 可能还在开机，超时/空手退出这两种「不可判」的失败不判形态死刑，排到队尾再验一次。
     // 线上症状就是这么来的：posix 形态自检超时(15s) + wsl 形态 `bash 退出码 1`（两边空），
     // 两条都不说明形态写错了，却把审批整个关掉了。
     const runCwd = this._dshRunCwd();
-    const guess = await probeShell(runCwd);
+    const diag = await this._ensureShellDiag();
+    const guess: ShellKind = diag.kind ?? shellGuessOnTimeout();
     const order: ShellKind[] = guess === 'wsl' ? ['wsl', 'posix'] : ['posix', 'wsl'];
 
     const attempts: ShellCheckAttempt[] = [];
     // 重试每次 activation 只给一次：冷启动只发生一次，下一次 spawn 时 WSL 已经热了（那时首轮就过）。
     // 不这么闸住的话，真接不上的场景会变成「每发一条消息先干等两轮超时」。
-    let retriesUsed = this._approvalRetried ? 1 : 0;
+    // ⚠️ C13 起这笔预算与 shell 诊断**共享**（诊断先探到「不可判」就会用掉它）。
+    let retriesUsed = this._coldStartRetried ? 1 : 0;
     const failure: string[] = [];
     for (;;) {
       const shellKind = nextShellCheck(order, attempts, retriesUsed);
@@ -2754,7 +2839,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const isRetry = attempts.some((a) => a.kind === shellKind);
       if (isRetry) {
         retriesUsed += 1;
-        this._approvalRetried = true;
+        this._coldStartRetried = true;
       }
       let files: ApprovalHookFiles;
       try {
@@ -2766,7 +2851,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return;
       }
       // 自检：这条 hook 命令在**同一个 shell**（DSH 也是 bash -c）里跑得起来吗？
-      const test = await testApprovalHook(files.hookCommand, runCwd);
+      // ⚠️ env 必须与运行时子进程拿到的那份**一致**（C13 修的）：hook 是 DSH 在**运行时子进程**里
+      // 跑的，用的是我们注入的 PATH；从扩展宿主用 `process.env` 去探，探的是**宿主**的 PATH。
+      // 今天两者碰巧相同，一旦用户钉了 bash 就不同 —— 而 shellKind 正是从自检结果推出来的，
+      // 推错 = 审批直接失效（探针还照样是绿的）。
+      const test = await testApprovalHook(files.hookCommand, runCwd, { env: this._dshEnv() });
       attempts.push({ kind: shellKind, retriable: test.retriable });
       if (test.ok) {
         this._approval = server;
@@ -2830,11 +2919,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _onApprovalAsk(ask: ApprovalAsk): void {
     const label = this._approvalLabel(ask);
     this._approvalCmds.set(ask.id, label);
+    // C13：POSIX 形态的路径多给一段两读法说明（只显示，不改写，也不给按钮）
+    const pathNote = this._approvalPathNote(ask);
+    if (pathNote) this._approvalNotes.set(ask.id, pathNote);
+    else this._approvalNotes.delete(ask.id);
     this._post({
       type: 'approval-request',
       id: ask.id,
       toolName: ask.toolName,
       command: label,
+      pathNote,
     });
     // 视图折叠着就看不到确认条，只能干等到超时 → 主动把它亮出来（失败也不影响流程）
     vscode.commands.executeCommand('hello.chatView.focus').then(undefined, () => {});
@@ -2845,6 +2939,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _onApprovalResolved(id: string, outcome: ApprovalOutcome): void {
     const command = this._approvalCmds.get(id);
     this._approvalCmds.delete(id);
+    const pathNote = this._approvalNotes.get(id);
+    this._approvalNotes.delete(id);
     this._post({ type: 'approval-resolved', id, outcome });
     if (!command) return;
     const label =
@@ -2855,7 +2951,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           : outcome === 'timeout'
             ? '确认超时，已按拒绝处理（未执行）'
             : '审批已取消（本轮停止或切换），未执行';
-    this._pushNote(`${label}：${oneLine(command, 120)}`);
+    // C13：留痕里带上那句「按 DSH 的解析方式会落到 X」—— 事后再看转写时，这是唯一能解释
+    // 「我明明写的是 /mnt/d/x，为什么盘上多了一个 D:\mnt\d\x」的地方
+    this._pushNote(`${label}：${oneLine(command, 120)}${pathNote ? `（${oneLine(pathNote, 160)}）` : ''}`);
   }
 
   /** 审批相关告警：控制台始终留痕，用户侧每次 activation 只弹一次（不刷屏）。 */
@@ -2864,6 +2962,221 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (this._approvalWarned) return;
     this._approvalWarned = true;
     void vscode.window.showWarningMessage(`事前审批未生效：${text}`);
+  }
+
+  // ---------- C13 shell 诊断 ----------
+
+  /** 告警上的按钮文案：唯一定义处（弹窗与结算两处用同一份，防漂移） */
+  private static readonly FixPin = '钉住这个 bash';
+  private static readonly FixClear = '清除这项设置';
+  private static readonly FixWsl = '怎么装 WSL 发行版';
+  private static readonly FixSettings = '打开设置';
+
+  /**
+   * 算一次 shell 诊断（幂等）。**诊断与审批的首猜共享这一份 promise** —— 两处各起一次 probe
+   * 只会把一个冷启动叠成两份超时，而它们探的本来就是同一把 bash。
+   *
+   * ⚠️ **绝不能住在 `_setupApproval` 里**：`hello.dsh.command` 整段覆盖时审批整个不接入，
+   * 可 bash 工具照样天天在用 —— 住进去 = 那类用户永远看不到 shell 告警，而且文案还会把
+   * 一个 shell 问题指向「审批」。
+   */
+  private _ensureShellDiag(): Promise<ShellDiagnosis> {
+    if (this._shellDiag) return Promise.resolve(this._shellDiag);
+    if (this._shellDiagSetup) return this._shellDiagSetup;
+    const p = this._runShellDiag();
+    this._shellDiagSetup = p;
+    const clear = (): void => {
+      if (this._shellDiagSetup === p) this._shellDiagSetup = undefined;
+    };
+    p.then(clear, clear);
+    return p;
+  }
+
+  /** 诊断本体：解析 → 分类 → 探一次 → （不可判才）重试一次 → （坏了才）找备选。 */
+  private async _runShellDiag(): Promise<ShellDiagnosis> {
+    const platform = process.platform;
+    const runCwd = this._dshRunCwd();
+    // pin 已经生效在这个 env 里（见 `_dshEnv`）；且它**必然带 PATH 键** —— F3 的地雷：
+    // env 没有 PATH 键时 libuv 会回退宿主真实环境，那样探测结果与实际不符。
+    const env = this._dshEnv();
+    const res = resolveOnPath('bash', env, { cwd: runCwd });
+    const cls = classifyBashPath(res.path);
+    const pinRaw = this._pinnedBashRaw();
+    const pinned = this._pinnedBashDir();
+    const diag: ShellDiagnosis = {
+      platform,
+      bashPath: res.path,
+      shape: cls.shape,
+      classEvidence: cls.evidence,
+      hits: res.hits,
+      tried: res.tried,
+      usability: 'broken',
+      // 设了 pin 却落不到文件上 —— 必须报出来：用户亲手写的设置静默失效是最坏的一种「安静」
+      pinMissing: pinRaw && !pinned ? pinRaw : undefined,
+      pinned: pinned?.file,
+      runCwd,
+      outsideGated: this._approvalOutsideEnabled(),
+    };
+
+    if (!res.path) {
+      // PATH 上一个 bash 都没有 → 确定性地坏，连 spawn 都不必试
+      diag.usability = usabilityOf({ ok: false, retriable: false, noCandidate: true, stdout: '' });
+      diag.detail = `沿 PATH 没找到 bash（看过 ${res.tried.length} 个位置）`;
+    } else {
+      let probe = await probeBash(runCwd, { env, timeoutMs: SHELL_PROBE_TIMEOUT_MS });
+      // 「不可判」才重试，且**全局只给一次**（与审批自检共享同一个预算，见 `_coldStartRetried`）：
+      // 冷启动只发生一次，而重试这一次本身就把 WSL 等热了。
+      if (probe.retriable && !this._coldStartRetried) {
+        this._coldStartRetried = true;
+        probe = await probeBash(runCwd, { env, timeoutMs: SHELL_PROBE_TIMEOUT_MS });
+      }
+      diag.usability = usabilityOf({
+        ok: probe.ok,
+        retriable: probe.retriable,
+        spawnError: probe.spawnError,
+        stdout: probe.stdout,
+      });
+      diag.kind = probe.kind;
+      diag.unameRaw = probe.stdout;
+      diag.detail = probe.spawnError ?? probe.detail;
+      // F4：WSL shim 的报错话术随系统语言变，`WSL_E_*` 不变 —— 认它
+      diag.wslCode = wslCodeOf(probe.stdout) ?? wslCodeOf(probe.stderr);
+    }
+
+    // 坏了才去找备选（能用的时候去找，等于白起进程）；找到的每个都**必须实测通过**才算数
+    if (diag.usability === 'broken') this._shellFixDirs = await this._verifiedFixDirs(res.hits, env, platform);
+    this._shellDiag = diag;
+    return diag;
+  }
+
+  /**
+   * 备选 bash 目录：只收**实测探得通**的。
+   *
+   * 两个来源，PATH 上真命中过的排在前面 —— 它本来就在这台机器上，比厂商默认位置实在。
+   */
+  private async _verifiedFixDirs(
+    hits: { path: string; dir: string }[],
+    env: NodeJS.ProcessEnv,
+    platform: NodeJS.Platform
+  ): Promise<string[]> {
+    const found: string[] = [];
+    for (const h of hits) {
+      if (classifyBashPath(h.path).shape === 'git-bash' && !found.includes(h.dir)) found.push(h.dir);
+    }
+    for (const dir of gitBashCandidateDirs(env, platform)) {
+      if (found.includes(dir)) continue;
+      try {
+        if (fs.statSync(path.join(dir, 'bash.exe')).isFile()) found.push(dir);
+      } catch {
+        /* 这台机器上没有这个默认位置，跳过（**不 spawn** —— 不存在的目录探了也是白探） */
+      }
+    }
+    const runCwd = this._dshRunCwd();
+    const ok: string[] = [];
+    for (const dir of found.slice(0, MAX_SHELL_FIX_PROBES)) {
+      const p = await probeBash(runCwd, { env: prependPathDir(env, dir, platform), timeoutMs: SHELL_PROBE_TIMEOUT_MS });
+      if (usabilityOf({ ok: p.ok, retriable: p.retriable, spawnError: p.spawnError, stdout: p.stdout }) === 'usable') {
+        ok.push(dir);
+      }
+    }
+    return ok;
+  }
+
+  /**
+   * 诊断缓存作废（设置变了 / 用户点了「钉住」）。**审批也一并作废** —— 换 shell 可能换掉 hook
+   * 命令的路径形态（Windows 形式 vs `/mnt/…`），那正是自检要重跑的理由。
+   */
+  private _invalidateShellDiag(): void {
+    this._shellDiag = undefined;
+    this._shellDiagSetup = undefined;
+    this._shellFixDirs = [];
+    this._coldStartRetried = false; // 换了一把 bash = 一次全新的冷启动
+    this._shellWarned = false; // 用户亲手动了手，值得再看一次结论
+    this._approval = undefined;
+    this._approvalFiles = undefined;
+  }
+
+  /**
+   * C13 告警：控制台始终留痕，用户侧每次 activation 只弹一条。
+   *
+   * 「只在 `broken`（或用户自己钉的路径不存在）时才有文本」是**纯函数** `shellWarnFor` 的判据，
+   * 探针用配对断言钉着它 —— 冷启动的「不可判」永不弹窗，这是不误报的全部保证。
+   */
+  private _shellWarn(text: string): void {
+    console.warn('[shell]', text);
+    if (this._shellWarned) return;
+    this._shellWarned = true;
+    const d = this._shellDiag;
+    const buttons: string[] = [];
+    if (this._shellFixDirs.length) buttons.push(ChatViewProvider.FixPin);
+    if (d?.pinMissing) buttons.push(ChatViewProvider.FixClear);
+    if (d?.shape === 'wsl-shim') buttons.push(ChatViewProvider.FixWsl);
+    buttons.push(ChatViewProvider.FixSettings);
+    void vscode.window.showWarningMessage(`agent 的 bash：${text}`, ...buttons).then((pick) => {
+      this._onShellRemedy(pick);
+    });
+  }
+
+  private _onShellRemedy(pick: string | undefined): void {
+    if (!pick) return;
+    if (pick === ChatViewProvider.FixPin) {
+      const dir = this._shellFixDirs[0];
+      if (dir) this._applyShellPin(path.join(dir, 'bash.exe'));
+      return;
+    }
+    if (pick === ChatViewProvider.FixClear) {
+      this._applyShellPin('');
+      return;
+    }
+    if (pick === ChatViewProvider.FixWsl) {
+      // **不代跑 `wsl.exe`** —— 装发行版会改这台机器的全局状态，那必须由用户自己在终端里做。
+      // 只给文本，顺手把命令放进剪贴板（按一下就省了手打）。
+      const text = 'wsl --install -d Ubuntu（装完要重启），然后 wsl -l -v 确认它是 Running。';
+      void vscode.env.clipboard.writeText('wsl --install -d Ubuntu');
+      void vscode.window.showInformationMessage(`${text}命令已复制。`, ChatViewProvider.FixSettings);
+      return;
+    }
+    if (pick === ChatViewProvider.FixSettings) {
+      void vscode.commands.executeCommand('workbench.action.openSettings', 'hello.dsh.bashPath');
+    }
+  }
+
+  /**
+   * 写设置里那个 pin。**只管写** —— 作废缓存与重连交给配置变更那条监听器（与 `approval.enabled`
+   * 同一条路径）。自己再走一遍会变成两次重启。
+   */
+  private _applyShellPin(value: string): void {
+    void vscode.workspace
+      .getConfiguration('hello')
+      .update('dsh.bashPath', value, vscode.ConfigurationTarget.Global)
+      .then(undefined, (err) => {
+        void vscode.window.showErrorMessage(
+          `写入 hello.dsh.bashPath 失败：${err instanceof Error ? err.message : String(err)}`
+        );
+      });
+  }
+
+  /**
+   * C13：模型递上 POSIX 形态路径时的**两读法说明**（`docs/backlog.md` 里那次 `/mnt/d` 真事故）。
+   *
+   * ⚠️ 三条硬规矩：
+   * 1. **只显示，绝不改写** —— 路径归一化是本次明确不做的事（那会改变 agent 的文件落点）。
+   * 2. **`cwd` 必须来自 hook 载荷**，缺了就整条不显示：盘符来自 cwd，缺了会自信地印一个**错的**
+   *    落点，那比不说更糟。
+   * 3. **不给按钮** —— 一个「改用 D:\x」的按钮等于借 UI 把没做的归一化偷偷做掉。
+   */
+  private _approvalPathNote(ask: ApprovalAsk): string | undefined {
+    const raw = String(ask.filePath ?? '').trim();
+    if (!raw) return undefined;
+    const t = readPosixTarget(raw, String(ask.cwd ?? '').trim());
+    if (!t) return undefined;
+    const lines = [`已按 POSIX 形态给出：${t.raw}`];
+    if (t.intended) lines.push(`模型想指的应是：${t.intended}`);
+    lines.push(`按 DSH 的解析方式会落到：${t.actual}（/… 被当成 Windows 相对根）`);
+    // 最后这行收益最大：DSH 的 fs 工具对 POSIX 形态解析不出绝对路径 ⇒ 我们不会为它抓轮前快照
+    // ⇒ 这次改动对**本轮审阅是隐形的**（C4 那次真事故里确认条弹对了，但用户不知道这件事）。
+    lines.push('本次不会为它抓轮前快照 —— 通常意味着这次改动不会出现在本轮审阅里。');
+    return lines.join('\n');
   }
 
   /**
@@ -3060,7 +3373,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     const key = this._apiKeyCache || '';
     if (key) env.DEEPSEEK_API_KEY = key;
+
+    // C13：钉住 bash 的**唯一**注入点。agent 的 bash 工具硬写 `bash -c`、上游没有换 shell 的
+    // 配置键，所以 PATH 是唯一的杠杆（实测 F1：`spawn(…, {env})` 用的就是**这个 env 的 PATH**）。
+    //
+    // **没设 pin 就一步都不走** —— 最强形式的零回归：未设时返回的 env 与从前逐字节相同
+    // （探针钉着这条）。设了但文件不存在也**不前置**：指空要如实报出来（诊断那边报），
+    // 悄悄前置一个不存在的目录只会让 PATH 多一段垃圾、bash 照样解析到别的。
+    const pinned = this._pinnedBashDir();
+    if (pinned) return prependPathDir(env, pinned.dir, process.platform);
     return env;
+  }
+
+  /** 设置里 pin 的原文（空白 = 未设，体例同其它取值函数）。 */
+  private _pinnedBashRaw(): string | undefined {
+    return shellPin(this._dshConfig().get('bashPath'));
+  }
+
+  /** pin 指向的那把 bash —— **只有它真是一个文件才返回**（指空/指目录 = 当作没设，交给诊断去说）。 */
+  private _pinnedBashDir(): { dir: string; file: string } | undefined {
+    const raw = this._pinnedBashRaw();
+    if (!raw) return undefined;
+    try {
+      if (!fs.statSync(raw).isFile()) return undefined;
+    } catch {
+      return undefined;
+    }
+    return { dir: path.dirname(raw), file: raw };
   }
 
   /**
@@ -3167,6 +3506,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       model: this._backendModel,
       detail: this._backendDetail,
       busy,
+      // C13：bash 读数。诊断还没算出来 ⇒ undefined（webview 那边就不渲染这一段，
+      // 与「能用且不是 WSL ⇒ 整段不出现」是同一个表现，不需要额外区分）
+      shell: this._shellDiag ? shellStatusSegment(this._shellDiag) : undefined,
     });
     this._postLiveConfig(); // 顺带刷新配置条（模型/预设/API 灯）
   }

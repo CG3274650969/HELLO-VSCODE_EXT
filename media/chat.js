@@ -34,6 +34,10 @@
 
   // Harness 连接状态点：仅 harness 模式可见（applyMode 切 hidden）
   var harnessStatusEl = document.getElementById('harness-status');
+  var harnessShellEl = document.getElementById('harness-shell');
+  // C13：最近一次收到的 bash 读数。存着不是为了「记住旧值」（不带 shell 的载荷会清掉它），
+  // 而是因为切模式时扩展**不会**重发 backend-status —— 切回 harness 得靠它把那段补回来
+  var shellSeg = null;
 
   var chatTitle = document.getElementById('chat-title');
   var chatTitleInput = document.getElementById('chat-title-input');
@@ -99,6 +103,7 @@
   // C1 事前审批：待确认的那条（id 非空 = 确认条亮着，整轮正阻塞等这一答）
   var approvalBar = document.getElementById('approval-bar');
   var approvalCmd = document.getElementById('approval-cmd');
+  var approvalNote = document.getElementById('approval-note');
   var approvalTool = document.getElementById('approval-tool');
   var approvalAllowBtn = document.getElementById('approval-allow');
   var approvalDenyBtn = document.getElementById('approval-deny');
@@ -263,6 +268,10 @@
     approvalId = data.id;
     approvalTool.textContent = data.toolName ? '（' + data.toolName + '）' : '';
     approvalCmd.textContent = data.command || '';
+    // C13：路径两读法说明。**只显示**（一个字的改写权都没有），没内容就整段不出现 ——
+    // 反控也在这儿：不带 pathNote 的老载荷走同一行代码，得到的就是 hidden
+    approvalNote.textContent = data.pathNote || '';
+    approvalNote.hidden = !data.pathNote;
     approvalBar.hidden = false;
     scrollToBottom();
   }
@@ -272,6 +281,8 @@
     approvalId = null;
     approvalBar.hidden = true;
     approvalCmd.textContent = '';
+    approvalNote.textContent = '';
+    approvalNote.hidden = true;
     approvalTool.textContent = '';
   }
 
@@ -617,10 +628,41 @@
       harnessStatusEl.textContent = '未连接';
       harnessStatusEl.title = '';
     }
+    renderShellStatus(data.shell);
     // 状态一变，底部配置条跟着刷新（含未配置时的引导空态文案）
     refreshLiveConfigVisibility();
     refreshLiveConfigEnabled();
     syncReactLive(); // harness ⇄ 真 DSH 对话画面（产物齐全时）
+  }
+
+  /** C13：把顶栏那段 bash 读数藏掉（**不动 `shellSeg` 缓存** —— 切回 harness 时它要原样回来）。 */
+  function hideShellSegment() {
+    harnessShellEl.textContent = '';
+    harnessShellEl.title = '';
+    harnessShellEl.className = 'harness-shell';
+    harnessShellEl.hidden = true;
+  }
+
+  /**
+   * C13：顶栏那一段 bash 读数（`bash=WSL` / `bash=?` / `bash=坏`）。
+   *
+   * 三态由扩展侧算（`shellStatusSegment`，纯函数），这里只画，只用 textContent。可见性两道闸：
+   * 1. **不带 `shell` 就整段不出现** —— 「能用且不是 WSL」「诊断还没算出来」「扩展是老版本」
+   *    三种情况表现一致，都是 hidden；
+   * 2. **chat 模式下也不出现**，同 `#harness-status` 那条规矩。⚠️ 这道闸必须在**这里**，
+   *    光在 `applyMode` 里藏不够：扩展会在任意时刻重发 `backend-status`（连上、重连、改设置），
+   *    chat 模式下一帧就能把这个读数重新点亮 —— 而那个模式里根本没有 agent 在跑 bash。
+   */
+  function renderShellStatus(shell) {
+    shellSeg = shell && shell.label ? shell : null;
+    if (!shellSeg || currentMode !== 'harness') {
+      hideShellSegment();
+      return;
+    }
+    harnessShellEl.textContent = shellSeg.label;
+    harnessShellEl.title = shellSeg.title || '';
+    harnessShellEl.className = 'harness-shell ' + (shellSeg.level || 'warn');
+    harnessShellEl.hidden = false;
   }
 
   // ---------- live 底部配置条（模型 + API Key） ----------
@@ -1058,8 +1100,13 @@
     pending = pendings[currentMode] || (pendings[currentMode] = []);
     inputEl.value = drafts[currentMode] || '';
     autosizeInput(); // 草稿可能是多行：按内容回弹输入框高度
-    // 状态点只在 harness 模式可见（chat 模式没有连接概念）
+    // 状态点只在 harness 模式可见（chat 模式没有连接概念）；C13 的 bash 读数同一条规矩
+    // （**同语义而不是同元素**：不碰它的 textContent，那由 renderShellStatus 管）。
+    // 切回 harness 时**不重发** backend-status（扩展不会因为换了个模式就重发）⇒ 靠缓存把那段补回来。
     harnessStatusEl.hidden = mode !== 'harness';
+    if (mode === 'harness') renderShellStatus(shellSeg);
+    else hideShellSegment(); // 只藏，不扔缓存
+
     refreshLiveConfigVisibility(); // 配置条仅 harness 常驻
     renderPending();
     // C3a：先清读数。紧随其后的 snapshot 会带该模式的 usage 重新点亮（顺序有保证：

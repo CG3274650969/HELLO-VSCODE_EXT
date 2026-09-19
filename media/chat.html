@@ -32,6 +32,10 @@
     <!-- Harness 连接状态点（harness 恒为 DSH 直播，无「模拟」开关）：仅 harness 模式可见
          （JS applyMode 里切 hidden）。状态文字/颜色由扩展 backend-status 回传。 -->
     <span id="harness-status" class="harness-status offline" hidden></span>
+    <!-- C13：agent 的 bash 读数（`bash=WSL` / `bash=?` / `bash=坏`）。⚠️ **必须是 #harness-status
+         的兄弟节点**，不能挂成它的子节点 —— renderHarnessStatus 每次都整段重写那个元素的
+         textContent，挂进去会被下一次重连静默抹掉（C10b 那个形状的坑）。 -->
+    <span id="harness-shell" class="harness-shell" hidden></span>
   </div>
 
   <!-- 行2（恒显示）：会话控制条 —— 可点改标题 + 历史/新建。历史面板 absolute 以此 header 为锚。 -->
@@ -93,6 +97,8 @@
         <span id="approval-tool" class="approval-tool"></span>
       </div>
       <pre id="approval-cmd" class="approval-cmd"></pre>
+      <!-- C13：模型递上 POSIX 路径时的两读法说明（多行文本，只显示不改写）。无内容时整段隐藏 -->
+      <pre id="approval-note" class="approval-note" hidden></pre>
       <div class="approval-actions">
         <span class="approval-hint">Esc 拒绝</span>
         <button id="approval-deny" class="button button-secondary" type="button">拒绝</button>

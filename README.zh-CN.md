@@ -155,6 +155,7 @@ Harness 页签顶部状态点依次显示连接：灰 未连接 → 蓝 连接�
 | `hello.dsh.model` | `"deepseek-v4-flash"` | 默认模型，按会话下发；在线状态里展示。 |
 | `hello.dsh.command` | `""` | 非空时**整段覆盖启动命令**（忽略 nodePath/loader/entry/config）。 |
 | `hello.dsh.args` | `[]` | `command` 非空时配合的参数列表。 |
+| `hello.dsh.bashPath` | `""` | **仅 Windows，通常留空。** 某个 `bash.exe`（或任意 bash）的绝对路径：它的**所在目录会被前置到运行时子进程的 `PATH`**，于是 agent 的 `bash` 工具命中**这一把**，而不是机器 PATH 上第一个。留空 ⇒ 子进程环境**逐字节原样透传**。指到一个不存在的文件会**如实报出**（绝不静默忽略），并可在告警里一键清除。详见 [README.md](README.md) 的 *Windows: which bash the agent gets*。 |
 | `hello.dsh.debug` | `false` | 把子进程 stderr / 被忽略的 JSON-RPC 通知打到输出面板（不含密钥）。 |
 
 一份可用的 `settings.json` 示例（**别提交**）—— 便携运行时：

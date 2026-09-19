@@ -160,7 +160,7 @@ try {
   // ---------- 第二块：真的把自检跑起来（含 retriable 的分类） ----------
 
   await check('自检超时要标成 retriable（那一刻 shell 还没起来，形态对不对还没验）', async () => {
-    const r = await testApprovalHook('sleep 30', repoRoot, 1200);
+    const r = await testApprovalHook('sleep 30', repoRoot, { timeoutMs: 1200 });
     ok(!r.ok, '居然通过了');
     ok(r.retriable === true, `retriable = ${r.retriable}`);
     ok(/自检超时（1s）/.test(r.detail), `detail 该按实际超时报秒数：${r.detail}`);
@@ -178,6 +178,26 @@ try {
     ok(!r.ok, '居然通过了');
     ok(r.retriable === false, `retriable = ${r.retriable}（可判的失败不该给重试）`);
     ok(/No such file or directory|not found/.test(r.detail), `detail 该带 bash 原文：${r.detail}`);
+  });
+
+  // ---------- 第二块之二：C13 —— 探针的 env 必须是**子进程真正的 env** ----------
+
+  await check('opts.env 真的换掉了 bash 的搜索路径（C13 的「钉住 bash」就靠这一条）', async () => {
+    // 实测（F3）：PATH 清空 ⇒ ENOENT，且**不回退当前目录**。这条过了才说明 opts.env 传到了 spawn，
+    // 否则「钉住 bash」会静默失效 —— 用户改了设置、什么都没发生、也没有任何报错。
+    const r = await testApprovalHook('exit 0', repoRoot, { env: { ...process.env, PATH: '' } });
+    ok(!r.ok, 'PATH 清空了居然还找得到 bash —— opts.env 没被用上');
+    ok(r.retriable === false, `这属于可判的失败，不该给重试：retriable = ${r.retriable}`);
+  });
+
+  await check('opts.env 就是 hook 真正跑在里面的 env（自检必须用它，否则形态是推错的）', async () => {
+    // C1 的自检拿**同一个 env** 跑，而 `buildHookCommand` 的 posix/wsl 形态就是从那次自检的结论推出来的：
+    // 自检若在宿主的 env 里跑，一旦有 pin 就会推出与运行时子进程不符的形态 ⇒ 审批整个失效。
+    const env = { ...process.env, HELLO_PROBE_MARK: '1' };
+    const yes = await testApprovalHook('[ "$HELLO_PROBE_MARK" = "1" ]', repoRoot, { env });
+    ok(yes.ok, `带标记的 env 居然不过：${yes.detail}`);
+    const no = await testApprovalHook('[ "$HELLO_PROBE_MARK" = "1" ]', repoRoot);
+    ok(!no.ok, '不传 env 时子进程不该看到这个标记');
   });
 
   const guess = await probeShell(repoRoot);

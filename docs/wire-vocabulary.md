@@ -138,6 +138,30 @@ C12 的工具白名单判据就是它（正反双控：带 profile 那轮没有 
 （只有 docker-desktop），工具会一路报错。修法：装 Ubuntu 并 `wsl --set-default Ubuntu`
 （让 shim 落到真 bash），加 `[wsl2] networkingMode=mirrored` 消除 Clash 本地代理告警。
 
+### 补记（2026-09-19，C13 实测，上面那句仍然全对）
+
+「没有换 shell 的配置项」到今天仍然成立 —— 但**它不等于做不到**：
+
+1. **PATH 是活的**。从 `_dshEnv()` 一路到那一次 spawn，**没有一处覆盖 PATH**：
+   `dsh-subprocess` 的 `childEnv` / `scrubbedParentEnv` 只擦敏感键与 `DSH_*`，
+   `dsh-bash-local` 的 `ENV_OVERRIDES` 不含 PATH。⇒ **扩展侧在子进程 PATH 前面插一个目录，
+   就能换掉 agent 的 bash**（C13 的 `hello.dsh.bashPath` 就是这么干的，DSH 一行不改）。
+2. **谁赢由 libuv 决定，不是 `PATHEXT`**：`spawn('bash', …, {env})` 按**传入 env 的 PATH** 搜索
+   （不是调用进程的），且 libuv **完全不看 `PATHEXT`**（硬编码 `.exe`）。
+   ⚠️ 所以**不许照抄** `dsh-subprocess-local` 的 `executableCandidates` —— 那个认 PATHEXT，
+   抄来会算出**错的赢家**。
+3. **`PATH=''` ⇒ ENOENT 且不回退 cwd**；空项跳过；相对项按**子进程 cwd** 解析；
+   `Path`/`PATH` 并存时大写 `PATH` 胜；**完全没有 PATH 键时回退宿主真实环境**
+   ⇒ 想改 PATH 就必须**删了再补**，不能只删。
+4. **shim 起不来时的话是 UTF-16LE 打在 stdout 上**（stderr 空、退出码 4294967295），
+   解出来是「不存在具有所提供名称的分发。错误代码: Wsl/Service/WSL_E_DISTRO_NOT_FOUND」
+   —— 上面那句「一路报错」的真身就是这个：按 utf8 读是**乱码**，所以看着像一串 bash 报错。
+   认它要按**奇位 NUL 占比 ≥ 0.4** 判 UTF-16LE（实测夹具 0.690），再认 `WSL_E_[A-Z_]+`
+   这个语言无关令牌。判定与文案在 `src/shellDiag.ts`，判据在 `scripts/probe-shell-diag.mjs`。
+5. **路径语义另有一坑**（同次实测）：DSH 的 fs 工具把 `/mnt/d/x` 当 **Windows 相对路径**解析，
+   落到 `<cwd 所在盘>\mnt\d\x`。C13 只**显示**两种读法（批准条上的说明），
+   **不做归一化** —— 改它等于改 agent 的文件落点。
+
 ## 相关
 
 - 抓帧：`node scripts/capture-dsh-frames.mjs`（`DSH_CAP_NODE/ENTRY/CONFIG/RUNCWD/TSCONFIG/
