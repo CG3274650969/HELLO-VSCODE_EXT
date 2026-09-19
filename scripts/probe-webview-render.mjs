@@ -797,7 +797,7 @@ check('C12 profile：正有一轮在跑 → profile 钮禁用 + 菜单收起（�
   $('live-profile-btn').click(); // 收起来，别把开着的菜单留给后面
 });
 
-// ---------- 配置条三个下拉钮的形状（2026-09-18 两次收窄：药丸 → 裸文字 → 图标 + 值） ----------
+// ---------- 配置条三个下拉钮的形状（2026-09-18 三次收窄：药丸 → 裸文字 → 图标 + 值 → 26px 方块图标钮） ----------
 
 check('配置条三钮：推理/profile 是**方块图标钮**（轴与值只在 title / aria-label 里），模型名照旧看得见', () => {
   liveConfig({ profile: null, profileModelPinned: false, model: 'deepseek-v4-flash', effort: null });
