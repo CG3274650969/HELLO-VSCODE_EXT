@@ -23,7 +23,7 @@
 | C10 | 上下文窗口指示 + 超限压缩/归档 | P1 | 数据前置已解（C3a 已透出窗口/占用）。**已实现；F5 的 ①②⑤ 过了（真压缩 6 次：5 成功 1 失败；wire note 与落盘 note 逐字相同）；③ 的两半分头都过了但组合未验、④ 百分比那半过了（⚠ 那半与续聊回落未验）** —— 三个前提被推翻：压缩 DSH 早已自己做（`compaction-basic`，已 compose）、那三个事件早就在流里而我们从没读、**「归档旧轮」按字面做不到**（无 wire RPC + 日志 append-only）。另，`DSH_CORDIS_CONFIG` env 赢过位置参数这条命脉（C1 与 C10 共用）**首次被反控证住**。⚠️ **F5 之后揪出一个真 bug（C10b）**：`request/context` 只在路由**变化**时才发，续聊时一条都不发 ⇒ 分母恒缺、整条占用指示安静地不存在（那次真机的读数里就没有百分比）。已修：分母记在会话上，新增纯模块 `contextWindow.ts` + `probe-context-window.mjs`（14/14），见正文 | [~] |
 | C11 | 会话级推理档位（reasoningEffort） | P1 | **原判「受限：需 runtime 先支持」已推翻** —— 机制早就在（provider 按请求解析档位、`agent/request` 瀑布的返回值就是请求 config），缺的只是入口。**已实现：自检 25/25 全绿；F5 五项全过**（④ 当场揪出一个真 bug：换会话不重播配置条，已修 `a7e5bab` + 加了结构守卫，复验通过；③ 有盘上留痕 —— 两会话各拿各的档位，且拿到「`reason=change` ⇒ 不重启就改档」的直接证据）（热切 + 真会话级；DSH 侧一行不改、用户配置一行不碰，纯追加一个我们自己的插件块） | [x] |
 | C12 | 项目级 agent profile（工具白名单/默认模型/审批策略） | P1 | **原文「扩展负责写回 runtime 配置」只对了三分之一** —— 模型是 `initialize` 参数（必重连）、审批是扩展内部三个读口（零新机制）、**工具白名单运行时压根没有配置键**（要靠自挂插件调 `tools.restrict`，见正文源码坐标）。**已实现：自检 32/32 + webview 段 8 条全绿**（含端到端反控：盘上 `request/header.header.tools` 里 bash 真的没了）；profile 文件落在工作区 `.hello-chat/profile.json`，**不写用户任何文件**，「只能加严」由 `compileProfile` 一个纯函数守死；**F5 五条 2026-09-19 真机全过**（模型跟着 profile 走、`header.tools` 里 bash/write/edit 真的没了而 read 还在、忙碌时切被拒且盘上不动、「写成想关审批」弹条照旧出现） | [x] |
-| C13 | Windows / 跨环境 shell 与路径收口 | P1 | 无（扩展侧为主） | [ ] |
+| C13 | Windows / 跨环境 shell 与路径收口 | P1 | **原文「必要时自带 bash 或推荐配置」没走到那一步，也不用走** —— 上游到今天确实没有换 shell 的配置键，但**PATH 是活的**（`spawn` 按传入 env 的 PATH 搜索，`dsh-subprocess` 只擦敏感键、`ENV_OVERRIDES` 不含 PATH）⇒ 扩展侧前置一个目录就能换掉 agent 的 bash，**DSH 一行不改**。**已实现：诊断 + 可选钉住 bash（`hello.dsh.bashPath`，`scope: machine`）+ 顶栏一段读数 + 坏时一次性可读告警 + 批准条的 `/mnt/…` 两读法说明**（只显示，**不做路径归一化**）；自检 **62/62 + webview 段 10 条（全套 57/57）+ C1 自检 21/21**，7 条结构守卫做过变异测试**全被抓红**；**F5 六条待跑**（真弹窗文案/窄面板挤压/设置写入与重启/真 WSL 一轮的排版/第三条监听器的重连行为/与「审批未生效」弹窗互不干扰） | [~] |
 | C14 | 事前 diff 预览（近似实现） | P2 | 受 wire 无 file 事件限制 | [ ] |
 | C15 | 多会话并行 / 分支对照视图 | P2 | 无 | [ ] |
 | C16 | 审批白名单记忆（信任一次/永久） | P2 | 依赖 C1 | [ ] |
@@ -592,7 +592,7 @@ if (!this._abort || !this._reviewChangesOn()) return;  // 对
   - [scripts/probe-context-window.mjs](../scripts/probe-context-window.mjs)（新，C10b）**14/14**：见上面 C10b 那条。
   - ✅ **`ApprovalServer` 被改过一行**（2026-09-18）：新探针抓到拒绝话术写死「该命令」，对 fs 工具说错了名词 —— 改成按 `toolName` 选（`nounOf()`）。动了 C1 的代码，所以 C1 的两条探针都重跑过（见下）。
   - [scripts/probe-compaction-override.mjs](../scripts/probe-compaction-override.mjs)（新）**31/31**：以仓库里真的 `runtime/cordis.default.yml` 为黄金输入 —— 恰好 2 行不同、CRLF 保持、幂等、行内注释/尾随空格、相邻块同名键不误伤、`modelPolicies[].thresholdRatio` 不受影响、9 个拒绝用例、全范围 `retainRatio < thresholdRatio` 不变量、以及「默认值 ⇒ 逐字节相同」。
-  - [scripts/probe-webview-render.mjs](../scripts/probe-webview-render.mjs)（新，**重建并入库**；C10 落地时 42/42，**现为 47/47** —— 多出的 5 条是 2026-09-18 配置条三钮的第三次收窄，见 C12 的 D5）：用最小 DOM 影子把 `media/chat.js` 载进 Node（加载期依赖只有 `acquireVsCodeApi()` 与 `window.addEventListener('message')` 两处），断言 D1 的 near / stale / compacted 各态与 `.near` 类的挂/摘、D4 的折叠条数与位置（折的是头部、首条渲染的是第 41 条）、点「显示」后全部回来、同会话刷新保持展开而**换会话复位**；外加 C9 运行条与浮层的一小段回归样、**C11 档位菜单**（默认「跟随配置」；当前档位才打勾；点一次只发一条 `set-effort` 且带对值；点当前项**不发**；`thinking: disabled` 下三档既置灰**又根本没挂 click 监听** —— 所以"置灰的行点不动"是结构保证、不是靠回调里再判一次）、**C12 profile 菜单** 8 条，以及一段 **D4 真数据**（最长真实会话 99 条 / 56 张工具卡：折 39 / 渲 60）。
+  - [scripts/probe-webview-render.mjs](../scripts/probe-webview-render.mjs)（新，**重建并入库**；C10 落地时 42/42，**现为 57/57** —— 多出的 5 条是 2026-09-18 配置条三钮的第三次收窄（见 C12 的 D5），另 10 条是 2026-09-19 C13 的读数与路径两读法，见 C13 的 D5）：用最小 DOM 影子把 `media/chat.js` 载进 Node（加载期依赖只有 `acquireVsCodeApi()` 与 `window.addEventListener('message')` 两处），断言 D1 的 near / stale / compacted 各态与 `.near` 类的挂/摘、D4 的折叠条数与位置（折的是头部、首条渲染的是第 41 条）、点「显示」后全部回来、同会话刷新保持展开而**换会话复位**；外加 C9 运行条与浮层的一小段回归样、**C11 档位菜单**（默认「跟随配置」；当前档位才打勾；点一次只发一条 `set-effort` 且带对值；点当前项**不发**；`thinking: disabled` 下三档既置灰**又根本没挂 click 监听** —— 所以"置灰的行点不动"是结构保证、不是靠回调里再判一次）、**C12 profile 菜单** 8 条，以及一段 **D4 真数据**（最长真实会话 99 条 / 56 张工具卡：折 39 / 渲 60）。
   - [scripts/probe-agent-profile.mjs](../scripts/probe-agent-profile.mjs)（新）**32/32**：C12 四段（解析 / 「只能加严」表驱动 / 插件决策表 / 端到端 `header.tools` 正反双控），详见 C12 正文。
     - 真数据那两条断言各假红过一次，都是**断言写错了而不是代码错了**：① 拿 `msg.text` 去比 `role: 'tool'` 的消息（工具卡渲的是 `msg.toolName`）⇒ 改成按 role 取签名；② 真实助手消息里有反引号与 `D:\…` 反斜杠，markdown 渲染会转义 ⇒ 改成归一化后再比（`plainText()` 只留实词）。**探针的红要先怀疑自己**。
     - **这次它又抓到两个真 bug**，且第 ① 个正是「不忠实的影子比没有影子更坏」的又一例：① 影子的 `className` setter **换掉了**那个 `Set`，而 `classList` 的闭包捕获的是构造时那一个 ⇒ `wrap.className = 'msg msg-user'` 之后 `classList.contains('msg')` 为假、`removeAllMessages` 一个都删不掉（断言全空转）。改成**原地改**。② 我自己按旧影子抄的期望值是过期的（`24K` 应为 `24.0K`、C9 条文案已改成三后缀并列）。③ 顺带发现旧脚本以为 `{type:'run-panel', open:true}` 是**入站**消息 —— 它其实是**出站**（扩展据此下发 details），浮层要靠点 `#runs-view` 才开；现在按真路子驱动，并断言那条回执确实发出去了。
@@ -741,7 +741,7 @@ if (!this._abort || !this._reviewChangesOn()) return;  // 对
   ③ 插件决策表（把生成的插件文件当纯模块载入，喂假 ctx 抓 `agent/created`：给了 deny ⇒ `restrict` 收到恰好那个 filter；deny 空/缺失 ⇒ **一次都没被调**；`restrict` 抛 ⇒ 不冒泡）；
   ④ **端到端真跑一轮**：派生配置挂真插件 ⇒ 盘上 `request/header.header.tools` 里**没有** `bash`、**有** `read`；**反控**：不带 profile 那轮 `bash` **必须在**（否则"没有 bash"可能只是这轮压根没装配工具）。
   第四段与 C11 探针同款：**刻意用假 key**（`sk-000…`，请求 401 但 header 在请求构建期就落盘），"没跑起来"响亮报错、绝不读成"验过了"。
-  - [scripts/probe-webview-render.mjs](../scripts/probe-webview-render.mjs) 的 C12 段 8 条（渲染/打勾/恰好一条 `set-profile`/`null`/钉住置灰且不发/未钉时可点（反控）/「已改动」行发得出去/错误条数/没工作区/忙碌时禁用且菜单收起）；**这套影子探针现在全套 47/47**，另外 5 条是同期配置条三钮**第三次收窄**（药丸 → 裸文字 → 图标+值 → 26px 方块图标钮）新增的形状守卫。
+  - [scripts/probe-webview-render.mjs](../scripts/probe-webview-render.mjs) 的 C12 段 8 条（渲染/打勾/恰好一条 `set-profile`/`null`/钉住置灰且不发/未钉时可点（反控）/「已改动」行发得出去/错误条数/没工作区/忙碌时禁用且菜单收起）；**这套影子探针在 C12 落地时为 47/47**（另外 5 条是同期配置条三钮**第三次收窄**（药丸 → 裸文字 → 图标+值 → 26px 方块图标钮）新增的形状守卫）；**2026-09-19 起为 57/57**（C13 又添 10 条，见 C13 的 D5）。
 - **只能真机 F5 盖住**：
   1. 放一份 `.hello-chat/profile.json`（两个 profile）⇒ 配置条出现 profile 菜单 ⇒ 选一个 ⇒ **重连一次** ⇒ 模型变成 profile 的、审批变严。盘上证据：新 `request/header` 的 `config.model` 跟着走。
   2. **工具白名单的真判据**：profile 里 deny `bash` ⇒ 重连后让 agent 做一件需要 shell 的事 ⇒ 它**说没有这个工具**（而不是「命令被拒」）。盘上对拍：`request/header.header.tools` 里没有 `bash`。
@@ -771,10 +771,53 @@ if (!this._abort || !this._reviewChangesOn()) return;  // 对
   - **❌ 不做 `allow` 型工具白名单**：allow 表达不了"只能加严"（决定 5 的推论）。
   - 不动 wire、不改 runtime、不给上游提需求。
 
-### C13 · Windows / 跨环境 shell 与路径收口
-- **现状**：bash 靠 PATH 找，`System32\bash.exe` 会命中 WSL shim，WSL 无发行版就全线报错（[wire-vocabulary.md](wire-vocabulary.md)）；跨盘/跨环境路径语义有坑。
-- **补法**：shell 探测 + 明确降级提示；UI 表达「工具将在哪个 cwd、能否出工作区」；必要时自带 bash 或推荐配置。
-- **验收**：无 WSL 的机器上给出可读引导而非一串 bash 报错。
+### C13 · Windows / 跨环境 shell 与路径收口（2026-09-19 实现；F5 六条待跑）
+- **原文**：**现状**「bash 靠 PATH 找，`System32\bash.exe` 会命中 WSL shim，WSL 无发行版就全线报错（[wire-vocabulary.md](wire-vocabulary.md)）；跨盘/跨环境路径语义有坑」；**补法**「shell 探测 + 明确降级提示；UI 表达「工具将在哪个 cwd、能否出工作区」；必要时自带 bash 或推荐配置」；**验收**「无 WSL 的机器上给出可读引导而非一串 bash 报错」。
+- **两个已拍板的决定（不再讨论）**：范围 = **诊断 + 可选「钉住 bash」**，**不做路径归一化**；落点 = **顶部状态条一段读数 + 坏时一次性可读告警**，**不加配置条第四个钮**（那条刚收窄三轮）。
+- **实测四条**（2026-09-19 本机复现，**四条都决定了设计**）：
+  - **F1 `spawn('bash', …, {env})` 按传入 env 的 PATH 搜索**，不是调用进程的 PATH（`PATH=E:/Git/bin` → `MINGW64_NT`；`PATH=C:/Windows/System32` → `Linux`）⇒ **「钉住 bash」真能换掉 agent 的 shell**，上游一行不改。
+  - **F2 libuv 完全不看 `PATHEXT`**（硬编码 `.exe`）：`PATHEXT='.COM;.BAT'`、甚至没有 `PATHEXT`，照样命中 `bash.exe` ⇒ ⚠️ **不许照抄** `dsh-subprocess-local` 的 `executableCandidates`（它认 PATHEXT）—— 抄了会算出**错的赢家**，在不含 `.EXE` 的机器上谎报「没有 bash」。
+  - **F3 PATH 的五条语义**：`PATH=''` → ENOENT 且**不回退 cwd**；空项跳过；相对项按**子进程 cwd** 解析；`Path`/`PATH` 并存时大写 `PATH` 胜；**完全没有 PATH 键时回退宿主真实环境** ⇒ `prependPathDir` **绝不能删了 PATH 不补**（否则 pin 静默失效）。
+  - **F4 WSL shim 起不来时的话是 UTF-16LE 打在 stdout 上**（stderr 空、退出码 4294967295）：解出来是「不存在具有所提供名称的分发。错误代码: Wsl/Service/WSL_E_DISTRO_NOT_FOUND」 ⇒ **这就是「一串 bash 报错」的成因**（按 utf8 读就是乱码）。诊断先按**奇位 NUL 占比 ≥ 0.4** 认出 UTF-16LE（夹具实测 0.690），再认 `WSL_E_*` 这个**语言无关**令牌。
+  - **链路核实**：`_dshEnv()` → `dshRuntime` 的 `spawn(…, {env})` → `dsh-subprocess` 的 `childEnv`（只擦敏感键与 `DSH_*`，**PATH 原样保留**）→ `dsh-bash-local` 的 `ENV_OVERRIDES` **不含 PATH**。**全程没有一处覆盖 PATH。**
+- **四条被推翻的预设**（记下来防后人重推）：
+  1. 「上游没有换 shell 的配置项 ⇒ 做不到」—— 上游**今天仍然没有**，但那不构成"做不到"：**PATH 是活的**（F1+F3）。
+  2. 「bash 的赢家按 `PATHEXT` 算」—— 那是 `dsh-subprocess-local` 的行为；bash 那一次 spawn 走的是 libuv（F2）。
+  3. 「WSL 起不来时会打一行可读的错」—— 是 UTF-16LE 乱码（F4）。
+  4. 「探不到 = 坏」—— 超时是 WSL 冷启动的**正面证据**（既有 `shellGuessOnTimeout` 的结论），诊断里它属于**不可判**，不是**坏**。
+- **D1 · 新纯模块** [src/shellDiag.ts](../src/shellDiag.ts)（**不 import vscode** —— 判据必须能在扩展宿主之外加载，C10b 的教训）：`pathValue` / `resolveOnPath` / `classifyBashPath` / `usabilityOf` / `shellWarnFor` / `shellStatusSegment` / `adviceFor` / `prependPathDir` / `shellPin` / `readPosixTarget` / `gitBashCandidateDirs`。
+  - **三值 `usable|broken|indeterminate` 复用 C1 的 `HookSelfCheck.retriable` 纪律**：超时、或退出码非 0 而**两流都空** ⇒ indeterminate；`shellWarnFor` **只对 `broken` 给文本** —— 这就是「冷启动不误报」的全部保证，也是探针里那条配对断言盯的东西。
+  - `prependPathDir`：`dir` 空 ⇒ **同内容同键序**返回（「未设 = 逐字节相同」取最强形式）；否则删掉所有大小写变体的 PATH 再前置一个，**幂等**、不改入参、**永不删了 PATH 不补**。
+  - `readPosixTarget` **只显示，永不改写**：`intended` 只认 `/mnt/<盘>/…` 与 `/<盘>/…`（`/etc/passwd` 不猜）；`actual` 用显式 `path.win32.resolve(cwd, raw)`（跨宿主一致，探针在 Linux 上也能钉）。⚠️ 它的准入集合**恰好等于** `_fsTargetAbs` 里 `raw.startsWith('/') && !raw.startsWith('//')` 的集合 —— **会印这段话的路径，正好就是不会抓轮前快照的那些**；两处各写各的，就会出现「提示说这次改动不在审阅里，实际却抓了快照」那种自相矛盾。
+- **D2 · 设置项** `hello.dsh.bashPath`（`type: string`、默认空、**`scope: machine`**）：它是**一台机器的事实**（某个 exe 的路径），不是项目策略；而 `window` 会允许写进 `.vscode/settings.json`，那正是本仓库最不想发生的事（一台机器的路径被提交进别人的仓库）。与 `runtimeDir`/`nodePath`/`command` **正交**（那三个决定跑哪份字节，它只改那个子进程的 PATH）⇒ **`hello.dsh.command` 整段覆盖时 pin 照样生效**，所以**诊断与告警绝不能住在 `_setupApproval` 里**（那个分支下审批整个不接入，可 bash 工具照样天天在用；住进去 = 那类用户永远看不到告警，文案还会错误地指向「审批」）。指向不存在的文件 ⇒ **不前置**，诊断如实报出 + 一键清除。
+- **D3 · 接线**（[src/chatViewProvider.ts](../src/chatViewProvider.ts)）：`_ensureShellDiag()` 幂等 promise；时序上**起诊断但不 await**（`.then()` 里发状态 + 可能告警），只有审批去 await 同一个 promise ⇒ 激活延迟是 `max` 不是 `sum`，且 WSL 只被唤醒一次；**冷启动重试预算与审批共享**（`_coldStartRetried`）。告警**独立旗标**（与审批共用会让先到的吞掉后到的）。一键修法：`钉住这个 bash`（**仅当备选是本次会话实测通过的**）/ `怎么装 WSL 发行版`（给两条**文本**命令，**不代跑 `wsl.exe`**）/ `打开设置`；**不给「不再提示」**（每 activation 一次已是既有体例）。
+- **D4 · 自检与 hook 的 env 一致性修**（探路时发现的**真问题**）：`testApprovalHook` / `probeShell` 原来用 `env: process.env` 从**扩展宿主** spawn，而 hook 是在**运行时子进程**里跑的 —— 今天两者碰巧相同，**一旦有 pin 就不同**；而 `buildHookCommand` 的 Windows-vs-WSL 形态**就是从这个答案推出来的**，推错 = 审批直接失效。抽 `spawnProbe` 让「不可判」的判定**只有一份实现**，三处调用加 `{env?, program?, timeoutMs?}`（**opts 省略时行为与今天一字不差**）。
+  - ⚠️ **`probeShell` 的返回类型必须保持 `ShellKind`**：`probe-sandbox.mjs` 拿它跟 `'wsl'` 直接比，改成对象会让比较**恒假**、静默挑错形态，而探针还是绿的（那种 bug 没人能看见）。要分辨「坏」与「不可判」用 `probeBash`。
+  - ⚠️ hook 自检**仍传 `program: 'bash'`、不传 pin 的绝对路径** —— 同一条解析路径才算数。
+  - ⚠️ **`spawnProbe` 的 argv 里不含可执行名**（`program` 是另一回事）：重构时写成 `['bash','-c',cmd]` 就成了 `bash bash -c …`，MSYS bash 会去把 `/usr/bin/bash` 当**脚本**读 ⇒ 一堆 `cannot execute binary file` / `line 1: … No such file or directory`，而**形态判定看起来还在工作**（探针里两条判据一红一绿才把它揪出来）。
+- **D5 · webview**（[media/chat.html](../media/chat.html) / [media/chat.js](../media/chat.js) / [media/chat.css](../media/chat.css)）：顶栏 `#harness-status` **之后**一个**兄弟** `<span id="harness-shell">`（⚠️ 必须是兄弟 —— `renderHarnessStatus` 整段重写 `#harness-status` 的 textContent，挂成子节点会被下一次重连静默抹掉，**C10b 那个形状**）。三态：能用且非 WSL ⇒ **整段不出现**；能用但在 WSL ⇒ `bash=WSL` 琥珀；不可判 ⇒ `bash=?` 琥珀；坏 ⇒ `bash=坏` 红。
+  - **可见性两道闸**：① 载荷不带 `shell`（老扩展 / 诊断还没算出来 / 一切正常）⇒ 不出现；② **chat 模式下也不出现**。⚠️ 第二道闸必须在 `renderShellStatus` **里面** —— 扩展会在任意时刻重发 `backend-status`（连上、重连、改设置），只在 `applyMode` 里藏的话，chat 模式下一帧就把它重新点亮了（探针里「chat 模式下连**重发**的也点不亮」就是为它写的）。切回 harness 时扩展**不会**重发 ⇒ 靠 `shellSeg` 缓存把那段补回来（`applyMode` 只藏、不扔缓存）。
+  - 确认条多一段 `#approval-note`（`<pre>`，初始 hidden）：`已按 POSIX 形态给出 / 模型想指的应是 / 按 DSH 的解析方式会落到 / 本次不会为它抓轮前快照`（最后一行收益最大 —— C4 那次真事故里确认条弹对了，但用户不知道这次改动对审阅是**隐形的**）。`cwd` 只取 hook 载荷里的 `ask.cwd`，缺了整条不显示（盘符来自 cwd，缺了会自信地印一个错位置，比不说更糟）。**绝不给按钮** —— 一个「改用 D:\x」的按钮就等于借 UI 把本次明确不做的路径归一化偷偷做掉。
+- **已知局限**：
+  - `actual` 是**预测不是事实**：真实写入还可能被沙箱拒或父目录不存在，所以文案写的是「**按 DSH 的解析方式**会落到」。
+  - 诊断的 probe 在冷启动时最坏 8s×2 —— 与审批共享重试预算后**总预算与今天持平**；若 F5 发现仍太慢，唯一旋钮是诊断的 `timeoutMs`。
+  - `git-bash` 的识别是**形状启发式**（`…/Git/bin`、`…/Git/usr/bin`）：便携 Git 会落到 `other`。无害 —— 判定不依赖它，只影响文案；`other` 里也可能有真能用的 Cygwin/MSYS2，那会显示「可用」而不报错。
+  - **本机复现不出「无 WSL 的机器」**（这台机器 WSL 里有 Ubuntu、冷启 ≈5s）：那半条验收只能靠**夹具 + 纯函数 + 自适应正控**（见下）。
+- **本次不做**（写死，防后人重推）：**不做路径归一化**（`/mnt/d/x` → `D:\x` 是 DSH 侧的解析行为，改它等于改 agent 的文件落点；本次只**显示**两种读法，且**不给按钮**）；不写 `.vscode/settings.json`、不写用户的 `cordis.yml`、不新增 `scope: resource` 设置项；不代跑 `wsl.exe --install`、不在没有用户点击的情况下自动选一把 bash；**不新增配置条旋钮**；不改 wire、不改 runtime、不给上游提需求。
+- **自检**：[scripts/probe-shell-diag.mjs](../scripts/probe-shell-diag.mjs)（新，**62/62**，八组）—— A 解析（假 PATH + 假 `isFile`：含 **PATHEXT 反控**、显式扩展名、空项、`PATH=''` 不回退 cwd、相对项按 cwd、`Path`/`PATH` 并存、无 PATH 键的地雷、平台隔离）；B 分类（含 **Cygwin / 裸 `bash.exe` ⇒ `other` 的反控** —— 没有它，一个恒返回 `wsl-shim` 的实现也能过前两条）；C 三值表 + **`shellWarnFor` 配对断言**（usable/indeterminate 必须 `undefined`、broken 必须有）+ pin 指空的例外 + 五条话术 + 状态段三档 + 平台隔离；D 解码（**F4 那段 116 字节 / 奇位 NUL 0.690 当夹具常量** + ASCII/UTF-8/png 三个反控样本 + 「拼接后只解一次」的理由）；E `prependPathDir`（身份 / 幂等 / 已有该目录 / 无 PATH 键 / posix 分隔符 / 入参未改）；F 两读法（含 UNC 反控与跨宿主不变性）；G 不许漂移（同一份事实，`classifyShell` 与 `usabilityOf` 必须说同一句话）；H 真机（自洽 + `probeShell` 返回类型仍只是一个形态 + 未设 pin 的同一性 + **自适应 Git bash 正控**（钉住后 posix 成立；一把都找不到 ⇒ **响亮 ⚠ 跳过，绝不静默通过**）+ 端到端不等式）。
+  - **「无 WSL 的机器」那条验收怎么机器可验**（三道）：① F4 那段夹具 + 假 env 端到端（假 PATH 只含 System32 ⇒ headline 指向 shim 且 action 是 pin；清空 PATH ⇒ 得到**另一条** headline，**不等式**断言）；② 判定全是探针记录的纯函数（真机那半只做记录，不做判定）；③ 真机正控自适应找一把真 Git bash、找不到就响亮跳过（`E:\Git\bin` **永不入库**）。
+  - [scripts/probe-approval-shell.mjs](../scripts/probe-approval-shell.mjs) **21/21**（原 19 + 新增 2）：`testApprovalHook` 的调用改 options bag；新增「**`opts.env` 真的换掉了搜索路径**」（这是 pin 的机制基础 —— 它不过就说明 pin 会**静默失效**：用户改了设置、什么都没发生、也没有任何报错）与「**`opts.env` 就是 hook 真正跑在里面的 env**」（C1 一致性修的判据）。
+  - [scripts/probe-webview-render.mjs](../scripts/probe-webview-render.mjs) **57/57**（原 47 + 新增 10）：读数三态与「不带就不出现」/ **chat 模式连重发的也点不亮、切回来靠缓存** / `pathNote` 多行与收起（含迟到帧不许误关）/ 两条结构守卫（`#harness-shell` 必须是**兄弟**；CSS 的 `flex:0 0 auto`、`white-space`、`[hidden]` 不许被 `display` 覆盖；`readPosixTarget(` 全文**只准出现 1 次**且在 `_approvalPathNote` 体内；`_fsTargetAbs` 的 POSIX 早退必须原样在）。
+  - **变异测试**：上述守卫逐条做过变异（塞成子节点、拿掉 `flex:0 0 auto` / `pre-wrap`、去掉模式闸、切模式扔缓存、改掉 `_fsTargetAbs` 的早退、在判定链路上多调一次 `readPosixTarget`）—— **7/7 全被抓红**，且每个变异**先自证插进去了**（本仓库 `media/`+`docs/` 是 CRLF，字面 pattern 不匹配会静默空转、绿着骗人）。
+  - **C13 动了 C1 的自检 env ⇒ C1 的两条探针重跑过**：`probe-approval-shell`（21/21）与 `probe-sandbox --fs-hook`（C1 那条「hook 能不能拦 fs 工具」真机跑通：`hook/invoked` + `hook/result` 各一条、`note.txt` **始终没被创建**、`shell=posix`）。
+- **只能真机 F5 盖住（六条，待跑）**：
+  1. 真弹窗的文案与三个按钮各自的措辞（三种修法）。
+  2. 顶栏那段读数在**窄面板**下会不会被挤（`flex:0 0 auto` 只能肉眼）。
+  3. 「钉住这个 bash」写进用户设置后重启是否真换成（探针验不了 VS Code 的设置写入与重启时序）。
+  4. `/mnt/…` 那第二行在真 WSL 一轮里的排版。
+  5. 第三条配置监听器的重连行为（改 `hello.dsh.bashPath` ⇒ 清诊断 + 重连）。
+  6. `hello.dsh.command` 整段覆盖时弹的是 **shell 告警**而不是「审批未生效」（两个弹窗互不干扰）。
+  - 现场提醒沿用 C12 那两条：EDH 启动时**没有打开工作区文件夹**；`request/header` **每请求才写一条**（改完设置必须再发一句话才有新留痕）。
 
 ---
 

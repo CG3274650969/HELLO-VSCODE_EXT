@@ -402,31 +402,144 @@ export interface HookSelfCheck {
 }
 
 /**
- * 自检：用**同一个 shell**（DSH 的 hook 也是 `bash -c <command>`）跑一遍这条 hook 命令，
- * 喂一个非 bash 工具的合成载荷（脚本会立刻 exit 0，无副作用）。
- * 失败说明 hook 起不来（典型：node 路径在 bash 里不可达）→ 审批**不会生效**，必须让用户知道，
- * 而不是安静地"看起来配好了"。
- *
- * `timeoutMs` 只为探针而留（钉住超时那条分支不必真等 15 s）；扩展侧一律用默认值。
+ * 一次 shell 探针的**原始记录**。这里只如实记下发生了什么，**不做任何形态判定** ——
+ * 「能不能用」由 `shellDiag.usabilityOf`（纯函数，探针钉得住）从这几个字段推。
  */
-export function testApprovalHook(hookCommand: string, cwd: string, timeoutMs = 15000): Promise<HookSelfCheck> {
+export interface RawProbe {
+  /** 退出码 0 且没有 spawn 层错误 */
+  ok: boolean;
+  /** 撞到超时（被我们 kill 掉的） */
+  timedOut: boolean;
+  /** **不可判**：超时、或退出≠0 却一个字都不说。与 `HookSelfCheck.retriable` 同义 */
+  retriable: boolean;
+  /** 退出码；spawn 层就失败时为 undefined */
+  code?: number | null;
+  stdout: string;
+  stderr: string;
+  /** spawn 层错误原文（ENOENT/EACCES/同步抛） */
+  spawnError?: string;
+  /** 本次超时预算（话术里的秒数就用它算，别各自 Math.round） */
+  timeoutMs: number;
+  /** 中性摘要，**不带调用方的自称**（谁用谁加前缀）。见下面三段的格式约定 */
+  detail: string;
+}
+
+/** `uname -s` 探针的记录：多一个已经认出来的形态 */
+export interface BashProbe extends RawProbe {
+  /** `ok` 且认得出时才有；退出 0 但答的不是 uname 则 undefined（那正是「坏了」的判据之一） */
+  kind?: ShellKind;
+}
+
+export interface ShellSpawnOptions {
+  /**
+   * spawn 用的环境。⚠️ **必须是运行时子进程实际会拿到的那个 env**（= `chatViewProvider._dshEnv()`）。
+   *
+   * 为什么：hook 是 **DSH 在运行时子进程里**跑的，用的是我们注入给它的 PATH；而从扩展宿主用
+   * `process.env` 去探，探到的是**宿主**的 PATH。今天两者碰巧相同，可一旦用户钉了 bash
+   * （`hello.dsh.bashPath`）就不同 —— 而 `buildHookCommand` 的 Windows-vs-WSL 形态**正是从这个
+   * 答案推出来的**，推错 = 审批直接失效（而探针还是绿的）。这是 C13 顺手修掉的一个真问题。
+   *
+   * ⚠️ 传进来的 env **必须自带 PATH 键**：实测（2026-09-19）env 里没有 PATH 键时 libuv 会
+   * **回退到宿主真实环境**，那时你精心准备的那个 PATH 被无声忽略。缺省 `process.env`。
+   */
+  env?: NodeJS.ProcessEnv;
+  /**
+   * 可执行名或绝对路径。缺省 `'bash'`。
+   *
+   * ⚠️ **钉了 bash 时 hook 自检这里仍然传 `'bash'`** —— hook 也是被 `bash -c` 调起来的，
+   * 只有走**同一条 PATH 解析路径**才是在测同一个东西。这个参数只为探针的正控而留。
+   */
+  program?: string;
+  /** 只为探针而留（钉住超时那条分支不必真等 15 s）。扩展侧一律用默认值。 */
+  timeoutMs?: number;
+}
+
+/**
+ * 解码启动器的输出。
+ *
+ * **WSL 的 shim 把报错按 UTF-16LE 打在 stdout 上** —— 实测（2026-09-19，`wsl.exe -d <不存在的
+ * 发行版> uname -s`）：stdout 是 UTF-16LE、stderr 空、退出码 4294967295。按 utf8 读是一串乱码。
+ * **这就是「无 WSL 的机器上给用户一串 bash 报错」的成因**：话就在那儿，只是没人按对的编码读它。
+ *
+ * 判据（实测标定，四个向量一起钉在 `scripts/probe-shell-diag.mjs` 里）：
+ * 长度是偶数、够长、且**奇数位 NUL 占比 ≥ 0.4** —— UTF-16LE 里 ASCII 码元的高位字节就是 0。
+ *   真 shim 报错 0.690 ／ 纯 ASCII 0.000 ／ UTF-8 中文 0.000 ／ PNG 头形状 0.125
+ * 不是 UTF-16LE 就按 utf8 原样返回 —— **绝不"总是按 utf16 解"**（那会把正常输出搅碎）。
+ * 只解码、不做 trim（调用方各自处理），但会剥掉 BOM 与编码产物性质的尾部 NUL。
+ */
+export function decodeShimOutput(buf: Buffer | string): string {
+  const b = typeof buf === 'string' ? Buffer.from(buf, 'utf8') : buf;
+  if (!b.length) return '';
+  const n = Math.min(b.length, 512);
+  let oddNul = 0;
+  for (let i = 1; i < n; i += 2) if (b[i] === 0) oddNul++;
+  const half = Math.floor(n / 2);
+  if (b.length % 2 === 0 && half >= 4 && oddNul / half >= 0.4) {
+        return b.toString('utf16le').replace(/^\uFEFF/, '').replace(/\u0000+$/, '');
+  }
+    return b.toString('utf8').replace(/\u0000+$/, '');
+}
+
+/**
+ * 起一次 `<program> <argv…>` 并**如实记录**发生了什么。
+ *
+ * C13 把它抽出来，是为了让「不可判」的判据（超时／非零却一个字都不说）**只有一份实现**：
+ * 审批自检与 shell 诊断必须对「不可判」给出一致的定义，否则同一台机器会得到两个结论。
+ * 请求方各自把自己的话术加在中性 `detail` 前面，这样既共享判据、又不互相绑架文案。
+ */
+function spawnProbe(
+  cwd: string,
+  argv: string[],
+  opts: ShellSpawnOptions,
+  input?: string
+): Promise<RawProbe> {
+  const env = opts.env ?? process.env;
+  const timeoutMs = opts.timeoutMs ?? 15000;
+  const program = opts.program ?? 'bash';
   return new Promise((resolve) => {
     let done = false;
-    const finish = (ok: boolean, detail: string, retriable = false): void => {
+    const outs: Buffer[] = [];
+    const errs: Buffer[] = [];
+    let outText: string | undefined;
+    let errText: string | undefined;
+    // 累积到 close 时**一次性**解码：UTF-16LE 的一个码元可能被 chunk 边界劈开，逐块解会解出半个字
+    const texts = (): { out: string; err: string } => {
+      outText ??= decodeShimOutput(Buffer.concat(outs));
+      errText ??= decodeShimOutput(Buffer.concat(errs));
+      return { out: outText, err: errText };
+    };
+    const finish = (p: {
+      ok: boolean;
+      retriable: boolean;
+      timedOut?: boolean;
+      spawnError?: string;
+      code?: number | null;
+      detail?: string;
+    }): void => {
       if (done) return;
       done = true;
-      resolve({ ok, detail, retriable });
+      const t = texts();
+      resolve({
+        ok: p.ok,
+        retriable: p.retriable,
+        timedOut: p.timedOut === true,
+        spawnError: p.spawnError,
+        code: p.code,
+        timeoutMs,
+        detail: p.detail ?? '',
+        stdout: t.out,
+        stderr: t.err,
+      });
     };
     let child;
     try {
-      child = spawn('bash', ['-c', hookCommand], { cwd, env: process.env, windowsHide: true });
+      child = spawn(program, argv, { cwd, env, windowsHide: true });
     } catch (err) {
-      // spawn 抛错（bash 根本不存在）与形态无关，重试也会一模一样地抛 → retriable 不置位
-      finish(false, err instanceof Error ? err.message : String(err));
+      // spawn 同步抛（bash 根本不存在）与形态无关，重试也会一模一样地抛 → retriable 不置位
+      const msg = err instanceof Error ? err.message : String(err);
+      finish({ ok: false, retriable: false, spawnError: msg, detail: msg });
       return;
     }
-    let out = '';
-    let errOut = '';
     const timer = setTimeout(() => {
       try {
         child.kill();
@@ -435,40 +548,63 @@ export function testApprovalHook(hookCommand: string, cwd: string, timeoutMs = 1
       }
       // 超时是**不可判**的：能答的 bash 答得极快（实测 Git Bash 的 uname 约 130 ms），
       // 撞到十几秒只可能是 WSL 启动器正在冷启动 —— 它压根没跑到命令那一行，形态对不对还没验。
-      finish(false, `自检超时（${Math.round(timeoutMs / 1000)}s）`, true);
+      finish({ ok: false, retriable: true, timedOut: true, detail: `超时（${Math.round(timeoutMs / 1000)}s）` });
     }, timeoutMs);
-    child.stdout?.on('data', (c) => (out += String(c)));
-    child.stderr?.on('data', (c) => (errOut += String(c)));
+    child.stdout?.on('data', (c: Buffer) => outs.push(c));
+    child.stderr?.on('data', (c: Buffer) => errs.push(c));
     child.on('error', (err) => {
       clearTimeout(timer);
-      finish(false, err.message);
+      finish({ ok: false, retriable: false, spawnError: err.message, detail: err.message });
     });
     child.on('close', (code) => {
       clearTimeout(timer);
       if (code !== 0) {
-        // stdout 也要报 —— bash/Windows shim 的失败话术并不总是走 stderr（WSL 起不来时
-        // 它往往把话打在 stdout 上），只报 stderr 会得到一条「退出码 1」这种没法查的线索。
+        // stdout 也要报 —— 启动器的失败话术并不总是走 stderr（WSL 起不来时它把话打在 stdout 上，
+        // 而且是 UTF-16LE，上面已经解过），只报 stderr 会得到一条「退出码 1」这种没法查的线索。
+        const t = texts();
         const bits: string[] = [];
-        if (errOut.trim()) bits.push(`stderr：${errOut.trim().slice(0, 300)}`);
-        if (out.trim()) bits.push(`stdout：${out.trim().slice(0, 300)}`);
+        if (t.err.trim()) bits.push(`stderr：${t.err.trim().slice(0, 300)}`);
+        if (t.out.trim()) bits.push(`stdout：${t.out.trim().slice(0, 300)}`);
         // **两边都空**是第二种「不可判」：形态写错时 bash 会又快又响亮地报错（实测 79–183 ms，
         // 退出码 127 + `bash: line 1: …: No such file or directory` 打在 stderr 上），
-        // 退出码 1 却一个字都不说，只可能是启动器半路熄火（WSL 还在开机）。
-        finish(
-          false,
-          `bash 退出码 ${code}${bits.length ? '（' + bits.join('；') + '）' : '（stdout/stderr 都是空的）'}`,
-          bits.length === 0
-        );
+        // 退出码非 0 却一个字都不说，只可能是启动器半路熄火（WSL 还在开机）。
+        finish({
+          ok: false,
+          retriable: bits.length === 0,
+          code,
+          detail: `退出码 ${code}${bits.length ? '（' + bits.join('；') + '）' : '（stdout/stderr 都是空的）'}`,
+        });
         return;
       }
-      if (out.trim()) {
-        // 非 bash 工具本不该产生任何决策输出
-        finish(false, `自检输出异常：${out.trim().slice(0, 200)}`);
-        return;
-      }
-      finish(true, 'ok');
+      finish({ ok: true, retriable: false, code, detail: 'ok' });
     });
-    child.stdin?.end(JSON.stringify({ tool_name: 'read', tool_input: { file_path: 'x' } }) + '\n');
+    if (input !== undefined) child.stdin?.end(input);
+  });
+}
+
+/**
+ * 自检：用**同一个 shell**（DSH 的 hook 也是 `bash -c <command>`）跑一遍这条 hook 命令，
+ * 喂一个非 bash 工具的合成载荷（脚本会立刻 exit 0，无副作用）。
+ * 失败说明 hook 起不来（典型：node 路径在 bash 里不可达）→ 审批**不会生效**，必须让用户知道，
+ * 而不是安静地"看起来配好了"。
+ *
+ * `timeoutMs` 只为探针而留（钉住超时那条分支不必真等 15 s）；扩展侧一律用默认值。
+ */
+export function testApprovalHook(
+  hookCommand: string,
+  cwd: string,
+  opts: ShellSpawnOptions = {}
+): Promise<HookSelfCheck> {
+  const payload = JSON.stringify({ tool_name: 'read', tool_input: { file_path: 'x' } }) + '\n';
+  return spawnProbe(cwd, ['-c', hookCommand], opts, payload).then((p) => {
+    if (p.timedOut) return { ok: false, detail: `自检超时（${Math.round(p.timeoutMs / 1000)}s）`, retriable: true };
+    if (!p.ok && p.spawnError) return { ok: false, detail: p.spawnError, retriable: false };
+    if (!p.ok) return { ok: false, detail: `bash ${p.detail}`, retriable: p.retriable };
+    if (p.stdout.trim()) {
+      // 非 bash 工具本不该产生任何决策输出
+      return { ok: false, detail: `自检输出异常：${p.stdout.trim().slice(0, 200)}`, retriable: false };
+    }
+    return { ok: true, detail: 'ok', retriable: false };
   });
 }
 
@@ -500,47 +636,29 @@ export function shellGuessOnTimeout(platform: NodeJS.Platform = process.platform
 }
 
 /**
- * 用与 DSH 完全相同的方式（`bash -c <command>`，从扩展进程 spawn）探一次 shell。
- * DSH 子进程的 env 继承自扩展，所以这里的 `bash` 解析结果就是 hook 将要用的那个。
+ * 探一次 bash（`uname -s`），**如实记录**：退出码、超时、原始输出、认出来的形态。
  *
- * ⚠️ **这只是首猜，不是判据。** 它只采一次样（8 s 超时）。真正的判据是自检
- * （见 chatViewProvider 的 `_setupApproval`）。但**首猜的优先级仍然要紧**：自检是按顺序来的，
- * 把跑不通的形态排在第一个，就是白等一次它的超时。
+ * 与 `probeShell` 的分工：这个给**诊断**用（它要区分「坏」与「不可判」，还要拿原始输出做文案），
+ * `probeShell` 给**审批的首猜**用（只要一个形态）。两者走的是**同一套 spawn 与解码**，
+ * 所以「预算是多少秒、什么算不可判」不会各说各话。
  */
-export function probeShell(cwd: string): Promise<ShellKind> {
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = (kind: ShellKind): void => {
-      if (done) return;
-      done = true;
-      resolve(kind);
-    };
-    let child;
-    try {
-      child = spawn('bash', ['-c', 'uname -s'], { cwd, env: process.env, windowsHide: true });
-    } catch {
-      finish(shellGuessOnTimeout());
-      return;
-    }
-    let out = '';
-    const timer = setTimeout(() => {
-      try {
-        child.kill();
-      } catch {
-        /* 已退出 */
-      }
-      finish(shellGuessOnTimeout());
-    }, 8000);
-    child.stdout?.on('data', (c) => (out += String(c)));
-    child.on('error', () => {
-      clearTimeout(timer);
-      finish(shellGuessOnTimeout());
-    });
-    child.on('close', () => {
-      clearTimeout(timer);
-      finish(classifyShell(out) ?? shellGuessOnTimeout());
-    });
-  });
+export async function probeBash(cwd: string, opts: ShellSpawnOptions = {}): Promise<BashProbe> {
+  // ⚠️ argv 里**不含**可执行名：`program` 是另一回事（探针的正控用它换一把 bash）
+  const p = await spawnProbe(cwd, ['-c', 'uname -s'], { ...opts, timeoutMs: opts.timeoutMs ?? 8000 });
+  return { ...p, kind: p.ok ? classifyShell(p.stdout) : undefined };
+}
+
+/**
+ * 用与 DSH 完全相同的方式（`bash -c <command>`）探一次 shell，只回一个形态。
+ *
+ * ⚠️ **这只是首猜，不是判据**（判据是自检，见 `_setupApproval`），而且**超时/起不来时它是猜的**
+ * —— `shellGuessOnTimeout` 的理由见那边。返回类型**必须保持 `ShellKind`**：
+ * `scripts/probe-sandbox.mjs` 拿它跟 `'wsl'` 直接比，改成对象会让比较恒假、静默挑错形态，
+ * 而探针还是绿的（那种 bug 没人能看见）。要分辨「坏」与「不可判」请用 `probeBash`。
+ */
+export async function probeShell(cwd: string, opts: ShellSpawnOptions = {}): Promise<ShellKind> {
+  const p = await probeBash(cwd, opts);
+  return p.kind ?? shellGuessOnTimeout();
 }
 
 /** 一次自检结果的**结论面**（`nextShellCheck` 只吃这些，不吃 detail） */

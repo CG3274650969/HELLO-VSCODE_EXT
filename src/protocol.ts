@@ -230,7 +230,18 @@ export type ExtToWebview =
   /** 工具卡出结果：id 更新 toolState，可选带输出文本。unknown = 结果没到（判据同 ChatMessage.toolState） */
   | { type: 'tool-result'; id: string; toolState: 'ok' | 'error' | 'unknown'; output?: string }
   /** harness（恒为 DSH 直播）连接状态广播：连接中/在线/错误 + 型号 + 忙否，webview 据此亮状态点 */
-  | { type: 'backend-status'; state: DshConnState; model?: string; detail?: string; busy: boolean }
+  | {
+      type: 'backend-status';
+      state: DshConnState;
+      model?: string;
+      detail?: string;
+      busy: boolean;
+      /**
+       * C13：agent 的 bash 读数（顶栏那一小段）。**可选**：诊断还没算出来时不带这个字段，
+       * 老 webview 收到它不认识的东西也只是不渲染（`media/chat.js` 只认 `shell`），互不打扰。
+       */
+      shell?: { label: string; level: 'wsl' | 'warn' | 'bad'; title: string };
+    }
   /** live 运行在途（连接/等首事件期间也没有流式气泡）→ 用它锁住输入与后端开关 */
   | { type: 'run-busy'; busy: boolean }
   /** react-live（harness + DSH 直播 + dsh-live 产物齐全）：转发当前 DSH 会话的
@@ -290,7 +301,17 @@ export type ExtToWebview =
   /** 有命令待确认：webview 弹确认条（挂在 composer 内，react-live 下也可见）。
    *  `command` 是**扩展预格式化好的展示串**：bash 调用是命令原文，C4 的 write/edit 调用是
    *  目标路径标签（模型给的 `tool_input.content` 绝不转发到前端）。 */
-  | { type: 'approval-request'; id: string; toolName: string; command: string }
+  | {
+      type: 'approval-request';
+      id: string;
+      toolName: string;
+      command: string;
+      /**
+       * C13：模型递上 POSIX 形态路径时的两读法说明（多行文本，**只显示**）。
+       * 只有拿得到 hook 载荷里的 `cwd` 才算得出来 —— 缺了就不带这个字段。
+       */
+      pathNote?: string;
+    }
   /** 这条审批有结果了：收起确认条（允许/拒绝/超时/取消） */
   | { type: 'approval-resolved'; id: string; outcome: ApprovalOutcome };
 

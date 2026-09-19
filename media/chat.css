@@ -136,6 +136,26 @@ body.vscode-high-contrast .brand-mark {
   background: var(--dsw-alias-state-error-primary, #f85149); /* 红：错误 */
 }
 
+/* ---------- C13：agent 的 bash 读数（顶栏，紧跟在 harness 状态点右边） ---------- */
+/* flex:0 0 auto 是**必须的**：状态点是 `flex:1 1 auto` + ellipsis，不给这一格固定尺寸
+   就会被它挤掉（缩写到看不见，而"看不见"在这里恰好等于"一切正常"——最坏的静默）。
+   三态：wsl（能用但在 WSL，琥珀）/ warn（不可判，琥珀）/ bad（坏了，红）。
+   「能用且不是 WSL」整段不出现，所以这里没有"正常态"的样式。 */
+.harness-shell {
+  flex: 0 0 auto;
+  margin-left: 8px;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+}
+.harness-shell.wsl,
+.harness-shell.warn {
+  color: var(--dsw-alias-state-warning-primary, var(--vscode-editorWarning-foreground, #d29922));
+}
+.harness-shell.bad {
+  color: var(--dsw-alias-state-error-primary, var(--vscode-editorError-foreground, #f85149));
+}
+
 /* ---------- 行2：会话控制条（标题 + 历史/新建） ---------- */
 .chat-header {
   position: relative; /* 让历史下拉面板以此定位 */
@@ -1343,6 +1363,21 @@ body.react-live #empty-hint {
   background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.15));
   color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
   font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+/* C13：路径两读法说明（只显示）。比命令原文更小、更弱 —— 它是解释，不是内容 */
+.approval-note {
+  margin: 0;
+  max-height: 88px;
+  overflow: auto;
+  padding: 6px 8px;
+  border-left: 2px solid var(--dsw-alias-state-warning-primary, var(--vscode-editorWarning-foreground, #d29922));
+  border-radius: 4px;
+  background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.15));
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
   font-size: 11px;
   line-height: 1.5;
   white-space: pre-wrap;

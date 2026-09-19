@@ -897,6 +897,169 @@ check('配置条三钮：**每一类钮只有一处定义** —— 方块钮挂 
   ok(/position:\s*absolute/.test(dot[1]), '角上的状态点不再是绝对定位 —— 它会占掉宽度，方块钮就白改了');
 });
 
+// ---------- C13 · 顶栏 shell 读数 + 批准条的路径两读法（2026-09-19） ----------
+//
+// 盯三件事：① 读数三态画对了、**不带就不出现**（老扩展 / 诊断没算出来 / 一切正常，三种情况
+// 表现一致）；② 确认条那段说明是**多行只读**的，收起时清干净；③ 两条**结构守卫** —— 影子 DOM
+// 把树摊平了，挂错父子关系在影子里看不出来（`#harness-status` 整段重写 textContent 会把子节点
+// 抹掉，而那要等到下一次重连才发作，正是 C10b 那种形状），所以只能用原文钉。
+
+const SHELL_SEG = {
+  wsl: { label: 'bash=WSL', level: 'wsl', title: 'agent 的 bash 是 WSL 启动器（System32\\bash.exe）' },
+  unknown: { label: 'bash=?', level: 'warn', title: 'shell 探测没能得出可判的结论' },
+  bad: { label: 'bash=坏', level: 'bad', title: '找不到可用的 bash：PATH 上没有 bash，也没设 hello.dsh.bashPath' },
+};
+
+const C13_NOTE = [
+  '已按 POSIX 形态给出：/mnt/d/proj/src/a.ts',
+  '模型想指的应是：D:\\proj\\src\\a.ts',
+  '按 DSH 的解析方式会落到：D:\\mnt\\d\\proj\\src\\a.ts（/… 被当成 Windows 相对根）',
+  '本次不会为它抓轮前快照 —— 通常意味着这次改动不会出现在本轮审阅里。',
+].join('\n');
+
+check('C13 顶栏 shell 段：有读数就显示，label / level / title 三样都落到位', () => {
+  send({ type: 'mode-set', mode: 'harness' });
+  send({ type: 'backend-status', state: 'online', model: 'deepseek-v4-flash', busy: false, shell: SHELL_SEG.wsl });
+  const el = $('harness-shell');
+  eq(el.hidden, false, '有读数却整段藏着');
+  eq(el.textContent, 'bash=WSL', '读数文案没落上去');
+  eq(el.className, 'harness-shell wsl', 'level 没挂成 class');
+  eq(el.title, SHELL_SEG.wsl.title, 'title 没落上去 —— 读数只有几个字，详情全靠它');
+});
+
+check('C13 顶栏 shell 段：三档 level 各自成 class，且不残留上一档', () => {
+  const el = $('harness-shell');
+  for (const k of ['unknown', 'bad', 'wsl']) {
+    send({ type: 'backend-status', state: 'online', busy: false, shell: SHELL_SEG[k] });
+    // 精确到整串：多一个旧 level 的 class 就说明上一条读数的颜色还留着（琥珀/红混着看=看不出档）
+    eq(el.className, `harness-shell ${SHELL_SEG[k].level}`, `${k} 档的 class 不对`);
+    eq(el.textContent, SHELL_SEG[k].label, `${k} 档的文案不对`);
+  }
+});
+
+check('C13 顶栏 shell 段：**不带 shell 就整段不出现**（老扩展 / 诊断没算出来 / 一切正常同款）', () => {
+  const el = $('harness-shell');
+  send({ type: 'backend-status', state: 'online', busy: false, shell: SHELL_SEG.wsl });
+  eq(el.hidden, false, '前置条件没成立');
+  send({ type: 'backend-status', state: 'online', busy: false }); // 老载荷：没有 shell 字段
+  eq(el.hidden, true, '不带 shell 时读数还赖着 —— 那会把上一次的结论当成现在的');
+  eq(el.textContent, '', '藏起来了但字还在（下次亮起来会先闪一下旧值）');
+  eq(el.title, '', 'title 没清');
+});
+
+check('C13 顶栏 shell 段：chat 模式下连**重发**的 backend-status 也点不亮它，切回 harness 靠缓存自己回来', () => {
+  const el = $('harness-shell');
+  send({ type: 'mode-set', mode: 'harness' });
+  send({ type: 'backend-status', state: 'online', busy: false, shell: SHELL_SEG.bad });
+  eq(el.hidden, false, '前置条件没成立');
+  send({ type: 'mode-set', mode: 'chat' });
+  eq(el.hidden, true, 'chat 模式下 bash 读数还挂着 —— 那个模式里根本没有 agent 在跑 bash');
+  // ⚠️ 这一帧是这条判据的全部意义：扩展会在任意时刻重发 backend-status（连上/重连/改设置），
+  // 只在 applyMode 里藏的话，chat 模式下一帧就把它重新点亮了。
+  send({ type: 'backend-status', state: 'online', busy: false, shell: SHELL_SEG.bad });
+  eq(el.hidden, true, 'chat 模式下重发一帧 backend-status 就把读数点亮了（可见性不能只看 applyMode 那一刻）');
+  // 切回来时**不重发**（扩展不会因为换了个模式就重发）⇒ 只能靠缓存把那段补回来
+  send({ type: 'mode-set', mode: 'harness' });
+  eq(el.hidden, false, '切回 harness 后读数没回来（缓存被 applyMode 扔了）');
+  eq(el.textContent, SHELL_SEG.bad.label, '切回来后读数内容不对');
+});
+
+check('C13 批准条：pathNote 多行原样落进 #approval-note（换行不能塌成一行）', () => {
+  send({ type: 'approval-request', id: 'c13-1', toolName: 'write', command: 'write /mnt/d/proj/src/a.ts', pathNote: C13_NOTE });
+  const el = $('approval-note');
+  eq(el.hidden, false, '带了 pathNote 却不显示；带说明的那次审批会安静地少掉一截信息');
+  eq(el.textContent, C13_NOTE, '说明文本被改了字');
+  eq(el.textContent.split('\n').length, 4, '换行没了 —— 塌成一行就读不出「想指」与「会落到」的对比');
+  eq($('approval-cmd').textContent, 'write /mnt/d/proj/src/a.ts', '命令原文被改动了（那段是只读的，一个字的改写权都没有）');
+});
+
+check('C13 批准条：不带 pathNote 的载荷 ⇒ 整段不出现（反控）', () => {
+  send({ type: 'approval-resolved', id: 'c13-1' });
+  send({ type: 'approval-request', id: 'c13-2', toolName: 'bash', command: 'rm -rf build' });
+  eq($('approval-note').hidden, true, '没有 pathNote 却显示出一段空说明');
+  eq($('approval-note').textContent, '', '空说明还留着字');
+});
+
+check('C13 批准条：收起时清干净；id 对不上的迟到帧不许误关新的那条', () => {
+  const el = $('approval-note');
+  send({ type: 'approval-request', id: 'c13-3', toolName: 'write', command: 'x.ts', pathNote: C13_NOTE });
+  eq(el.hidden, false, '前置条件没成立');
+  send({ type: 'approval-resolved', id: 'late-frame' }); // 迟到帧
+  eq(el.hidden, false, '迟到的 resolved 把当前这条说明关掉了');
+  send({ type: 'approval-resolved', id: 'c13-3' });
+  eq(el.hidden, true, '拍板后说明还挂着 —— 下一条命令会先闪出上一条的路径');
+  eq(el.textContent, '', '藏起来但字还在');
+});
+
+check('C13 结构守卫：#harness-shell 必须是 #harness-status 的**兄弟**，不能挂成子节点', () => {
+  const html = readFileSync(htmlPath, 'utf8');
+  const m = /<span[^>]*\bid="harness-status"[^>]*>([\s\S]*?)<\/span>/.exec(html);
+  ok(m, 'chat.html 里找不到 #harness-status');
+  ok(
+    !/harness-shell/.test(m[1]),
+    '#harness-shell 落进了 #harness-status 里面 —— 那个节点整段重写 textContent，读数会在下一次重连时被静默抹掉'
+  );
+  ok(/id="harness-shell"/.test(html), 'chat.html 里没有 #harness-shell（读数没有落点）');
+  ok(/<pre[^>]*\bid="approval-note"[^>]*\shidden(?=[\s/>])/.test(html), '#approval-note 必须是**初始 hidden 的 <pre>**（多行文本 + 没说明时整段不出现）');
+});
+
+check('C13 结构守卫：CSS —— 读数不被挤掉、颜色走 token、hidden 没被 display 覆盖', () => {
+  // 先去掉注释：本仓库的 CSS 每个小节前都有一行 `/* ---- 标题 ---- */`，它会被 `[^{}]+`
+  // 一起吞进「选择器」里，于是 trim 之后谁都不等于选择器本身 —— 那条判据会**永远假红**。
+  const css = readFileSync(join(repoRoot, 'media', 'chat.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  // 按**选择器列表**取规则块：`.harness-shell.wsl, .harness-shell.warn { … }` 这种合并写法
+  // （同色的两档本来就该是一条规则）用「选择器紧跟着 {」的字面匹配会一条都取不到，然后假红。
+  const block = (sel) => {
+    for (const m of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      if (m[1].split(',').some((s) => s.trim() === sel)) return m[2];
+    }
+    return undefined;
+  };
+  const shell = block('.harness-shell');
+  ok(shell, 'chat.css 里找不到 .harness-shell');
+  ok(/flex:\s*0 0 auto/.test(shell), '.harness-shell 不是 flex:0 0 auto —— 它会被左边 flex:1 1 auto 的 .harness-status 挤没（那是这条读数唯一可能被吃掉的方式）');
+  ok(/white-space:\s*nowrap/.test(shell), '.harness-shell 会折行 —— 顶栏那一行装不下两行');
+  ok(!/display:/.test(shell), '.harness-shell 里写了 display —— 那会盖掉 [hidden] 的 display:none，读数会以空壳形式常驻');
+  const bad = block('.harness-shell.bad');
+  ok(bad && /error/.test(bad), '.harness-shell.bad 没走 error token —— 「坏」和「WSL」就只剩文案不一样，颜色分不出档');
+  const warn = block('.harness-shell.wsl');
+  ok(warn && /warning/.test(warn), '.harness-shell.wsl 没走 warning token（复用仓库已有 token，不新造色）');
+  const note = block('.approval-note');
+  ok(note, 'chat.css 里找不到 .approval-note');
+  ok(/white-space:\s*pre-wrap/.test(note), '.approval-note 不是 pre-wrap —— 四行说明会塌成一团');
+  ok(!/display:/.test(note), '.approval-note 里写了 display —— [hidden] 会失效，没说明时也占一块位置');
+});
+
+check('C13 结构守卫：路径两读法**只在显示链路上**（判定链路一行没动）', () => {
+  const src = readFileSync(join(repoRoot, 'src', 'chatViewProvider.ts'), 'utf8');
+  const lines = src.split('\n');
+  const lineOf = (needle, from = 0) => lines.findIndex((l, i) => i >= from && l.includes(needle)) + 1;
+  const idxOfLine = (k) => lines.slice(0, k - 1).join('\n').length;
+
+  const calls = lines.map((l, i) => [i + 1, l]).filter(([, l]) => l.includes('readPosixTarget('));
+  eq(calls.length, 1, `readPosixTarget( 出现了 ${calls.length} 次 —— 只该在 _approvalPathNote 里被调一次`);
+  const def = lineOf('private _approvalPathNote(');
+  ok(def > 0, '找不到 _approvalPathNote 的定义');
+  ok(
+    calls[0][0] > def && calls[0][0] < def + 20,
+    `readPosixTarget 的调用不在 _approvalPathNote 体内（第 ${calls[0][0]} 行 vs 定义在第 ${def} 行）`
+  );
+
+  // 说明只由「问」的那条路算。判定链路（_fsTargetAbs → 快照/是否放行）碰它一下，
+  // 它就悄悄从「显示」变成了「行为」，而本次明确不做路径归一化。
+  const askDef = idxOfLine(lineOf('private _onApprovalAsk('));
+  const askEnd = src.indexOf('\n  private ', askDef + 1);
+  const callIdx = idxOfLine(lineOf('this._approvalPathNote('));
+  ok(callIdx > askDef && callIdx < askEnd, '_approvalPathNote 被 _onApprovalAsk 之外的代码调用了 —— 那它就不只是显示');
+
+  // fail-safe 那一行必须原样在：POSIX 形态仍然「问、但不抓轮前快照」。
+  // 它也是上面那段说明的准入集合（说明里「不会抓快照」那句和这句必须说的是同一件事）。
+  ok(
+    /if \(raw\.startsWith\('\/'\) && !raw\.startsWith\('\/\/'\)\) return undefined;/.test(src),
+    '_fsTargetAbs 的 POSIX 早退被改了 —— 那行是「问但不抓快照」的全部依据'
+  );
+});
+
 console.log('');
 if (failures.length) {
   console.log(`✗ ${failures.length} 条未过（共 ${passed + failures.length} 条）：`);

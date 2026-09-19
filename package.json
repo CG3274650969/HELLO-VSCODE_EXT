@@ -132,6 +132,12 @@
           "markdownDescription": "`command` 非空时配合使用的参数列表。",
           "scope": "machine"
         },
+        "hello.dsh.bashPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "钉住 agent 的 bash 工具用哪一把 bash：填一个 `bash.exe` 的绝对路径，扩展会把它所在目录前置到子进程 PATH 上。空 = 不干预，靠 PATH 自己找（Windows 上常常命中 `C:\\Windows\\System32\\bash.exe` 这个 WSL 启动器，而 WSL 里没有发行版时 agent 每次调用都只得到一段报错）。\n\n⚠️ 是 `scope: machine` —— 这是**一台机器的事实**，不该被提交进任何仓库。\n\nPin which bash the agent's bash tool uses: an absolute path to `bash.exe`; the extension prepends its directory to the child process PATH. Empty = leave PATH alone (on Windows this often lands on the `C:\\Windows\\System32\\bash.exe` WSL launcher, which fails with an unreadable error when no WSL distro is installed).\n\n⚠️ `scope: machine` on purpose — it is a fact about one machine and must never be committed to a repo.",
+          "scope": "machine"
+        },
         "hello.dsh.debug": {
           "type": "boolean",
           "default": false,
