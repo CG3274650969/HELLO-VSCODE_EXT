@@ -497,9 +497,15 @@ export interface PosixTarget {
  *   缺了会自信地印一个错位置 —— 比不说更糟
  * - `//…`（UNC）也整条 `undefined`：它压根不是「模型把 `D:\x` 写成了 POSIX」，
  *   没有「想指的」可言。这条**不是顺手加的**：它让本函数的准入集合**恰好等于**
- *   `_fsTargetAbs` 里 `raw.startsWith('/') && !raw.startsWith('//')` 那一句的集合 ——
+ *   `changeForecast.resolveTargetPath`（C14 之前是 `chatViewProvider._fsTargetAbs`）里
+ *   `raw.startsWith('/') && !raw.startsWith('//')` 那一句的集合 ——
  *   也就是说，**会印出这段话的路径，正好就是不会抓轮前快照的那些**。
  *   两处若各写各的，就会出现「提示说这次改动不在审阅里，实际却抓了快照」那种自相矛盾。
+ *
+ * ⚠️ 这一句和 `changeForecast.resolveTargetPath` 里那一句**同形不同命**：那边的作用是
+ * *拒绝*（拿不到绝对路径 ⇒ 按越界处理、多问一次），这边的作用是*翻译*（把 `/mnt/d/x` 读成
+ * `D:\x` 供显示）。所以它俩**必须各留一份**，谁也别去「顺手合并」—— `probe-webview-render`
+ * 的结构守卫就是钉这件事的（它允许这两个文件里各有一处，禁止第三处）。
  */
 export function readPosixTarget(raw: string, cwd: string): PosixTarget | undefined {
   if (!raw.startsWith('/') || raw.startsWith('//')) return undefined;

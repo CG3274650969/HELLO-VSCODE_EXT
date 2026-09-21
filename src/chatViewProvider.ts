@@ -46,6 +46,21 @@ import {
   wslCodeOf,
   ShellDiagnosis,
 } from './shellDiag';
+// C14：事前 diff 预览的判据全在这个纯模块里（能在扩展宿主之外加载 → 探针验得了）。
+// `resolveTargetPath` 是从本文件 `_fsTargetAbs` 搬过去的，**判据与字面量只有那一个源**。
+import {
+  actualForecast,
+  actualLine,
+  forecastFileChange,
+  forecastLine,
+  FORECAST_FAILED_LINE,
+  FORECAST_NO_DIFF_LINE,
+  FORECAST_UNKNOWN_LINE,
+  isForecastTool,
+  parseToolArgs,
+  resolveTargetPath,
+  ForecastIO,
+} from './changeForecast';
 import {
   EFFORT_VALUES,
   EffortPluginMount,
@@ -94,7 +109,13 @@ import { readCompactionEvent } from './compactionNotice';
 // scripts/probe-run-inspector.mjs 直接加载编译产物自检）。后两个导出是**唯一的一份实现** ——
 // 本文件里 `_toolKey` 与 `tool/result` 的三态判定（ok / error / **unknown**）都改成调用它们，
 // 免得检查器与转写对同一件事各说一套。
-import { RunInspector, toolKeyFrom, toolResultVerdict, type RunReadout } from './runInspector';
+import {
+  RunInspector,
+  toolKeyFrom,
+  toolResultVerdict,
+  type RunReadout,
+  type ToolResultVerdict,
+} from './runInspector';
 // C12：项目级 agent profile（纯模块，零 vscode 依赖，scripts/probe-agent-profile.mjs 直接加载编译产物自检）。
 // 「只能加严」那条性质由 `compileProfile` 一个纯函数守着 —— 本文件里没有第二处决定松紧的地方。
 import {
@@ -1201,6 +1222,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (m.role === 'tool' && m.toolState === 'running') {
           m.toolState = 'unknown';
           this._post({ type: 'tool-result', id: m.id, toolState: 'unknown' });
+          // C14：这条调用不会有 tool/result 了 —— 卡上那行预测必须当场撤掉
+          this._forecastAfter(m.id, 'unknown', undefined);
         }
       }
     }
@@ -1280,6 +1303,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // 进程被杀 → 那次调用到底跑没跑完**无法区分**（同 _finishTurn 那条，见那里的注释）
         m.toolState = 'unknown';
         this._post({ type: 'tool-result', id: m.id, toolState: 'unknown' });
+        // C14：同上 —— 预测当场撤掉，别让它留在卡上冒充结果
+        this._forecastAfter(m.id, 'unknown', undefined);
       }
     }
     this._backendState = 'error';
@@ -1921,6 +1946,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._active.messages.push(msg);
         this._toolIds.set(key, msg.id);
         this._post({ type: 'tool-start', message: msg });
+        // C14：这条调用要动哪个文件、大概改成什么样 —— 帧先于 dispatch（见 changeForecast 头注释），
+        // 所以这是真·事前。**预测只活在这一次会话里**（不入 ChatMessage / 不落盘）。
+        this._forecastBefore(msg.id, d);
         return;
       }
       case 'tool/result': {
@@ -1955,6 +1983,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         target.toolState = verdict;
         target.toolOutput = output;
         this._post({ type: 'tool-result', id: target.id, toolState: target.toolState, output });
+        // C14：把上面那条预测换成事实（或明确地说「这次没跑成，那只是预测」）。
+        this._forecastAfter(target.id, verdict, d.meta);
         return;
       }
       case 'turn/end': {
@@ -2390,16 +2420,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return String(ask.cwd ?? '').trim() || this._reviewRoot() || '';
   }
 
-  /** fs 工具的目标绝对路径（拿不到 → undefined）。 */
+  /**
+   * fs 工具的目标绝对路径（拿不到 → undefined）。
+   *
+   * C14 起**委派**给 `changeForecast.resolveTargetPath` —— 卡片上的「预计改动」与批准条上的文案
+   * 必须是**同一个函数**算出来的路径，两处各写一份就会出现「同一轮里两个读数指向不同文件」。
+   * 规则与判据（POSIX/UNC 早退、绝对路径、相对路径按会话工作区）一个字没改，只是搬了位置。
+   */
   private _fsTargetAbs(ask: ApprovalAsk): string | undefined {
-    const raw = String(ask.filePath ?? '').trim();
-    if (!raw) return undefined;
-    // POSIX 形态（Linux 侧给的 /mnt/… 之类）：Windows 的 path 会把它当"当前盘根下"解析出
-    // 一个完全错误的位置 —— 宁可判不出来（调用方按越界处理，多问一次），也不乱认。
-    if (raw.startsWith('/') && !raw.startsWith('//')) return undefined;
-    if (path.isAbsolute(raw)) return path.resolve(raw);
-    const base = this._sessionWorkspaceRoot(ask);
-    return base ? path.resolve(path.join(base, raw)) : undefined;
+    return resolveTargetPath(ask.filePath, this._sessionWorkspaceRoot(ask));
   }
 
   /** target 是否落在 root 之内（含 root 自身）。win32 下 path.relative 已做大小写归一。
@@ -4221,6 +4250,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // 重新赋值一个新 Map（而不是 clear）：对比那边靠**引用相等**判断「还是不是本轮」
     this._reviewRoots = new Map();
     this._pendingReview = [];
+    // C14：上一轮那些「发过预测」的卡已经收过尾了，键留着只会让下一轮的同 id 串味
+    this._forecastPaths.clear();
     this._post({ type: 'review-clear' }); // 新一轮开始 → 隐去上轮审阅条
     const root = this._reviewRoot();
     if (!root || !this._reviewChangesOn()) return;
@@ -4237,6 +4268,124 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (doPost) {
       this._post({ type: 'review-clear' });
     }
+  }
+
+  // ---------- C14 工卡上的「事前 / 实际改动」（近似） ----------
+  //
+  // 判据全在 `src/changeForecast.ts`（纯模块，探针直接加载）。这里的三个方法只做接线：
+  // 把入参喂进去、把结果 post 出去、在**失败/中断**时把预测撤掉。
+  //
+  // ⚠️ 这一整条链只吃 `session.event` —— 与审批开关、C1 的 hook、`hello.dsh.command`
+  // 覆盖模式**全无关**（要有一条 F5 正面证明这件事）。
+
+  /**
+   * 本轮里「发过预测」的工具消息 id → 事前算出的那个路径（DSH 在 diffs 里没给 path 时兜底）。
+   * 一张 map 兼作集合：`has()` 就是「这条卡上有预测」。轮首清空 —— 与 `_reviewRoots` 同一
+   * 生命周期，不另起一套状态机（否则没收尾的预测会跨轮累积、「实际改动」被贴到别的卡上）。
+   */
+  private readonly _forecastPaths = new Map<string, string>();
+
+  /**
+   * 一条 `tool/call` 的**事前**预测。帧是 `appendToolCall` 写的、排在 `scheduler.dispatch`
+   * 之前（见 `changeForecast.ts` 头注释的实测出处），所以这是**真·事前** ——
+   * 但只领先毫秒，**不是可拦截的窗口**（真正的阻塞窗口只有 C1 的 hook）。
+   */
+  private _forecastBefore(id: string, d: DshEventData): void {
+    if (!this._reviewChangesOn()) return; // 与 C4 同一个开关：不审阅就别在卡上多写一行
+    const args = parseToolArgs(d.arguments);
+    if (!isForecastTool(d.name) || !args) return;
+    // 「什么算可预览内容」复用 C4 的判定（扩展名表 / 前 8KB 的 NUL / 单文件字节上限）——
+    // 另写一份读文件逻辑，两份判据迟早分叉
+    const io: ForecastIO = {
+      // 键是 basename（`snapshotSingleFile` 用父目录当根，见那里的注释）；读不到 = 没有条目
+      readText: (abs) =>
+        snapshotSingleFile(path.dirname(abs), abs).files.get(path.basename(abs))?.content ??
+        undefined,
+      exists: (abs) => {
+        try {
+          return fs.statSync(abs).isFile();
+        } catch {
+          return false;
+        }
+      },
+    };
+    // 基准取 DSH 的会话目录（`DSH_CWD` 就是从这里注入的）⇒ 卡上这行与批准条上那个路径
+    // 出自同一个基准、同一个 resolveTargetPath
+    const f = forecastFileChange(d.name, args, this._dshCwd(), io);
+    if (!f) return; // 没有预测也是一种答案：什么都不显示，绝不留空壳
+    const line = forecastLine(f);
+    this._forecastPaths.set(id, f.abs ?? f.raw);
+    this._post({
+      type: 'forecast',
+      id,
+      phase: 'before',
+      label: line.text,
+      title: line.title,
+      level: line.level,
+      diff: f.diff,
+      diffTruncated: f.diffTruncated,
+      note: f.diffNote,
+    });
+  }
+
+  /**
+   * 这条调用跑完了：把卡上那行预测换成事实，或**明确地撤掉它**。
+   *
+   * 只在真发过预测时才说话（`_forecastPaths.has`）—— 于是别的卡片不会长出这一行。三种收尾都在
+   * 这里，因为它们共享同一个前提：**卡上不许留着一条没有下文的「预计」**（那是靠沉默说谎）。
+   */
+  private _forecastAfter(id: string, verdict: ToolResultVerdict, meta: unknown): void {
+    if (!this._forecastPaths.has(id)) return;
+    if (verdict === 'unknown') {
+      this._post({
+        type: 'forecast',
+        id,
+        phase: 'after',
+        label: FORECAST_UNKNOWN_LINE,
+        level: 'warn',
+        unknown: true,
+        note: '上面那行是预测，不是结果 —— 别按它判断盘上的现状',
+      });
+      return;
+    }
+    if (verdict === 'error') {
+      this._post({
+        type: 'forecast',
+        id,
+        phase: 'after',
+        label: FORECAST_FAILED_LINE,
+        level: 'warn',
+        failed: true,
+        note: '失败路径通常压根不带 diffs —— 预测作废',
+      });
+      return;
+    }
+    const a = actualForecast(meta);
+    if (!a) {
+      // 成功了、但结果里没有可认的 diffs（老运行时 / 嵌套的 Code Mode 调用 / 这条工具没挂
+      // presentationMeta）—— 同样不许把预测留在卡上
+      this._post({
+        type: 'forecast',
+        id,
+        phase: 'after',
+        label: FORECAST_NO_DIFF_LINE,
+        level: 'warn',
+        note: '结果里没有可读的 diffs（老运行时或嵌套调用）',
+      });
+      return;
+    }
+    const line = actualLine(a, this._forecastPaths.get(id)); // 兜底路径：DSH 那份 diff 里没给 path 时用
+    this._post({
+      type: 'forecast',
+      id,
+      phase: 'after',
+      label: line.text,
+      title: line.title,
+      level: line.level,
+      diff: a.diff,
+      diffTruncated: a.diffTruncated,
+      note: a.hunks === 0 ? 'DSH 报的 diffs 是空的：新建文件，或内容与改动前完全一样' : undefined,
+    });
   }
 
   /**

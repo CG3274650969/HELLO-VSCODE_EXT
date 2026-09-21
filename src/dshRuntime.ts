@@ -104,6 +104,12 @@ export interface DshEventData {
   error?: { name?: string; code?: string } | unknown;
   /** tool/result 的 message.content 数组 */
   message?: { content?: DshToolResultBlock[] };
+  /**
+   * C14：`tool/result` 的 `presentationMeta`（**只有顶层 exec 会带**：工具自己的
+   * `presentationMeta(args, value)` 结果，write/edit 就在里面给 `diffs`）。
+   * 一直在线、此前没人读 —— 形状交给 `changeForecast.actualForecast` 认，这里只要不丢就行。
+   */
+  meta?: unknown;
   /** turn/end 的收尾原因 */
   reason?: { kind?: string; [k: string]: unknown };
 }

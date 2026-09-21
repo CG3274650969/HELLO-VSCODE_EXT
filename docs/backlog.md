@@ -24,7 +24,7 @@
 | C11 | 会话级推理档位（reasoningEffort） | P1 | **原判「受限：需 runtime 先支持」已推翻** —— 机制早就在（provider 按请求解析档位、`agent/request` 瀑布的返回值就是请求 config），缺的只是入口。**已实现：自检 25/25 全绿；F5 五项全过**（④ 当场揪出一个真 bug：换会话不重播配置条，已修 `a7e5bab` + 加了结构守卫，复验通过；③ 有盘上留痕 —— 两会话各拿各的档位，且拿到「`reason=change` ⇒ 不重启就改档」的直接证据）（热切 + 真会话级；DSH 侧一行不改、用户配置一行不碰，纯追加一个我们自己的插件块） | [x] |
 | C12 | 项目级 agent profile（工具白名单/默认模型/审批策略） | P1 | **原文「扩展负责写回 runtime 配置」只对了三分之一** —— 模型是 `initialize` 参数（必重连）、审批是扩展内部三个读口（零新机制）、**工具白名单运行时压根没有配置键**（要靠自挂插件调 `tools.restrict`，见正文源码坐标）。**已实现：自检 32/32 + webview 段 8 条全绿**（含端到端反控：盘上 `request/header.header.tools` 里 bash 真的没了）；profile 文件落在工作区 `.hello-chat/profile.json`，**不写用户任何文件**，「只能加严」由 `compileProfile` 一个纯函数守死；**F5 五条 2026-09-19 真机全过**（模型跟着 profile 走、`header.tools` 里 bash/write/edit 真的没了而 read 还在、忙碌时切被拒且盘上不动、「写成想关审批」弹条照旧出现） | [x] |
 | C13 | Windows / 跨环境 shell 与路径收口 | P1 | **原文「必要时自带 bash 或推荐配置」没走到那一步，也不用走** —— 上游到今天确实没有换 shell 的配置键，但**PATH 是活的**（`spawn` 按传入 env 的 PATH 搜索，`dsh-subprocess` 只擦敏感键、`ENV_OVERRIDES` 不含 PATH）⇒ 扩展侧前置一个目录就能换掉 agent 的 bash，**DSH 一行不改**。**已实现：诊断 + 可选钉住 bash（`hello.dsh.bashPath`，`scope: machine`）+ 顶栏一段读数 + 坏时一次性可读告警 + 批准条的 `/mnt/…` 两读法说明**（只显示，**不做路径归一化**）；自检 **62/62 + webview 段 10 条（全套 57/57）+ C1 自检 21/21**，7 条结构守卫做过变异测试**全被抓红**；**F5 六条全过（2026-09-19 用户真机）** —— 真弹窗文案与三个按钮、窄面板下顶栏不被挤、`钉住这个 bash` 写进用户设置后真换成、`/mnt/…` 两读法在真 WSL 一轮里的排版、第三条监听器的重连、与「审批未生效」弹窗互不干扰 | [x] |
-| C14 | 事前 diff 预览（近似实现） | P2 | 受 wire 无 file 事件限制 | [ ] |
+| C14 | 事前 diff 预览（近似实现） | P2 | **原文「wire 无 file 事件 → 拿不到将改动的文件清单」只对了一半** —— 真 hunk 一直在线上（`tool/result.meta.diffs`），是扩展此前一个字没读；缺的只有「事前」那半，靠 `tool/call` 的入参预判（帧先于 dispatch）。**已实现：卡片上一行「预计 → 实际」**（事前按入参算近似 diff + 命中检查，事后换成 DSH 报的 `meta.diffs`，失败/中断当场作废）；自检 27/27 + webview 段 65/65，6 条结构守卫变异测试全被抓红；**F5 六条待跑** | [~] |
 | C15 | 多会话并行 / 分支对照视图 | P2 | 无 | [ ] |
 | C16 | 审批白名单记忆（信任一次/永久） | P2 | 依赖 C1 | [ ] |
 | C17 | 多模态 / 图片附件 | P2 | 取决于模型能力 | [ ] |
@@ -827,10 +827,45 @@ if (!this._abort || !this._reviewChangesOn()) return;  // 对
 
 ## P2 — 加分项
 
-### C14 · 事前 diff 预览（近似）
-- **现状**：只能跑完再还原。wire 无 file 事件 → 无法拿"将改动的文件清单"。
-- **补法**：用 tool/call 的 `arguments` 预判 + 轮前快照做近似「预计改动」提示。
-- **验收**：写文件类工具调用前，能提前显示预计触及的路径。
+### C14 · 事前 diff 预览（近似）（2026-09-21 实现，F5 六条待跑）
+- **原文**：**现状**「只能跑完再还原。wire 无 file 事件 → 无法拿"将改动的文件清单"」；**补法**「用 `tool/call` 的 `arguments` 预判 + 轮前快照做近似「预计改动」提示」；**验收**「写文件类工具调用前，能提前显示预计触及的路径」。
+- **原文的「现状」只对了一半**（先说清，免得后人接着信）：wire 里确实**没有** file 事件，但**实际的 hunk diff 一直在线上** —— `tool/result.meta.diffs` 带着 DSH 用真 before/after 算出来的 `[{path,oldText,newText}]`，而扩展此前**一个字都没读**（`tool/result` 分支只取 `message.content[].text`）。所以「只能跑完再还原」是**我们没读**，不是拿不到。真正的缺口只剩「**事前**」那半：它只能靠入参预判。
+- **两个已拍板的决定（不再讨论）**：① 落点 = **工具卡里**（不是新的 composer 条、不是新面板）；② **含「预计 → 实际」对齐** —— 那条调用的 `tool/result` 一到就把预测换成事实。
+- **实测五条**（2026-09-21 逐条核过源码/抓帧，**每一条都决定了设计**）：
+  - **F1 `tool/call` 帧是真·事前**：`dsh-agent-loop` 里 `appendToolCall` 在前（`lib/index.js:191`）、`scheduler.dispatch` 在后（`:197`）⇒ 帧一定先于执行。⚠️ 但领先只有**毫秒级**，**它不是可拦截的窗口** —— 真正的阻塞窗口只有 C1 的 hook（且只覆盖破坏性 bash 与工作区外的写）。
+  - **F2 `data.arguments` 是 JSON 字符串**（抓帧实测 `"{\"command\": \"echo …\"}"`）⇒ 必须先 `JSON.parse`，且类型是 `unknown`，畸形/非对象都要**不抛**地退化。
+  - **F3 `meta` 只挂顶层 exec、且只是可选的**：`dsh-tools` 把 `output.presentationMeta(args, value)` 挂进 `result.meta`（`lib/index.js:3417-3424`），agent loop 的 `appendToolResult` 用 `...result.meta !== void 0 ? { meta: result.meta } : {}` 原样透出（`dsh-agent-loop/lib/index.js:302-314`）⇒ **失败路径、嵌套（Code Mode）调用、没挂 `presentationMeta` 的工具都不带**。这就是「不许把一条预测永远挂在卡上」的由来。
+  - **F4 `computeHunkDiffs` 是「每个 hunk 一条」**（`dsh-tool-fs/lib/index.js:487-512`，context 3）：一次写到同一个文件也可能给**多条** `diffs`（纯插入的 `oldText` 是 `null`），而**前后文本完全相同时它返回空数组** ⇒ `diffs: []` 的两种成因是**新建文件**与**内容与改动前一样**，**我们分不出来**（所以话要说得能容下两者，不许硬说「新建」）。
+  - **F5 真实工具清单里 `todo_write` 存在**（27 个存档会话统计：`plan, bash, glob, read, write, edit, todo_write, subagent`）⇒ 写文件的只有 `write`/`edit`（与 C1 的 hook matcher 同集合的 fs 部分），且**判据必须精确匹配** —— `name.includes('write')` 会把 `todo_write` 当成写文件的工具。
+- **D1 · 新纯模块** [src/changeForecast.ts](../src/changeForecast.ts)（**不 import vscode** —— 判据必须能在扩展宿主之外加载，C10b 的教训）：`parseToolArgs` / `isPosixShapedPath` / `resolveTargetPath` / `forecastFileChange` / `forecastProblem` / `forecastLine` / `actualForecast` / `actualLine` + 三句「预测作废」的常量。diff 复用 C4 的 `lineDiff` 与 `MAX_DIFF_ROWS`（[src/fileSnapshot.ts](../src/fileSnapshot.ts)），不另起一套。
+  - **`resolveTargetPath` 是本项唯一一处对既有代码的搬动**：把 `_fsTargetAbs` 的解析规则原样搬进来，`_fsTargetAbs` 改成一行委派。理由只有一条 —— **卡片上的路径与批准条上的路径必须是同一个函数算的**，两处各写一份就会出现「同一轮里两个读数指向不同文件」那种最坏的错。⚠️ 有回归风险（3 个调用点：批准文案、越界判断、写前快照），所以单独重跑了三条审批探针 + `probe-sandbox --fs-hook`。
+  - `write` 的近似 diff = `lineDiff(现在盘上的文本, content)`（读盘复用 C4 的 `snapshotSingleFile` ⇒ 二进制/超大/预算闸与审阅**同一套**，不另写读文件逻辑）；`edit` 的 diff = `lineDiff(old_string, new_string)` —— **只在替换片段上算，不模拟「替换哪一处」**（那是 DSH 的语义，猜了就是说谎）。
+  - **命中检查先归一化行尾**（`\r\n` → `\n`）：本仓库自己就是 CRLF/LF 混排，拿模型给的 LF `old_string` 去 `indexOf` 一个 CRLF 文件会**假报「找不到」**（而 DSH 那边其实能成功）。归一化**只用于检查**，不参与 diff 的文本。
+  - **事前就能说出「这次会失败」**（这一小块最值钱）：`old_string` 命中 0 次 / 命中 >1 且 `replace_all` 没开 / `old_string === new_string`（DSH 的 `parseEditArgs` 自己就会拒）/ 盘上没这个文件。**读不出盘就不给 `finding`**（不猜）。
+- **D2 · 接线**（[src/chatViewProvider.ts](../src/chatViewProvider.ts)）：`_forecastBefore`（`tool/call` 分支）/ `_forecastAfter`（`tool/result` 分支 + `_finishTurn`、`_surfaceLiveError` 两处 unknown 收尾）；一张 `_forecastPaths`（工具消息 id → 事前算出的路径）兼作「这条卡上有预测」的集合，在 `_captureBaselineAtTurnStart` 里清 —— 与 `_reviewRoots` 同一生命周期，不另起状态机。**三种收尾都只在真发过预测时才说话**，且都遵守同一条：**卡上不许留着一条没有下文的「预计」**。
+  - **不落盘**：`ChatMessage` 一个字不加（预测是直播提示，不是转录内容）⇒ 重载窗口/切会话后那行消失、历史会话回放也不长它。`sessionStore` 零改动（探针里有结构守卫钉着）。
+  - **与 C1 解耦**：整条链只吃 `session.event`，与审批开关、hook、`hello.dsh.command` 整段覆盖**全无关**（F5 第 5 条正面证明）。
+- **D3 · 协议**（[src/protocol.ts](../src/protocol.ts)）：`{ type:'forecast'; id; phase:'before'|'after'; label; title?; level?; diff?; diffTruncated?; note?; failed?; unknown? }`；[src/dshRuntime.ts](../src/dshRuntime.ts) 的 `DshEventData` 加 `meta?: unknown`（F3 的载体，唯一的字段新增）。
+- **D4 · webview**（[media/chat.js](../media/chat.js) / [media/chat.css](../media/chat.css)）：那行是 `card` 的**直接子节点、落在顶栏正下方、入参 JSON 之前**（锚点是入参节点，没有才退到 `outputEl` —— 入参那块可能上千字符，把读数排在它下面等于让人先滚过一坨参数）。⚠️ **绝不塞进 `.tool-head` 里**（顶栏是 flex 行，塞进去会被挤坏；C13 的 `#harness-shell` 是同一型教训）。事后帧**就地改**同一个节点（不重建 —— 重建会丢展开状态与位置），失败/中断/没带回 diff 三种收尾会**当场把展开区与按钮一并收掉**（否则上一次那份 diff 看起来像这一条的结果）。CSS 里 `.tf-toggle`/`.tf-diff` **不写 `display`**（那会盖掉 `[hidden]` 的 `display:none`），diff 行复用审阅面板那套 `.diff-line.add/.del/.ctx` token。
+- **已知局限**：
+  - **这是「即将/正在」，不是「可拦截」**（F1）：别把那行读成事前审批。
+  - **两个「改动」读数会不一样，且是有意的**：卡片上的 diff 是「相对现在盘上」，轮尾审阅（C4）是「相对轮前快照」。同一文件一轮内写两次 ⇒ 卡片是两次增量、审阅是一条累计。文案里写着「按现在盘上的内容算的」。
+  - `edit` 的行尾归一化会让**一类真失败漏报**：真的因为 CRLF 不匹配而失败的编辑，我们检查时会认为命中（容错方向是对的，但要知道它不完备）。
+  - `meta.diffs` 的 `path` 形态**未定**（注释说它盖的是 model-facing `file_path`）：可能是入参原文、也可能被后端相对化过 ⇒ 只显示、不断言（F5 第 6 条去定）。
+  - 二进制/超大的目标**不预览**（只报性质）；`edit` 的 diff **不含上下文行**。
+  - 不落盘的代价：重载窗口/切会话后那行消失（它是直播提示）；重放的历史会话也不长这行。
+- **本次不做**（写死，防后人重推）：**不预判 `bash` 的写**（重定向 / `rm` / `tee` 都是 shell 语法，猜错比不说更坏 —— 它们仍走 C1 的审批与 C4 的轮尾审阅，**别让用户以为「没出现在卡片上 = 这轮没动文件」**）；**不给按钮**（不「按这个路径改」、不「改用 D:\x」—— 那等于借 UI 把 C13 明确不做的路径归一化偷偷做掉）；不做跨调用的汇总条（用户选了卡片落点）；不做整文件 diff 的编辑模拟；不加设置项、不动 wire/runtime/上游、不改 C4 的快照与审阅语义、**不改 `_fsTargetAbs` 的行为**（只搬实现位置，判据一套）；不在 react-live 画面里渲染（真组件接管，硬塞会两套 UI 打架）。
+- **自检**：[scripts/probe-change-forecast.mjs](../scripts/probe-change-forecast.mjs)（新，**27/27**，八组）—— A 解析（JSON 字符串正面 + 畸形/非对象 `undefined` 且不抛）、B 工具门（**`todo_write` 反控**）、C 路径（相对/绝对/POSIX/UNC 原样放行/空/无 base）、D kind 与 diff（新建 / 相对现在盘上 / 三种「没法预览」各有话说 / 片段 diff / 超长截断）、E 命中检查（0-1-2-2 四条结论 + **CRLF 反控** + 同文本 + 文件不存在 + 入参不完整 + 读不出盘不给 finding）、F 文案（事前那行 + 两档 level）、G 实际那半（正常 hunk / 多 hunk 合并 / **`diffs: []` 不是 undefined** / 畸形 `undefined` 不抛 / path 优先 / 三句作废的话互不重复）、H 结构守卫（`_fsTargetAbs` 必须委派且体内无 POSIX 字面量、**全仓该字面量只准 `changeForecast.ts` 与 `shellDiag.ts` 两处**、三处 `_forecastAfter` 调用点、轮首清表、`ChatMessage`/`sessionStore` 里不许出现 forecast）。
+  - [scripts/probe-webview-render.mjs](../scripts/probe-webview-render.mjs) **65/65**（原 57 + 新增 8）：落位与「不在顶栏里」/ 点开才出 diff（逐行 kind 与行首 `+`/`-`）/ **`tool-result` 之后那行原地被换成事实**（比节点身份，防重建）/ 不带 diff 时按钮与展开区当场收掉（反控）/ 失败与中断两档 class 与文案、**id 对不上的迟到帧不许改别的卡** / id 找不到什么都不做 / 没发过预报的卡不长那行 / CSS 守卫（`flex-wrap`、两个 `[hidden]` 元素不许有 `display`、label 必须省略号）。C13 那条 `_fsTargetAbs` 守卫**同步改形**：现在断言它**委派**给 `resolveTargetPath`、且体内不再有那个字面量。
+  - **变异测试 6/6 全被抓红**：塞进顶栏里面、`FORECAST_TOOLS` 换成子串判据、删掉 POSIX 早退、拿掉行尾归一化、把 `diffs: []` 判成「读不懂」、拆掉一处 unknown 收尾 —— 每个变异**先自证插进去了**（字面量不匹配就直接报「这条测试无效」，绝不静默空转绿着骗人）。
+  - **搬 `_fsTargetAbs` 的回归**：`probe-approval-roundtrip` 18/18、`probe-approval-shell` 21/21、`probe-sandbox --fs-hook`（真机：`hook/invoked`+`hook/result` 各一条、fs 工具被拦下、`isError` 落到 tool/result）全部照常；另 `probe-run-inspector` 31/31、`probe-turn-state` 13/13、`probe-c8-runtime` 全过、`probe-context-window` 14/14、`probe-shell-diag` 62/62、`probe-compaction-notice` 20/20、`smoke-runtime` 通过。
+- **只能真机 F5 盖住（六条，⚠️ 待跑）**：
+  1. 发一句让 agent 写文件的话 ⇒ 卡片上那行在结果出来**之前**就在（`write` 与 `edit` 两种都要看）。
+  2. 近似 diff 与轮尾审阅的 diff 对得上/差异可解释（同一轮多次写就会不同，那是有意的）。
+  3. `tool/result` 一到就翻成「实际」并换成 `meta` 那份；**新建文件那条**说的是「新建/没报改动」而不是「没有」。
+  4. 制造一次失败/中断 ⇒ 卡上**不许**再挂着「预计」。
+  5. `hello.dsh.command` 整段覆盖（审批不接入）+ 审批关掉两种情况下，那行**照样出现**（与 C1 解耦的正控）。
+  6. 路径带 `/mnt/d/…` 时卡片怎么显示，**`meta.diffs` 报的 `path` 落在哪** —— 顺手用事实回答 C13 悬着的那条。
 
 ### C15 · 多会话并行 / 分支对照视图
 - **现状**：刚做的 fork 是「切过去 + 同记忆」，没有 A/B 对照。
@@ -855,4 +890,4 @@ if (!this._abort || !this._reviewChangesOn()) return;  // 对
 - **最小可用商业化 = C1 + C2 + C3**（敢用、装得上、花得起）。C3 的用量部分（C3a）已完成，剩 C3b 的费用/拦截。
 - C1/C4/C12 同源（审批策略），做 C1 时一并设计，别拆散。**C12 的落地形态（2026-09-18）**：审批那一半确实"零新机制"（profile 只是一层 `||`/并集，读口从"读设置"变成"读设置 → `compileProfile`"），但**工具白名单那一半不是同一回事** —— 它跟 C1 没有共用机制，靠的是自挂插件调 `tools.restrict`（见 C12 正文）。「同源」说的是**审批策略这一轴**，别据此以为整张 C12 都挂在 C1 上。
 - ~~C3 与 C10 共用「用量可得性」前置验证，建议合并做一次 spike。~~ 该前置已达（C3a 已把窗口与占用透出），C10 只剩压缩动作本身。
-- ~~C11、C14 受 DSH wire 能力限制，属"要等上游"~~ **C11 更正（2026-09-18）**：wire 下不去 ≠ 做不到 —— `cordis.yml` 里挂一个我们自己的插件就能在请求构建期覆盖（见 C11 正文的四条源码坐标）。**别再把「wire 没这个方法」直接读成「这件事做不了」**，先看看 `agent/*` 的瀑布与插件加载器。C14 仍是真受限（wire 里**没有**任何 file 事件可读）。
+- ~~C11、C14 受 DSH wire 能力限制，属"要等上游"~~ **C11 更正（2026-09-18）**：wire 下不去 ≠ 做不到 —— `cordis.yml` 里挂一个我们自己的插件就能在请求构建期覆盖（见 C11 正文的四条源码坐标）。**别再把「wire 没这个方法」直接读成「这件事做不了」**，先看看 `agent/*` 的瀑布与插件加载器。**C14 也一并更正（2026-09-21）**：这句话说 C14「仍是真受限」是错的 —— wire 里确实没有 file 事件，但 `tool/result.meta.diffs` 一直带着真 hunk（扩展此前没读），而「事前」那半靠 `tool/call` 的入参就够（帧先于 dispatch）。**两次更正说的是同一件事：先去看它到底给了什么，再判「拿不到」。**
