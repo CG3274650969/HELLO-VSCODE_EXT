@@ -709,6 +709,79 @@ body.vscode-high-contrast .brand-mark {
   word-break: break-all;
 }
 
+/* ---------- C14：工具卡上的「预计 / 实际改动」那行 ---------- */
+/*
+ * 位置由 JS 保证（card 的直接子节点、排在 .tool-head 之后、.tool-input 之前）。
+ * ⚠️ 本块与下面的 .tf-toggle/.tf-diff **都不写 display**（除了容器自己的 flex）：
+ * `[hidden]` 是 UA 的 `display:none`，作者样式里任何 display 都能把它压掉 ——
+ * 于是「没有 diff 时按钮该藏起来」会静默失效（C13 的 shell 状态段踩过同一个坑）。
+ */
+.tool-forecast {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 6px;
+  margin: 0 10px 6px;
+  padding-top: 5px;
+  border-top: 1px dashed var(--dsw-alias-border-l2, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.3)));
+  font-size: 11px;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #bdbdbd));
+}
+.tf-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tool-forecast.after .tf-label {
+  color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
+}
+/* 事前那行是**预测**：用点标记出来，别让人读成事实 */
+.tool-forecast:not(.after) .tf-label::before {
+  content: '≈ ';
+  opacity: 0.7;
+}
+.tool-forecast.warn .tf-label {
+  color: var(--dsw-alias-state-warning-primary, var(--vscode-editorWarning-foreground, #d29922));
+}
+.tool-forecast.failed .tf-label {
+  color: var(--dsw-alias-state-error-primary, var(--vscode-errorForeground, #f48771));
+}
+.tf-note {
+  flex: none;
+  opacity: 0.75;
+}
+.tf-toggle {
+  flex: none;
+  padding: 0 4px;
+  border: 1px solid var(--dsw-alias-border-l2, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.3)));
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+.tf-diff {
+  flex: 1 1 100%;
+  margin: 2px 0 0;
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: var(--dsw-alias-bg-layer-2, var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.12)));
+  font-family: var(--dsw-code-font-family, var(--vscode-editor-font-family, Consolas, monospace));
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 180px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.tf-diff .tf-cut {
+  font-style: italic;
+  opacity: 0.8;
+}
+
 /* 输出：pre 里的纯文本；error 卡让它偏红提示失败 */
 .tool-output {
   margin: 0;

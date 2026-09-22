@@ -229,6 +229,30 @@ export type ExtToWebview =
   | { type: 'tool-start'; message: ChatMessage }
   /** 工具卡出结果：id 更新 toolState，可选带输出文本。unknown = 结果没到（判据同 ChatMessage.toolState） */
   | { type: 'tool-result'; id: string; toolState: 'ok' | 'error' | 'unknown'; output?: string }
+  /**
+   * C14：工卡上那行「预计/实际改动」。`phase:'before'` = 按 `tool/call` 入参算的**预测**
+   * （帧先于 dispatch，但只领先毫秒 —— 这是提示，不是审批）；同一条调用跑完再发一条
+   * `phase:'after'`，**就地**换成 DSH 报的事实，或把预测明确撤掉（failed/unknown）。
+   * 全是可选字段：老 webview 见到不认的 type 直接忽略，不会炸。
+   */
+  | {
+      type: 'forecast';
+      id: string;
+      phase: 'before' | 'after';
+      /** 一行主文案（含路径与增删数，由 changeForecast 的纯函数拼好） */
+      label: string;
+      /** 悬停展开的细节（原始入参路径、为什么不预览、diff 是谁算的…） */
+      title?: string;
+      level?: 'ok' | 'warn';
+      diff?: DiffLine[];
+      diffTruncated?: boolean;
+      /** 没有 diff 时的那句人话（新建文件 / 二进制或超大不预览…） */
+      note?: string;
+      /** 事后：这条调用失败了 —— 预测作废，绝不能让它挂在卡上冒充结果 */
+      failed?: boolean;
+      /** 事后：本轮中断，这条调用改没改不可知 */
+      unknown?: boolean;
+    }
   /** harness（恒为 DSH 直播）连接状态广播：连接中/在线/错误 + 型号 + 忙否，webview 据此亮状态点 */
   | {
       type: 'backend-status';

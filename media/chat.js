@@ -2048,6 +2048,85 @@
     rec.outputEl.textContent = rec.outputText || '';
   }
 
+  /**
+   * C14：工具卡上那行「预计改动 / 实际改动」。**就地改同一个节点**，不重建卡片 ——
+   * 卡片是一次建好、之后只改内容的（`applyToolState` 也只动 stateEl / outputEl）。
+   *
+   * 位置必须是 `card` 的**直接子节点、排在 `.tool-head` 之后**（`.tool-input` 之前）：
+   * 顶栏是 flex、状态点与状态字都在里面，塞进去会把那行挤坏（C13 的 `#harness-shell`
+   * 犯过同型的错：挂在头部里而不是它的兄弟）。
+   *
+   * 入参与 label/note 一律 textContent（防 XSS）；diff 逐行建元素，零 innerHTML。
+   */
+  function renderToolForecast(rec, data) {
+    var box = rec.forecastEl;
+    if (!box) {
+      box = document.createElement('div');
+      box.className = 'tool-forecast';
+      var label = document.createElement('span');
+      label.className = 'tf-label';
+      var note = document.createElement('span');
+      note.className = 'tf-note';
+      var toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = 'tf-toggle';
+      toggle.textContent = 'Diff';
+      var diff = document.createElement('pre');
+      diff.className = 'tf-diff';
+      diff.hidden = true;
+      toggle.addEventListener('click', function () {
+        diff.hidden = !diff.hidden;
+        toggle.textContent = diff.hidden ? 'Diff' : '收起';
+      });
+      box.appendChild(label);
+      box.appendChild(note);
+      box.appendChild(toggle);
+      box.appendChild(diff);
+      // 落在顶栏正下方：入参那块 JSON 可能上千字符，把读数排在它下面等于让人先滚过一坨参数。
+      // 锚点是**入参节点**（有则插它前面），没有才退到 outputEl —— output 永远在末尾。
+      rec.card.insertBefore(box, rec.inputEl || rec.outputEl);
+      rec.forecastEl = box;
+      rec.forecastLabel = label;
+      rec.forecastNote = note;
+      rec.forecastToggle = toggle;
+      rec.forecastDiff = diff;
+    }
+    box.classList.toggle('warn', data.level === 'warn');
+    box.classList.toggle('failed', !!data.failed);
+    box.classList.toggle('unknown', !!data.unknown);
+    box.classList.toggle('after', data.phase === 'after');
+    rec.forecastLabel.textContent = data.label || '';
+    // 走属性而不是 setAttribute：DOM 影子把 setAttribute 只当作「存起来」（class/hidden 才镜像），
+    // `title` 这样写才既有真效果、也能被探针读到（C13 的 shell 段同款）
+    box.title = data.title || '';
+    rec.forecastNote.textContent = data.note || '';
+    rec.forecastNote.hidden = !data.note;
+
+    var lines = data.diff || [];
+    while (rec.forecastDiff.firstChild) rec.forecastDiff.removeChild(rec.forecastDiff.firstChild);
+    if (lines.length) {
+      for (var i = 0; i < lines.length; i++) {
+        var row = document.createElement('div');
+        var kind = lines[i].kind === 'add' ? 'add' : lines[i].kind === 'del' ? 'del' : 'ctx';
+        row.className = 'diff-line ' + kind;
+        row.textContent = (kind === 'add' ? '+' : kind === 'del' ? '-' : ' ') + (lines[i].text || '');
+        rec.forecastDiff.appendChild(row);
+      }
+      if (data.diffTruncated) {
+        var cut = document.createElement('div');
+        cut.className = 'diff-line ctx tf-cut';
+        cut.textContent = '…（diff 过长，已只保留前段）';
+        rec.forecastDiff.appendChild(cut);
+      }
+    } else {
+      // 新载荷没有 diff（如「新建文件」或失败收尾）⇒ 把展开状态一并复位：
+      // 否则按钮没了、上一次的 diff 还开着，看起来像这一条的结果
+      rec.forecastDiff.hidden = true;
+      rec.forecastToggle.textContent = 'Diff';
+    }
+    rec.forecastToggle.hidden = lines.length === 0;
+  }
+
   function addToolMessage(msg) {
     if (isReactLive()) return;
     var wrap = document.createElement('div');
@@ -2072,11 +2151,14 @@
     head.appendChild(stateEl);
     card.appendChild(head);
 
+    // ⚠️ 名字别叫 inputEl：模块顶上那个 inputEl 是 composer 输入框，同名会把后来读它的人骗惨
+    var inputNode = null;
     if (msg.toolInput) {
       var input = document.createElement('div');
       input.className = 'tool-input';
       input.textContent = msg.toolInput;
       card.appendChild(input);
+      inputNode = input;
     }
 
     var output = document.createElement('pre');
@@ -2093,6 +2175,8 @@
       card: card,
       stateEl: stateEl,
       outputEl: output,
+      // C14：那行「预计/实际改动」的插入锚点（没有入参时是 null）
+      inputEl: inputNode,
       outputText: msg.toolOutput || '',
       toolState: msg.toolState || 'running',
       status: 'done',
@@ -2841,6 +2925,15 @@
         }
         updateBusy();
         scrollToBottom();
+        break;
+      }
+
+      case 'forecast': {
+        // C14：write/edit 卡的「预计 → 实际」。查不到 id（回放历史会话、切了会话、react-live
+        // 下没建过 DOM 卡）→ **直接 break**，这不是错误。
+        if (isReactLive()) break;
+        var fcRec = byId.get(data.id);
+        if (fcRec && fcRec.role === 'tool') renderToolForecast(fcRec, data);
         break;
       }
 

@@ -1030,6 +1030,177 @@ check('C13 结构守卫：CSS —— 读数不被挤掉、颜色走 token、hidd
   ok(!/display:/.test(note), '.approval-note 里写了 display —— [hidden] 会失效，没说明时也占一块位置');
 });
 
+// ---------- C14 · 工具卡上的「预计 / 实际改动」 ----------
+//
+// 真机看到的是「卡片头部下面多一行」。这里验的是那行的**结构与就地改**：
+// 位置（顶栏的兄弟、不是塞进顶栏）、`tool-result` 之后不被抹掉、
+// 事后帧换字不换节点、以及**没有 diff 时按钮与展开区都不许赖着**。
+
+/** 造一张工具卡：先换会话清空消息面，再送 tool-start（同一 id 才能收到 forecast 帧） */
+function mkToolCard(id, name, input) {
+  send({ type: 'snapshot', sessionId: `s-c14-${id}`, messages: [] });
+  send({ type: 'mode-set', mode: 'harness' });
+  send({ type: 'tool-start', message: { id, role: 'tool', toolName: name, toolInput: input, toolState: 'running' } });
+  const wraps = msgNodes().filter((n) => childWithClass(n, 'tool-card').length);
+  return childWithClass(wraps[wraps.length - 1], 'tool-card')[0];
+}
+const forecastOf = (card) => childWithClass(card, 'tool-forecast')[0];
+
+const C14_BEFORE = {
+  type: 'forecast',
+  id: 'f1',
+  phase: 'before',
+  label: '≈ 预计改动 D:\\proj\\src\\a.ts（修改 · +2 −1）',
+  title: '这次调用看下来没有明显问题（不代表一定成功）\n按现在盘上的内容算的',
+  level: 'ok',
+  diff: [
+    { kind: 'ctx', text: 'const a = 1;' },
+    { kind: 'del', text: 'const b = 2;' },
+    { kind: 'add', text: 'const b = 3;' },
+  ],
+  note: '按现在盘上的内容算的',
+};
+
+check('C14 卡片那行：落在顶栏**之后、入参之前**，且不在顶栏里面', () => {
+  const card = mkToolCard('f1', 'write', '{"file_path":"D:\\\\proj\\\\src\\\\a.ts"}');
+  eq(card.children[0].className, 'tool-head', '第一块不是顶栏 —— 卡片结构变了');
+  eq(card.children[1].className, 'tool-input', '前置条件：入参块该在第二位');
+  send(C14_BEFORE);
+  const box = forecastOf(card);
+  ok(box, '送了 forecast 帧却没长出那行');
+  // 比节点用 `ok(a === b)`：`eq` 会 JSON.stringify，而影子节点带 `_parent` 环（拿 eq 比会
+  // 抛 "Converting circular structure to JSON"，报的还不是断言本身）
+  ok(card.children[1] === box, '那行没落在顶栏正下方（插到入参/输出后面去了）—— 用户要先滚过一坨 JSON 才看得到');
+  eq(card.children[2].className, 'tool-input', '那行把入参块挤到了别处 —— 卡片里各块的次序变了');
+  eq(card.children[3].className, 'tool-output', '输出块不在末尾 —— 那行插错了位置');
+  const head = card.children[0];
+  ok(!childWithClass(head, 'tool-forecast').length, '那行被塞进了顶栏里面 —— 顶栏是 flex 行，塞进去会被挤坏');
+  eq(box.classList.contains('after'), false, '事前那一帧就被当成「实际」了');
+  ok(box.title.includes('不代表一定成功'), 'title 没落上去（预测的口径全靠它说清）');
+  eq(box.children[1]._text, '按现在盘上的内容算的', 'note 没落上去');
+  eq(box.children[2].hidden, false, '有 diff 却把展开按钮藏了');
+  eq(box.children[3].hidden, true, 'diff 默认就该是收起的');
+});
+
+check('C14 卡片那行：点开才出 diff，逐行 kind 成 class、行首带 +/-/空格', () => {
+  const card = mkToolCard('f2', 'write', '{"file_path":"a.ts"}');
+  send(Object.assign({}, C14_BEFORE, { id: 'f2' }));
+  const box = forecastOf(card);
+  const diff = box.children[3];
+  box.children[2].click();
+  eq(diff.hidden, false, '点了展开还是藏着');
+  eq(diff.children.length, 3, `diff 行数不对：${diff.children.length}`);
+  eq(diff.children[0].className, 'diff-line ctx', '上下文行的 class 不对（复用审阅面板那套 token）');
+  eq(diff.children[1].className, 'diff-line del', '删除行的 class 不对');
+  eq(diff.children[1]._text, '-const b = 2;', '行首没带 - 号');
+  eq(diff.children[2]._text, '+const b = 3;', '行首没带 + 号');
+  box.children[2].click();
+  eq(diff.hidden, true, '再点一下没收起来');
+});
+
+check('C14 卡片那行：`tool-result` 一到，那行**原地**被换成事实（不是重建卡片）', () => {
+  const card = mkToolCard('f3', 'write', '{"file_path":"a.ts"}');
+  send(Object.assign({}, C14_BEFORE, { id: 'f3' }));
+  const before = forecastOf(card);
+  before.children[2].click();
+  // 工具跑完：扩展先发 tool-result（卡片换状态），再发 phase:'after'
+  send({ type: 'tool-result', id: 'f3', toolState: 'ok', output: 'ok' });
+  ok(forecastOf(card) === before, 'tool-result 之后那行没了 —— 它被 applyToolState 或重建抹掉了');
+  send({
+    type: 'forecast',
+    id: 'f3',
+    phase: 'after',
+    label: '实际改动 D:\\proj\\src\\a.ts（+1 −1）',
+    level: 'ok',
+    diff: [
+      { kind: 'del', text: 'const b = 2;' },
+      { kind: 'add', text: 'const b = 3;' },
+    ],
+  });
+  const after = forecastOf(card);
+  ok(after === before, '事后帧换了新节点 —— 那就不叫「就地改」，展开状态与位置都会丢');
+  eq(after.classList.contains('after'), true, '没挂上 .after —— 事前/事后在配色上分不出来');
+  ok(after.children[0]._text.startsWith('实际改动'), '主文案没换成「实际」：' + after.children[0]._text);
+  eq(after.children[3].children.length, 2, 'diff 没被换成 DSH 报的那份');
+  eq(after.children[3].hidden, false, '换 diff 时把用户展开的状态也一起重置了');
+});
+
+check('C14 卡片那行：事后**不带 diff**（新建/失败/中断）⇒ 按钮与展开区当场收掉（反控）', () => {
+  const card = mkToolCard('f4', 'write', '{"file_path":"new.ts"}');
+  send(Object.assign({}, C14_BEFORE, { id: 'f4' }));
+  const box = forecastOf(card);
+  box.children[2].click();
+  eq(box.children[3].hidden, false, '前置条件：展开着');
+  send({
+    type: 'forecast',
+    id: 'f4',
+    phase: 'after',
+    label: '实际改动 D:\\proj\\new.ts（DSH 没报改动）',
+    note: 'DSH 报的 diffs 是空的：新建文件，或内容与改动前完全一样',
+  });
+  eq(box.children[2].hidden, true, '没有 diff 却还留着展开按钮 —— 点开是上一次的残留');
+  eq(box.children[2]._text, 'Diff', '按钮文案没复位');
+  eq(box.children[3].hidden, true, '没有 diff 却还开着 —— 上一次那份 diff 看起来像这一条的结果');
+  eq(box.children[3].children.length, 0, '旧 diff 行没清掉');
+  eq(box.children[1].hidden, false, 'note 该显示（「新建」这种结论只能靠它说）');
+});
+
+check('C14 卡片那行：失败/中断两档各自挂 class，文案是「预测作废」那一句', () => {
+  const card = mkToolCard('f5', 'edit', '{"file_path":"a.ts"}');
+  send(Object.assign({}, C14_BEFORE, { id: 'f5' }));
+  const box = forecastOf(card);
+  // 文案用扩展真发的那一句（`changeForecast.FORECAST_FAILED_LINE` 的原样抄件）——
+  // 这里写个自造句子就等于只测「textContent 会被赋值」，测不出那句话有没有说清楚
+  send({
+    type: 'forecast',
+    id: 'f5',
+    phase: 'after',
+    label: '这次调用失败了 —— 上面那行只是预测，不是结果',
+    level: 'warn',
+    failed: true,
+  });
+  eq(box.classList.contains('failed'), true, 'failed 没挂 class');
+  ok(box.children[0]._text.includes('只是预测'), '失败收尾的文案没说清「那只是预测」：' + box.children[0]._text);
+  send({ type: 'forecast', id: 'f6', phase: 'after', label: '不该出现', level: 'warn', unknown: true });
+  eq(forecastOf(card).children[0]._text.includes('不该出现'), false, 'id 对不上的帧改到了别的卡上（按 id 查之前必须先查存在）');
+});
+
+check('C14 卡片那行：id 找不到时**什么都不做**（回放/切会话/react-live 都会走到这儿）', () => {
+  send({ type: 'snapshot', sessionId: 's-c14-none', messages: mkMessages(3) });
+  const n = msgNodes().length;
+  send({ type: 'forecast', id: '不存在的卡', phase: 'before', label: 'x' });
+  eq(msgNodes().length, n, '找不到 id 却凭空建了东西');
+  eq(msgNodes().filter((m) => childWithClass(m, 'tool-forecast').length).length, 0, '普通气泡上长出了那行');
+});
+
+check('C14 反控：没发过 forecast 的工具卡**不长**那一行', () => {
+  const card = mkToolCard('f7', 'read', '{"file_path":"a.ts"}');
+  send({ type: 'tool-result', id: 'f7', toolState: 'ok', output: 'ok' });
+  eq(forecastOf(card), undefined, '没送过 forecast 的卡上也多出一行 —— 那它就成每条工具卡的常驻噪声了');
+});
+
+check('C14 结构守卫：CSS 不写 display（否则 [hidden] 失效）、长路径不许撑破卡片', () => {
+  const css = readFileSync(join(repoRoot, 'media', 'chat.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  const block = (sel) => {
+    for (const m of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      if (m[1].split(',').some((s) => s.trim() === sel)) return m[2];
+    }
+    return undefined;
+  };
+  const box = block('.tool-forecast');
+  ok(box, 'chat.css 里找不到 .tool-forecast');
+  ok(/flex-wrap:\s*wrap/.test(box), '.tool-forecast 没开 flex-wrap —— 展开的 diff 会挤在同一行里');
+  // ⚠️ 容器自己是允许写 display 的（它身上没有 [hidden] 语义）；被 hidden 切的是下面两个
+  for (const sel of ['.tf-toggle', '.tf-diff']) {
+    const b = block(sel);
+    ok(b, `chat.css 里找不到 ${sel}`);
+    ok(!/display:/.test(b), `${sel} 里写了 display —— 那会盖掉 [hidden] 的 display:none`);
+  }
+  const label = block('.tf-label');
+  ok(label && /text-overflow:\s*ellipsis/.test(label), '.tf-label 没有省略号 —— 一条长路径会把状态字挤出卡片');
+  ok(/white-space:\s*nowrap/.test(label), '.tf-label 会折行 —— 那行本来就只有一行的高度');
+});
+
 check('C13 结构守卫：路径两读法**只在显示链路上**（判定链路一行没动）', () => {
   const src = readFileSync(join(repoRoot, 'src', 'chatViewProvider.ts'), 'utf8');
   const lines = src.split('\n');
@@ -1052,11 +1223,16 @@ check('C13 结构守卫：路径两读法**只在显示链路上**（判定链�
   const callIdx = idxOfLine(lineOf('this._approvalPathNote('));
   ok(callIdx > askDef && callIdx < askEnd, '_approvalPathNote 被 _onApprovalAsk 之外的代码调用了 —— 那它就不只是显示');
 
-  // fail-safe 那一行必须原样在：POSIX 形态仍然「问、但不抓轮前快照」。
-  // 它也是上面那段说明的准入集合（说明里「不会抓快照」那句和这句必须说的是同一件事）。
+  // fail-safe 那一行必须原样在 —— 但 C14 起它搬进了 `changeForecast.resolveTargetPath`
+  // （卡片上那行「预计改动」与批准条必须是同一个函数算的路径）。所以判据改形为：
+  // `_fsTargetAbs` **委派**、体内不再有那个字面量；字面量本身的唯一性由
+  // `probe-change-forecast` 的 G 组全仓扫（那边还钉住「shellDiag 那份是翻译、不是拒绝」）。
+  const fsDef = idxOfLine(lineOf('private _fsTargetAbs('));
+  const fsBody = src.slice(fsDef, src.indexOf('\n  private ', fsDef + 1));
+  ok(/resolveTargetPath\(/.test(fsBody), '_fsTargetAbs 没有委派给 changeForecast.resolveTargetPath —— 卡片与批准条的路径会各算各的');
   ok(
-    /if \(raw\.startsWith\('\/'\) && !raw\.startsWith\('\/\/'\)\) return undefined;/.test(src),
-    '_fsTargetAbs 的 POSIX 早退被改了 —— 那行是「问但不抓快照」的全部依据'
+    !/startsWith\('\/'\)/.test(fsBody),
+    '_fsTargetAbs 体内又自己写了一份 POSIX 判据 —— 判据只准有一处（改这个函数就等于改审批行为）'
   );
 });
 

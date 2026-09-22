@@ -18,7 +18,7 @@
 
 | 路线图问题 | 结论 | 依据 |
 |---|---|---|
-| 有没有 file/编辑器事件可等？ | **没有**。核心事件表（`core/session/known-event-types.ts`）无 file/editor 类；实测对拍无新增。 | 静态 + 动态 |
+| 有没有 file/编辑器事件可等？ | **没有**。核心事件表（`core/session/known-event-types.ts`）无 file/editor 类；实测对拍无新增。⚠️ **但「没有 file 事件」≠「拿不到文件改动」**（见下条补记）。 | 静态 + 动态 |
 | 有没有 approval/permission 事件可转发？ | **当前配置下没有**。`rm -f` + 写出工作目录均直接执行、零事件。 | 动态（真跑） |
 | `reasoningEffort` / plan 能按会话下发？ | **不能**。initialize 多余参数被静默忽略（resp ok 但不生效）。 | 动态（C 发）+ 静态 |
 | 工具失败时 wire 怎么表现？ | 只以 `tool/result` 文本回传 stderr，不产生独立事件。 | 动态 |
@@ -50,10 +50,35 @@ client session 有 `PendingWait('approval')`）。但当前部署配置下工具
 > 请求的 config** ⇒ 在派生 `cordis.yml` 里挂一个我们自己的插件就能按会话覆盖，**热生效、不重启**。
 > 详见 [backlog.md](backlog.md) 的 C11（含四条源码坐标与两条实测证据）。**wire 依然是死的，这条路不是。**
 
+## C14 补记：`tool/*` 帧上的三条（2026-09-21 实测/核源码，都已入库当判据）
+
+C14 之前，上面那张表里「没有 file 事件」被读成了「因此拿不到文件改动」。**这个推论是错的**，
+缺的只是一双读它的眼睛。三条事实（出处都在 DSH 源码里，不是推断）：
+
+1. **`tool/result` 帧带 `meta`，write/edit 的真 hunk 就在里面。** `dsh-tools` 在**顶层 exec** 上把
+   `output.presentationMeta(args, value)` 挂进 `result.meta`（`lib/index.js:3417-3424`），
+   `dsh-agent-loop` 的 `appendToolResult` 用 `...result.meta !== void 0 ? { meta: result.meta } : {}`
+   原样透出（`lib/index.js:302-314`）。形状：`{ diffs: [{ path, oldText, newText }] }`。
+   ⚠️ 它是**可选的** —— 失败路径、嵌套（Code Mode）调用、没挂 `presentationMeta` 的工具都不带，
+   所以消费者必须把「没有 meta」与「meta 里没有改动」分开说。
+   ⚠️ `computeHunkDiffs` 是**每个 hunk 一条**（`dsh-tool-fs/lib/index.js:487-512`，context 3），
+   纯插入的 `oldText` 是 `null`；**前后文本完全相同时它返回空数组**。
+   **扩展此前从未读过这个字段**（`tool/result` 分支只取 `message.content[].text`）。
+2. **`tool/call` 帧先于执行。** `dsh-agent-loop` 里 `appendToolCall`（`:191`）在前、
+   `scheduler.dispatch`（`:197`）在后 ⇒ 帧是真·事前信号。⚠️ 领先只有**毫秒级**，
+   **不是可拦截的窗口**（能拦的是 C1 的 PreToolUse hook）。
+3. **`data.arguments` 是 JSON 字符串**（抓帧实测 `"{\"command\": \"echo …\"}"`），类型是 `unknown`
+   ⇒ 消费者必须 `JSON.parse` 并对畸形/非对象**不抛**地退化。
+
+> ⚠️ 第 1 条是「**先去看它到底给了什么，再判「拿不到」**」的第三次应验（前两次见上面第 4 条与
+> C11/C12 的补记）。判据照旧升级：**wire 缺不缺 → 配置面缺不缺 → 事件载荷里是不是本来就有。**
+
 ## 对扩展功能设计的含义
 
 - **2.1 diff 审阅 + Keep/Revert**：扩展侧做（live 轮开始 git 快照 → 收尾 diff）。
-  没有「官方 file 事件」可等。
+  没有「官方 file 事件」可等。**C14 起还多一层**：每条 `write`/`edit` 的卡片上会给一行
+  「预计改动 → 实际改动」—— 事前按 `tool/call` 的入参预判，事后换成上面第 1 条那份 `meta.diffs`
+  （见 [backlog.md](backlog.md) 的 C14）。
 - **审批（2.x）**：扩展侧自造（破坏性工具命令预审 / 确认条）。运行时当前不给任何
   wire 级审批入口；除非先在 DSH 配置层启用审批策略再另行评估。
 - **3.1 Shield 的 reasoningEffort 菜单**：~~不是高优先 —— 这条 wire 下发不了，
