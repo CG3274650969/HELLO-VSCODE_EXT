@@ -24,8 +24,8 @@
 | C11 | 会话级推理档位（reasoningEffort） | P1 | **原判「受限：需 runtime 先支持」已推翻** —— 机制早就在（provider 按请求解析档位、`agent/request` 瀑布的返回值就是请求 config），缺的只是入口。**已实现：自检 25/25 全绿；F5 五项全过**（④ 当场揪出一个真 bug：换会话不重播配置条，已修 `a7e5bab` + 加了结构守卫，复验通过；③ 有盘上留痕 —— 两会话各拿各的档位，且拿到「`reason=change` ⇒ 不重启就改档」的直接证据）（热切 + 真会话级；DSH 侧一行不改、用户配置一行不碰，纯追加一个我们自己的插件块） | [x] |
 | C12 | 项目级 agent profile（工具白名单/默认模型/审批策略） | P1 | **原文「扩展负责写回 runtime 配置」只对了三分之一** —— 模型是 `initialize` 参数（必重连）、审批是扩展内部三个读口（零新机制）、**工具白名单运行时压根没有配置键**（要靠自挂插件调 `tools.restrict`，见正文源码坐标）。**已实现：自检 32/32 + webview 段 8 条全绿**（含端到端反控：盘上 `request/header.header.tools` 里 bash 真的没了）；profile 文件落在工作区 `.hello-chat/profile.json`，**不写用户任何文件**，「只能加严」由 `compileProfile` 一个纯函数守死；**F5 五条 2026-09-19 真机全过**（模型跟着 profile 走、`header.tools` 里 bash/write/edit 真的没了而 read 还在、忙碌时切被拒且盘上不动、「写成想关审批」弹条照旧出现） | [x] |
 | C13 | Windows / 跨环境 shell 与路径收口 | P1 | **原文「必要时自带 bash 或推荐配置」没走到那一步，也不用走** —— 上游到今天确实没有换 shell 的配置键，但**PATH 是活的**（`spawn` 按传入 env 的 PATH 搜索，`dsh-subprocess` 只擦敏感键、`ENV_OVERRIDES` 不含 PATH）⇒ 扩展侧前置一个目录就能换掉 agent 的 bash，**DSH 一行不改**。**已实现：诊断 + 可选钉住 bash（`hello.dsh.bashPath`，`scope: machine`）+ 顶栏一段读数 + 坏时一次性可读告警 + 批准条的 `/mnt/…` 两读法说明**（只显示，**不做路径归一化**）；自检 **62/62 + webview 段 10 条（全套 57/57）+ C1 自检 21/21**，7 条结构守卫做过变异测试**全被抓红**；**F5 六条全过（2026-09-19 用户真机）** —— 真弹窗文案与三个按钮、窄面板下顶栏不被挤、`钉住这个 bash` 写进用户设置后真换成、`/mnt/…` 两读法在真 WSL 一轮里的排版、第三条监听器的重连、与「审批未生效」弹窗互不干扰 | [x] |
-| C14 | 事前 diff 预览（近似实现） | P2 | **原文「wire 无 file 事件 → 拿不到将改动的文件清单」只对了一半** —— 真 hunk 一直在线上（`tool/result.meta.diffs`），是扩展此前一个字没读；缺的只有「事前」那半，靠 `tool/call` 的入参预判（帧先于 dispatch）。**已实现：卡片上一行「预计 → 实际」**（事前按入参算近似 diff + 命中检查，事后换成 DSH 报的 `meta.diffs`，失败/中断当场作废）；自检 27/27 + webview 段 65/65，6 条结构守卫变异测试全被抓红；**F5 六条待跑** | [~] |
-| C15 | 多会话并行 / 分支对照视图 | P2 | 无 | [ ] |
+| C14 | 事前 diff 预览（近似实现） | P2 | **原文「wire 无 file 事件 → 拿不到将改动的文件清单」只对了一半** —— 真 hunk 一直在线上（`tool/result.meta.diffs`），是扩展此前一个字没读；缺的只有「事前」那半，靠 `tool/call` 的入参预判（帧先于 dispatch）。**已实现：卡片上一行「预计 → 实际」**（事前按入参算近似 diff + 命中检查，事后换成 DSH 报的 `meta.diffs`，失败/中断当场作废）；自检 27/27 + webview 段 65/65，6 条结构守卫变异测试全被抓红；**F5 未跑**（2026-09-21 用户跳过那条 react-live 回落验证，直接转 C15）—— 六条用例仍在正文里挂着 | [~] |
+| C15 | 多会话并行 / 分支对照视图 | P2 | 无。**已实现：一个只读的全屏浮层把两条会话的转写在分叉点之后并排摆出来，并按数据标注它们是否共享 DSH 记忆**（串话判据**双证据：先看本次运行的映射、再看盘** —— 只看盘会漏报「补丁不可用 / `hello.dsh.command` 覆盖」那两条绝不写盘的路）；自检 **28/28（新）+ webview 段 78/78**，8 条变异测试**全被抓红**（累计 21/21）；**F5 十条待跑** | [~] |
 | C16 | 审批白名单记忆（信任一次/永久） | P2 | 依赖 C1 | [ ] |
 | C17 | 多模态 / 图片附件 | P2 | 取决于模型能力 | [ ] |
 | C18 | 企业集成：代理 / 远程开发 / 审计日志 | P2 | 无 | [ ] |
@@ -859,7 +859,7 @@ if (!this._abort || !this._reviewChangesOn()) return;  // 对
   - [scripts/probe-webview-render.mjs](../scripts/probe-webview-render.mjs) **65/65**（原 57 + 新增 8）：落位与「不在顶栏里」/ 点开才出 diff（逐行 kind 与行首 `+`/`-`）/ **`tool-result` 之后那行原地被换成事实**（比节点身份，防重建）/ 不带 diff 时按钮与展开区当场收掉（反控）/ 失败与中断两档 class 与文案、**id 对不上的迟到帧不许改别的卡** / id 找不到什么都不做 / 没发过预报的卡不长那行 / CSS 守卫（`flex-wrap`、两个 `[hidden]` 元素不许有 `display`、label 必须省略号）。C13 那条 `_fsTargetAbs` 守卫**同步改形**：现在断言它**委派**给 `resolveTargetPath`、且体内不再有那个字面量。
   - **变异测试：C14 这 6 条全被抓红**（塞进顶栏里面、`FORECAST_TOOLS` 换成子串判据、删掉 POSIX 早退、拿掉行尾归一化、把 `diffs: []` 判成「读不懂」、拆掉一处 unknown 收尾），加上 C13 那 7 条 = **`probe-webview-render` 累计 13/13**（README 那行说的就是这个累计数）—— 每个变异**先自证插进去了**（字面量不匹配就直接报「这条测试无效」，绝不静默空转绿着骗人；本次第 6 条又踩了一次 CRLF 的坑，正因为有这道自检才没变成假绿）。
   - **搬 `_fsTargetAbs` 的回归**：`probe-approval-roundtrip` 18/18、`probe-approval-shell` 21/21、`probe-sandbox --fs-hook`（真机：`hook/invoked`+`hook/result` 各一条、fs 工具被拦下、`isError` 落到 tool/result）全部照常；另 `probe-run-inspector` 31/31、`probe-turn-state` 13/13、`probe-c8-runtime` 全过、`probe-context-window` 14/14、`probe-shell-diag` 62/62、`probe-compaction-notice` 20/20、`smoke-runtime` 通过。
-- **只能真机 F5 盖住（六条，⚠️ 待跑）**：
+- **只能真机 F5 盖住（六条，⚠️ 2026-09-21 用户跳过未跑）**：
   1. 发一句让 agent 写文件的话 ⇒ 卡片上那行在结果出来**之前**就在（`write` 与 `edit` 两种都要看）。
   2. 近似 diff 与轮尾审阅的 diff 对得上/差异可解释（同一轮多次写就会不同，那是有意的）。
   3. `tool/result` 一到就翻成「实际」并换成 `meta` 那份；**新建文件那条**说的是「新建/没报改动」而不是「没有」。
@@ -867,9 +867,55 @@ if (!this._abort || !this._reviewChangesOn()) return;  // 对
   5. `hello.dsh.command` 整段覆盖（审批不接入）+ 审批关掉两种情况下，那行**照样出现**（与 C1 解耦的正控）。
   6. 路径带 `/mnt/d/…` 时卡片怎么显示，**`meta.diffs` 报的 `path` 落在哪** —— 顺手用事实回答 C13 悬着的那条。
 
-### C15 · 多会话并行 / 分支对照视图
-- **现状**：刚做的 fork 是「切过去 + 同记忆」，没有 A/B 对照。
-- **补法**：并排渲染两条分支转写；明确标注共享记忆的串话风险（现 fork 与源会话共用同一 DSH 会话，回源继续发消息会被彼此看到）。
+### C15 · 多会话并行 / 分支对照视图（2026-09-22 实现，F5 十条待跑）
+- **原文**：**现状**「刚做的 fork 是『切过去 + 同记忆』，没有 A/B 对照」；**补法**「并排渲染两条分支转写；明确标注共享记忆的串话风险（现 fork 与源会话共用同一 DSH 会话，回源继续发消息会被彼此看到）」。
+- **问题**：C5/C6 的「在新对话中分支」今天只是**切过去 + 同记忆** —— 分完支，源会话就看不到了，用户回答不了「这两条支各自长成什么样了」。而「它们共享同一份 DSH 记忆」这件事**在界面上一个字都没有**：回源会话继续发消息，模型两边都看得见，用户不知道。
+- **三个已拍板的决定（不再讨论）**：① 落点 = **全屏浮层**（同 `#runs-panel` / `#review-panel` 的体例），不做常驻第二栏；② 范围 = **只读对照**（面板里不发消息、不并行跑）；③ 串话 = **只标注**（不给「断开共享」之类的动作，只把风险说出来）。
+- **实测（逐条核过源码，**每一条都决定了设计**）**：
+  - **F1 `_forkSession` 是深拷贝**（`JSON.parse(JSON.stringify(src.messages))`，[chatViewProvider.ts](../src/chatViewProvider.ts)）⇒ 副本与源**逐字相同**，有稳定的共同前缀。
+  - **F2 消息 id 里嵌着产生它的会话 uuid**（`_nextMsgId()` 返回 `` `${this._active.id}#${++this._msgSeq}` ``）⇒ 副本里的 id 仍带**源会话的** uuid，fork 之后的新消息才带 fork 的。于是**共同前缀 = 分叉点**，且**跨代也成立**（F2 从 F 分出来，与源比仍是源那一段）；两条无关会话的前缀恒为 0。
+  - **F3 `_openSession` 打开历史会话时会归一化残留态**（`status:'streaming'` → `interrupted`、`toolState:'running'` → `unknown`，**两个 `if` 不是 else 关系**）⇒ 对照栏**必须走同一条规则**，否则「面板里看到的一条」与「打开那条会话看到的」不一样。而**源会话拷完之后还会被原地归一化、fork 那份不会** ⇒ 会出现「同 id 不同 status」，这也是面板上 `drifted` 那个提示的由来。
+  - **F4 只看盘会漏报真串话**：补丁不可用时 `_ensureDshSession` 的 `existing` 分支**提前 return、从不查盘**，且三条路里只有一条写盘 ⇒ 那种模式下 fork 与源两侧盘上都没有 `dsh`，但 `_dshSessions` 里确实共用同一个 id。所以串话判据**双证据：先看本次运行里的映射、再看盘**（这一条是对「只从盘上算」的**有意加强**）。
+  - **F5 同 id 不同 cwd 不该警示**：DSH 会话日志按 cwd 归属（resume 的条件就是 `stored?.cwd === cwd`）⇒ 判 `unknown`/`cwd-differs`，不是 shared。
+  - **F6 react-live 会把消息面整个藏掉**（`body.react-live #messages { display:none !important }`），但**浮层是 body 直系子元素、照常可见** ⇒ 这是选「全屏浮层」形态的**唯一理由**（C14 刚在这上面栽过）。
+  - **F7 三个 `add*Message` 入口各自第一行都是 `if (isReactLive()) return;`** ⇒ 直接复用它们，面板在 react-live 下**画不出任何东西**。
+  - **F8 渲染走模块单例**（`messagesEl` + `byId`）⇒ 对照栏必须用自己的容器与**一次性记录表**：把「属于别会话的 id」写进 `byId`，等于给迟到帧开一扇门。
+- **D1 · 新纯模块** [src/branchCompare.ts](../src/branchCompare.ts)（**不 import vscode** —— C10b 的教训）：`divergenceOf` / `divergenceLine` / `divergenceTitle` / `sharedPrefixNote` / `crossTalkOf` / `crossTalkLine` / `crossTalkTitle` / `frozenTail` / `pickCounterpart` / `FORK_SUFFIX`。
+  - `divergenceOf` 按 **id 逐条比**（零正文参与），给 `{kind, shared, aAfter, bAfter, drifted}`。`shared === 0` 时**绝不说「分叉点在第 1 条」**，说的是「两侧没有共享消息 —— 不是同一次分支的结果（或源会话的那一段已被清掉）」。`drifted` 是「同 id 但内容不同」的条数，**是提示不是逐字 diff**（比的是 `role/status/toolName/toolInput/toolOutput`）。
+  - `crossTalkOf(a, b, live?)` 的证据优先级**写死一处**（F4）：live 两侧都有 → 用它；否则看盘（同 id 同 cwd → shared；**同 id 不同 cwd → unknown**；其余 → unknown）。**判据全是数据、文案是常量映射**：三句 `unknown` 两两不同，`warn` 只挂在 `shared` 一档。
+  - `frozenTail(s, from)` 深拷贝尾段 + 归一化，**绝不改原对象**（探针里有正面证明：改前 `JSON.stringify` 存一份比）。
+- **D2 · 唯一一处对既有代码的搬动**：F3 那段归一化搬进 [src/sessionStore.ts](../src/sessionStore.ts) 的 `freezeTranscript`（那里才能被探针加载，理由同 `capToolInput`），`_openSession` 改成一行委派。**两个 `if` 保持不是 else 关系**，别顺手「修」。⚠️ 有回归面（打开历史会话那条路），所以搬完**立刻**重跑了四条探针。
+- **D3 · 接线**（[src/chatViewProvider.ts](../src/chatViewProvider.ts)）：`_openCompare` / `_pickCompareSide` / `_resolveCompareSide` / `_comparePane` / `_postCompare` + `case 'compare-open'` / `case 'compare-pick'`。
+  - `_compareSides` **纯内存、不落盘、不新增任何持久化状态**：`StoredSession` 一个字不加，**不给 fork 加 `forkedFrom`** —— 识别只靠消息 id 与标题后缀这两条既有痕迹（`[FORK_SUFFIX]`，`_forkSession` 用它命名分支）。
+  - `_resolveCompareSide` 用 `_store.get` 就够：活动会话与数组里那个对象**是同一引用** ⇒ 直播中它也是最新的。解不出来的（软删 / 空）**就地清掉记录**，绝不留一条指向空气的 id。
+  - **只在打开/换侧/刷新时发快照**（不做每帧推送）⇒ 不需要「面板开着吗」这个闸，也绕开了「两轮之间 `_dshSessions` 变化」的坑；`dispose()` 里什么都不做。
+- **D4 · 协议**（[src/protocol.ts](../src/protocol.ts)）：webview→ext 两条（`compare-open` 幂等 / `compare-pick`）；**故意不加 `compare-close`** —— 扩展对面板开合**无状态**，关了不必通知（与 `run-panel` 的差别就在这儿：那条是为体积闸存在的）。ext→webview 是 `compare-set`，**全字段可选**（旧 webview 忽略不认的 type，同 `forecast` 约定）+ `interface ComparePane`。
+- **D5 · webview**（[media/chat.js](../media/chat.js) / [media/chat.css](../media/chat.css) / [media/chat.html](../media/chat.html)）：
+  - **渲染器落点化**（本项唯一一处有回归风险的重构）：单例换成落点对象 `LIVE_SINK = {container, registry, reactLive}`，拆出 `renderToolInto` / `renderNoteInto` / `renderMessageInto` / `renderTranscriptInto`。**「把一份转写渲染进一个落点」只此一处实现**，直播面与对照栏共用。⚠️ `renderMessageInto` 第一行也是门规 —— 直播面整条重渲染走 `renderTranscriptInto`，**不再经过 `add*` 包装器**，所以全仓一共 4 行门规，这是**有意保留的重复**（漏传 sink 会当场 TypeError，漏掉门规会静默画到直播面上）。折 `buildFoldRow(n, onExpand)` 的点击动作**由调用方给**：折叠态是**每个落点自己的**（直播面 `foldExpanded` / 对照栏 `compareTailExpanded.a|b`）。
+  - 对照栏用**一次性记录表**（`compareSink()` 每次 `new Map()`，绝不写进 `byId`）与 `reactLive:false`（这正是「在 react-live 下也照画」）。`compareState = null` **同时就是「开着吗」**（不另起布尔，两个标志必然漂移）。
+  - **三个状态分开说**：还没收到快照（「载入中…」，postMessage 的这几毫秒不是「没数据」）/ 选中了解不出来（「已被删除或清空」）/ 压根没选（「还没有可对照的会话」）。
+  - **共同前缀不渲染正文**（两侧逐字相同），改成一句说明 + 一条「分叉点之后」的界线。
+  - 选择器**就地换内容**（不用浮层菜单：面板内的滚动容器会裁掉绝对定位层，且「触发钮 + 菜单」的配方仓库里已有三份）。**已选的两行置灰且不挂 click 监听**；点一行只上报，`compare-set` 一到就收起选择器（= 这次选择被处理了的**回执**，被拒也回整份 set）。
+  - 入口 = header `.header-actions` 里的「对照」文字钮（**不放 composer**：那里四条 bar 都是本轮的读数/动作；**恒显示、不按「有没有第二条会话」隐藏** —— 要等有对手才出现的入口等于没有入口，C9 的老调）。Esc 链按层次插一条（审阅 → 运行 → 对照 → 历史）。
+  - CSS：`.cmp-transcript` **必须 flex column**（`.msg` 的 `align-self` 与 `max-width:92%` 都是 **flex 项**属性，块容器下用户消息就不右对齐了），且**不许**抄 `.messages` 的 `max-width:760px` / `margin:0 auto`；`@media (max-width: 520px)` 改竖排；警示色**复用仓库已有的 warning token**，不新造颜色。
+- **已知局限**：判据是消息 id ⇒ **只认拷贝关系**，手工复制粘贴出来的两条相似会话算不出共同前缀（会说「没有共享消息」）—— 这是**有意的**，宁可说不知道也不按正文相似度猜；`drifted` 是提示不是逐字 diff；串话的 `by` 字段会在悬停里说清这次是拿**哪份证据**判的（进程内重连会 `_dshSessions.clear()` ⇒ 退回盘上那份）；同 id 不同 cwd 判 unknown（只有手改过 `sessions.json` 才见得到这一档）；选择器只有标题与时间（`SessionSummary` 里没有条数）；侧栏窄时并排读不了；不另设条数上限（与 `snapshot` 同口径：全量下发、渲染侧折叠）。
+- **本次不做**（写死，防后人重推）：**不从面板发消息、不做并行跑**（`_liveRunning`/`_abort`/`_currentDshId`/`_turnStatus` 的语义一个字不动，「停止 = 杀子进程」照旧 —— C8 的核心，回归面太大）；不做 N 路 / 第三栏；**不做同步滚动**（要 scroll 重入闸，而影子看不到布局 ⇒ 那是「上了没人验」的代码）；不渲染共同前缀；不给 fork 加 `forkedFrom`、不落任何新状态；不在 React ChatView 的动作栏加入口；**不做转写侧的差异着色**（`.diff-line` 是给文件改动的，套到对话上会把「这段文字不同」说成「这行被改了」）；摘要里不放 usage / reasoningEffort（usage 口径只认当前活动会话，照抄会与用量条当场打架）；不动 `byId`/`foldSource`/`foldExpanded` 的单例语义。
+- **自检**：[scripts/probe-branch-compare.mjs](../scripts/probe-branch-compare.mjs)（新，**28/28**，七组）—— A 共同前缀（fork 拷贝 / 源分叉后又长 / 无关会话 / 同一条 / 一侧为空 / **跨代**）、B `drifted`（含反控：id 不同但正文完全相同 ⇒ 不进前缀）、C 冻结只读的**正面证明**（原对象一个字段都没变 + 尾段是副本）+ `aAfter === 尾段长度` 同源、D 串话六态 **+ live 优先的反控**、E 三句 `unknown` 文案两两不同 / 无关会话不许出警示 / 标题写出判据、F `pickCounterpart` 三级回退、G 结构守卫（`freezeTranscript` 在 provider 里恰好 1 处且 `_openSession` 必须委派、`_comparePane` 必须走 `frozenTail`、`compare-set` 的构造点只在 `_postCompare`、`sessionStore`/`ChatMessage`/`StoredSession` 里不许出现 `compare`/`forkedFrom`、`side` 只有 `a|b`、`FORK_SUFFIX` 字面量全仓唯一）。
+  - [scripts/probe-webview-render.mjs](../scripts/probe-webview-render.mjs) **78/78**（原 65 + 新增 13）：开关与幂等（恰好一条 `compare-open`）/ **三个空态分开说** / 两栏各自渲染 + 判定区两行且只有串话那行是警示色（**外加一条 `level:'ok'` 的正面反控**）/ **折叠各自独立**（反控：展开对照栏不许把直播面也展开）/ 选择器行数与置灰行**点了不发消息** / `compare-set` 收起选择器 / **关掉之后迟到的快照不许把面板画回来** / **对照栏不许污染直播面的 `byId`**（给对照栏里的卡发一条同 id 的 `tool-result`，它的 class 与文案一个都不许变）/ 对照渲染前后 `#messages` 子节点数相同 + 冻结过的终态视觉（`unknown`、**不带** `running`、没有 `.caret`）/ 三浮层互斥 / Esc 逐层收 / CSS 与 `chat.html` 的结构守卫（`#compare-panel` 必须是 body 直系且**不在 `#messages` 区间里**、`#compare-btn` 在 `.header-actions` 内）。顺带补上了影子的一处**测试性缺口**：`document.addEventListener` 原本是 no-op，全局键盘链（Esc 那串）**从来没被验过**，现在改成捕获式。
+  - **变异测试：C15 这 8 条全被抓红**（sink 换成 `byId`、折叠接到 `foldExpanded`、置灰行也挂监听、关掉时不丢弃状态、`.cmp-transcript` 改回 `display:block`、不冻结尾段、**调换 live 与盘的证据优先级**、把对照状态写进盘上的 `StoredSession`），加上 C13 那 7 条 + C14 那 6 条 = **`probe-webview-render` 累计 21/21**（README 那行说的就是这个累计数）。每条**先自证插进去了**（字面量不匹配就报「这条测试无效」）。
+    ⚠️ 本次踩到一枚**新坑**，记下来：`probe-branch-compare` 载的是 `out/` 里的**编译产物**，所以「改 `.ts` 源文件」的变异对它是**整份全绿**的 —— 看着像「漏网」，实际是**根本没插进去**。改 `.ts` 的变异必须**重新编译**（且跑完要把产物**再编译回来**）。这正是「先自证」那道闸的价值：没有它，这一次会被记成「探针盖不住」而白白加固错的地方。
+  - **回归**：`probe-session-tools` 64/64、`probe-purge` 20/20、`probe-turn-state` 13/13、`probe-branch-compare` 28/28、`probe-webview-render` 78/78（搬 `freezeTranscript` 与渲染器落点化之后**各跑一遍**，全绿）。
+- **只能真机 F5 盖住（十条，⚠️ 待跑）**：
+  1. 侧栏拉宽 ⇒ 真的并排、各自独立滚动、栏间发丝线在；拉到 ≤520px ⇒ 竖排（阈值只有真机试得出）。
+  2. **在 react-live 画面下打开浮层，两条转写照样可见** —— 本项选这个形态的**唯一理由**，必须正面证明（C14 刚栽过）。
+  3. 真 fork 走一遍：分支 → 源里再发 2 条 → fork 里再发 3 条 → 打开对照，两侧「此后 N 条」与肉眼一致、分叉点行位置对得上。
+  4. 串话三态看**脸色**（不只文案）：真 fork（同 `dsh.id`）⇒ warning 色那行在；两条无关会话 ⇒ 没有警示行；从没连过 DSH 的会话 ⇒ unknown 那行。
+  5. 快照是**每次重取**：发一条后回面板点「刷新」⇒ 数字与内容都动（不是缓存的旧图）。
+  6. 开着面板时那一轮正在跑 ⇒ 面板头说「快照时仍在跑」，且**卡不转圈**、没有闪烁光标。
+  7. 三浮层互斥 + Esc 逐层收（对照 → 运行 → 审阅 → 历史）。
+  8. 重载窗口后：分完支立刻关窗口的那种 fork ⇒ 对照里是「无身份」**不警示**（与「记忆真的断了」一致）；正常落过盘的 ⇒ 仍是 shared。
+  9. header 挤不挤：三个钮 + 标题在 300px 侧栏下标题还剩几个字（`.chat-title` 会 ellipsis 先让）。
+  10. 深/浅两套主题下 `.cmp-*` 与栏里气泡的配色。
 
 ### C16 · 审批白名单记忆
 - **现状**：无（依赖 C1）。

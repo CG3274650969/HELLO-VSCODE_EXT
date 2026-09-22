@@ -1814,3 +1814,135 @@ body.react-live #empty-hint {
   font-size: 11px;
   color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
 }
+
+/* ---------- C15 分支对照浮层 ---------- */
+/* 外壳复用 .review-panel / .rp-head / .rp-sub（见上面那段），这里只写它自己那几块。 */
+
+/* 判定行区（分叉点 + 串话）。显隐靠 hidden 属性 —— 顶部那条 [hidden]{display:none!important}
+   兜底，所以下面这个 display:flex 压不掉它。 */
+.cmp-verdict {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: none;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.35)));
+}
+.cmp-verdict-line {
+  font-size: 11px;
+  line-height: 15px;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+}
+/* ⚠️ 警示色的**唯一**来源是「两侧共享同一份 DSH 记忆」（扩展侧那条判据）——
+   两条无关会话绝不许染上这个色，否则警示很快就没人看了。 */
+.cmp-verdict-line.warn {
+  color: var(--dsw-alias-state-warning-primary, var(--vscode-editorWarning-foreground, #d29922));
+}
+
+.cmp-body {
+  flex: 1 1 auto;
+  min-height: 0; /* flex 子项要能收缩才滚得动（同 .rp-scroll） */
+  display: grid;
+  grid-template-columns: 1fr 1fr; /* 并排 */
+}
+.cmp-pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.cmp-pane + .cmp-pane {
+  border-left: 1px solid var(--dsw-alias-border-l1, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.35)));
+}
+.cmp-pane-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.35)));
+}
+.cmp-side {
+  flex: none;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-tertiary, var(--vscode-descriptionForeground, #999));
+}
+.cmp-pick {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+.cmp-meta {
+  flex: none;
+  font-size: 11px;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+}
+
+/* ⚠️ 必须是 flex column：`.msg` 的 align-self（用户靠右 / 助手靠左）与 max-width:92% 都是
+   **flex 项**属性，块容器下用户消息就不右对齐了。
+   ⚠️ 也**不许**抄 `.messages` 的 max-width:760px / margin:0 auto —— 那是单栏的阅读列，
+   放进半宽的栏里会把内容挤成一条。 */
+.cmp-transcript {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* 尾段之前那两行说明（共同前缀不渲染正文，只在这里交代它有多少条） */
+.cmp-shared {
+  flex: none;
+  font-size: 11px;
+  line-height: 15px;
+  color: var(--dsw-alias-label-tertiary, var(--vscode-descriptionForeground, #999));
+}
+.cmp-fork {
+  flex: none;
+  font-size: 11px;
+  line-height: 15px;
+  text-align: center;
+  padding: 3px 6px;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  border-top: 1px dashed var(--dsw-alias-border-l2, rgba(128, 128, 128, 0.4));
+  border-bottom: 1px dashed var(--dsw-alias-border-l2, rgba(128, 128, 128, 0.4));
+}
+
+/* 会话选择器：就地换掉那一栏的内容（不用绝对定位的弹出层 —— 会被这里的滚动容器裁掉） */
+.cmp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+/* 已选中的两侧置灰。⚠️ 置灰的行**连 click 监听都不挂**（灰了还能点出消息是最坏的一种）。 */
+.cmp-item.disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.cmp-item.disabled:hover {
+  background: none;
+}
+.cmp-item-here {
+  margin-left: auto;
+  flex: none;
+  font-size: 10px;
+  color: var(--dsw-alias-label-tertiary, var(--vscode-descriptionForeground, #999));
+}
+
+/* 侧栏窄到一定程度就并排不起来了（1fr 1fr 在 300px 侧栏下每栏 ~150px）——改竖排。 */
+@media (max-width: 520px) {
+  .cmp-body {
+    grid-template-columns: 1fr;
+  }
+  .cmp-pane + .cmp-pane {
+    border-left: none;
+    border-top: 1px solid var(--dsw-alias-border-l1, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.35)));
+  }
+}

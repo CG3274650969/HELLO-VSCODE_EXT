@@ -337,7 +337,50 @@ export type ExtToWebview =
       pathNote?: string;
     }
   /** 这条审批有结果了：收起确认条（允许/拒绝/超时/取消） */
-  | { type: 'approval-resolved'; id: string; outcome: ApprovalOutcome };
+  | { type: 'approval-resolved'; id: string; outcome: ApprovalOutcome }
+  /** C15 分支对照：一份**只读快照**（打开 / 换侧 / 点刷新时才发，没有持续推送）。
+   *
+   *  全字段可选 —— 旧 webview 见到不认的 type 直接忽略，不会炸（同 `forecast` 的约定）。
+   *
+   *  **分工线**（防两边各写一套）：**带判定的文案（`split` / `crosstalk`）扩展侧拼好**
+   *  （那是判据 + level）；**纯排版（`title · 此后 N 条 · 时间`）webview 侧拼**
+   *  —— 后者只是把 payload 里已有的字段摆出来。 */
+  | {
+      type: 'compare-set';
+      /** 两侧**当前选中的会话 id**（**不是**「解出来了」的意思）。选择器要靠它置灰「本侧/对侧」，
+       *  而解不出来的那一侧在 `panes` 里是缺的 —— 两个概念必须分开。 */
+      sides?: { a?: string; b?: string };
+      panes?: { a?: ComparePane; b?: ComparePane };
+      split?: { shared: number; aAfter: number; bAfter: number; kind: 'same' | 'fork' | 'none'; line: string; title: string };
+      /** 串话标注。`level: 'warn'` **只**由 `shared` 一档产生（无关会话不许出警示）。 */
+      crosstalk?: { line: string; title: string; level: 'ok' | 'warn' };
+      /** 快照时刻（epoch ms） */
+      at?: number;
+      /** 快照落下时那一轮还在跑 ⇒ 面板头要说「此后两侧的新消息不会进来」。 */
+      live?: boolean;
+    };
+
+/**
+ * C15 对照里的一侧。**只有分叉点之后的尾段** —— 共同前缀两侧逐字相同，不发也不渲染
+ * （要全文用「导出会话」）。
+ */
+export interface ComparePane {
+  id: string;
+  title: string;
+  /** 已**冻结**的尾段（`streaming`→`interrupted`、`running`→`unknown`，见 sessionStore.freezeTranscript）。
+   *  冻结是为了与「真打开这条会话」看到的一致。 */
+  messages: ChatMessage[];
+  /** 这一侧共同前缀的条数。 */
+  shared: number;
+  /** 共同前缀那句说明（判定的部分扩展侧拼好，webview 只排版）。 */
+  sharedNote: string;
+  /** 尾段里被冻结的条数；>0 时 `frozenNote` 一并给出。 */
+  frozen: number;
+  frozenNote?: string;
+  /** 只显示用（判据在 `crosstalk` 里），面板头写「DSH 会话 a1b2…」。 */
+  dshId?: string;
+  updatedAt: number;
+}
 
 /** C1 一条审批的最终去向（与 src/approvalServer.ts 的 ApprovalOutcome 同构） */
 export type ApprovalOutcome = 'allowed' | 'rejected' | 'timeout' | 'cancelled';
@@ -385,6 +428,13 @@ export type WebviewToExt =
   // fork 整份当前会话 → 新会话保留全部转写并切换过去，记忆沿用源 DSH 会话）。
   | { type: 'fork-session' }
   /** C1：用户在确认条上拍了板（allow=true 允许执行；对失效的 id 扩展会静默忽略） */
-  | { type: 'approval-answer'; id: string; allow: boolean }
-  /** C9：运行检查器浮层开/关。开着才把 `details` 随 `runs` 一起下发（体积控制）。 */
-  | { type: 'run-panel'; open: boolean };
+  | { type: 'approval-answer'; id: string; allow: boolean }  /** C9：运行检查器浮层开/关。开着才把 `details` 随 `runs` 一起下发（体积控制）。 */
+  | { type: 'run-panel'; open: boolean }
+  /** C15：打开/刷新分支对照浮层。**幂等**（面板开着时再点 = 重新取一份快照）。
+   *
+   *  ⚠️ 有意**没有** `compare-close`：扩展对面板的开合**无状态**（快照只在打开/换侧/刷新时发，
+   *  不像 `runs` 那样持续推送，所以不需要「开着吗」这个闸）。面板关了不必告诉扩展 ——
+   *  不是漏了。 */
+  | { type: 'compare-open' }
+  /** C15：换某一侧的会话。`side` 只有两侧（`'a'` 左 / `'b'` 右）—— 不做第三栏。 */
+  | { type: 'compare-pick'; side: 'a' | 'b'; sessionId: string };

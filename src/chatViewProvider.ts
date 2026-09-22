@@ -6,6 +6,7 @@ import { randomBytes } from 'crypto';
 import {
   Attachment,
   ChatMessage,
+  ComparePane,
   DshConnState,
   ExtToWebview,
   FileRef,
@@ -74,6 +75,7 @@ import { isAbortError, streamMockReply } from './mockAssistant';
 import {
   capToolInput,
   dshStillReferenced,
+  freezeTranscript,
   LoadReport,
   RETENTION_DAY_MS,
   SessionStore,
@@ -81,6 +83,18 @@ import {
   titleFromText,
 } from './sessionStore';
 import { removeDshSessionDir } from './dshPaths';
+import {
+  crossTalkLine,
+  crossTalkOf,
+  crossTalkTitle,
+  divergenceLine,
+  divergenceOf,
+  divergenceTitle,
+  FORK_SUFFIX,
+  frozenTail,
+  pickCounterpart,
+  sharedPrefixNote,
+} from './branchCompare';
 import { searchSessions } from './sessionSearch';
 import { sessionToJson, sessionToMarkdown, suggestedFileName } from './sessionExport';
 import {
@@ -576,6 +590,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** 运行浮层是否开着。开着才把 `details` 随 `runs` 一起下发（体积控制） */
   private _runsPanelOpen = false;
 
+  /**
+   * C15：对照浮层选中的两侧（UI 会话 id）。**纯内存、不落盘** —— 重开面板回到默认对。
+   *
+   * ⚠️ 与 `_runsPanelOpen` 的差别：对照**没有推送**（只读快照，只在打开/换侧/刷新时发），
+   * 所以不需要「开着吗」这个闸，webview 关了面板也不必告诉扩展。见 protocol.ts 的 `compare-open`。
+   */
+  private _compareSides: { a?: string; b?: string } = {};
+
   constructor(
     private readonly _extensionUri: vscode.Uri,
     storageDir: string,
@@ -825,6 +847,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // C9：浮层开着才把详情随读数一起发（关掉时不必回发 —— 前端自己就把面板收了）
         this._runsPanelOpen = msg.open;
         if (msg.open) this._postRuns();
+        break;
+      case 'compare-open':
+        // C15：打开或刷新（幂等）。没有 compare-close —— 扩展对面板开合无状态（见 protocol.ts）
+        this._openCompare();
+        break;
+      case 'compare-pick':
+        this._pickCompareSide(msg.side, msg.sessionId);
         break;
       case 'clear':
         this.startNewSession();
@@ -2183,6 +2212,120 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         ? { type: 'runs', readout, details: this._runs.details(this._active.id) }
         : { type: 'runs', readout }
     );
+  }
+
+  // ---------- C15 分支对照（只读浮层） ----------
+
+  /**
+   * 打开 / 刷新对照浮层：定两侧 → 发一份快照。**幂等**（点「刷新」也走这条）。
+   *
+   * 先 `_sendHistory()` 再 `_postCompare()`：前端的会话选择器数据源就是历史列表那一份
+   * （`_sendHistory` 的 `active()` 过滤 = 在列且有内容，正好就是可对照的集合 —— 一处实现），
+   * 先发免得选择器短暂显示上一份。
+   */
+  private _openCompare(): void {
+    if (this._compareSides.a === undefined) this._compareSides.a = this._active.id;
+    if (this._compareSides.b === undefined) {
+      const other = pickCounterpart(
+        this._active,
+        this._store.active().filter((s) => s.id !== this._active.id)
+      );
+      if (other) this._compareSides.b = other.id;
+    }
+    this._sendHistory();
+    this._postCompare();
+  }
+
+  /** 换某一侧。两侧不允许是同一条（前端已置灰，这里兜底迟到/陈旧的点击）。 */
+  private _pickCompareSide(side: 'a' | 'b', id: string): void {
+    if (id === (side === 'a' ? this._compareSides.b : this._compareSides.a)) return;
+    this._compareSides[side] = id;
+    this._postCompare();
+  }
+
+  /**
+   * 解析一侧：`_store.get` 就够 —— 活动会话在首次说话时已被 `add(this._active)`，与数组里
+   * 那个对象**是同一个引用**，所以直播中它也是最新的（不是盘上一次快照）。
+   *
+   * 解不出来的（空会话 / 已进回收站）返回 undefined，调用方会**就地清掉记录** ——
+   * 面板要能回到「还没选」，绝不能留着一条指向空气的 id。
+   */
+  private _resolveCompareSide(id?: string): StoredSession | undefined {
+    if (!id) return undefined;
+    const s = this._store.get(id);
+    if (!s || s.deletedAt !== undefined || s.messages.length === 0) return undefined;
+    return s;
+  }
+
+  /**
+   * 一条侧的载荷：**只有分叉点之后的尾段**（共同前缀两侧逐字相同，不发也不渲染）。
+   *
+   * `shared` / `drifted` 都是**这一对**的属性（由 `divergenceOf` 算出后传进来）——
+   * 别在这一侧里重新推一遍，那是第二个判据。
+   */
+  private _comparePane(s: StoredSession, shared: number, drifted: number): ComparePane {
+    const { messages, frozen } = frozenTail(s, shared);
+    return {
+      id: s.id,
+      title: s.title,
+      messages,
+      shared,
+      sharedNote: sharedPrefixNote(shared, drifted),
+      frozen,
+      frozenNote: frozen > 0 ? `其中 ${frozen} 条「仍在跑」的状态已冻结为终态` : undefined,
+      dshId: s.dsh?.id,
+      updatedAt: s.updatedAt,
+    };
+  }
+
+  /**
+   * 下发一份对照快照。判定（分叉点 + 串话）全在 `branchCompare` 里算，**文案也由它拼好**
+   * —— webview 只排版。
+   *
+   * `live` 只读 `_dshSessions` 这个纯缓存（串话判据的第一证据，理由见 branchCompare 头注释）；
+   * `_abort` / `_liveRunning` 仅用于「快照时仍在跑」那句话，不参与任何判定。
+   */
+  private _postCompare(): void {
+    const a = this._resolveCompareSide(this._compareSides.a);
+    const b = this._resolveCompareSide(this._compareSides.b);
+    if (!a) this._compareSides.a = undefined;
+    if (!b) this._compareSides.b = undefined;
+
+    if (!a || !b) {
+      // 一侧解不出来（空会话 / 已进回收站）：只回「选中的是谁」，`panes` 留空。
+      // 前端据此把那一侧画成「这条会话已被删除或清空」，而不是整块面板一起变空。
+      this._post({ type: 'compare-set', at: Date.now(), sides: { ...this._compareSides }, panes: {} });
+      return;
+    }
+
+    const d = divergenceOf(a, b);
+    const c = crossTalkOf(a, b, {
+      a: this._dshSessions.get(a.id),
+      b: this._dshSessions.get(b.id),
+    });
+    this._post({
+      type: 'compare-set',
+      at: Date.now(),
+      sides: { a: a.id, b: b.id },
+      live: !!(this._abort || this._liveRunning),
+      panes: {
+        a: this._comparePane(a, d.shared, d.drifted),
+        b: this._comparePane(b, d.shared, d.drifted),
+      },
+      split: {
+        shared: d.shared,
+        aAfter: d.aAfter,
+        bAfter: d.bAfter,
+        kind: d.kind,
+        line: divergenceLine(d),
+        title: divergenceTitle(d),
+      },
+      crosstalk: {
+        line: crossTalkLine(c),
+        title: crossTalkTitle(c),
+        level: c.kind === 'shared' ? 'warn' : 'ok',
+      },
+    });
   }
 
   /**
@@ -3738,17 +3881,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._resetTurnUsage(); // C3a：本轮读数属于切走的那个会话
     this._persistActiveSession();
 
-    // 新打开的会话不会再续跑任何流：残留的 streaming 一律落成 interrupted
-    for (const m of target.messages) {
-      if (m.status === 'streaming') {
-        m.status = 'interrupted';
-      }
-      if (m.role === 'tool' && m.toolState === 'running') {
-        // 落盘的 running = 那条 result 从没到过（进程被杀 / 窗口关掉），跑没跑完**不可知**。
-        // 判成失败是谎报：会让人去重试一个可能已经生效的命令（同 _finishTurn 那条注释）
-        m.toolState = 'unknown';
-      }
-    }
+    // 新打开的会话不会再续跑任何流：残留的 streaming 一律落成 interrupted（规则见 freezeTranscript，
+    // C15 起分量共用 —— 分支对照面板里的每一侧也要与「真打开这条会话」逐字一致）
+    freezeTranscript(target.messages);
     target.updatedAt = Date.now();
     this._store.replace(target);
     this._store.persist();
@@ -3780,7 +3915,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const firstUser = messages.find((m) => m.role === 'user');
     const fork = this._store.create(
       src.title
-        ? src.title + '（分支）'
+        ? src.title + FORK_SUFFIX
         : firstUser
           ? titleFromText(firstUser.text)
           : ''

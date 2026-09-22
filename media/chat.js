@@ -135,6 +135,37 @@
   var runsDetails = null; // RunRecord[]；**只在面板开着时**扩展才下发
   var runsPanelOpen = false;
 
+  // ---------- C15 分支对照浮层 ----------
+  var comparePanel = document.getElementById('compare-panel');
+  var comparePanelSub = document.getElementById('compare-panel-sub');
+  var compareVerdict = document.getElementById('compare-verdict');
+  var compareRefresh = document.getElementById('compare-refresh');
+  var comparePanelClose = document.getElementById('compare-panel-close');
+  var compareBtn = document.getElementById('compare-btn');
+  /** 两侧的 DOM 引用（'a' = 左 / 'b' = 右）。 */
+  var compareEls = {
+    a: {
+      transcript: document.getElementById('compare-transcript-a'),
+      meta: document.getElementById('compare-meta-a'),
+      pick: document.getElementById('compare-pick-a'),
+    },
+    b: {
+      transcript: document.getElementById('compare-transcript-b'),
+      meta: document.getElementById('compare-meta-b'),
+      pick: document.getElementById('compare-pick-b'),
+    },
+  };
+  /**
+   * 面板状态。⚠️ **`null` 就是「关着」** —— 不另起一个布尔（同 reviewPanelOpen 那条教训：
+   * 两个标志必然漂移，而漂移的表现是「面板关着却还在吃消息」或反过来）。
+   */
+  var compareState = null;
+  /**
+   * 两侧尾段的折叠展开态。**每个落点自己的** —— 直播面那个 `foldExpanded` 是单例，
+   * 共用一个的话在对照栏点「显示」会把直播面也展开（探针有反控钉着这条串台）。
+   */
+  var compareTailExpanded = { a: false, b: false };
+
   // 顶部模式：chat（内嵌聊天）/ harness（Agent）。两种模式各一套草稿与待发附件，互不串。
   var modeTabs = Array.prototype.slice.call(document.querySelectorAll('.mode-tab'));
   var currentMode = 'harness'; // mode-set 到达前的占位，扩展回执后纠正为真正模式（默认 harness）
@@ -146,6 +177,18 @@
   /** id -> 该条消息的 DOM 记录；text 字段是本端对当前可见文本的唯一累积处 */
   var byId = new Map();
   var atBottom = true; // 用户是否接近底部（决定要不要抢滚）
+
+  /**
+   * C15：**渲染落点** —— 一份转写画到哪儿、记录进哪张表。
+   *
+   * 直播面就是模块单例（`messagesEl` + `byId`）。C15 的对照面板每次渲染现建一个**一次性**落点
+   * （见 `compareSink`）：两条会话的消息 id 各带自己的 uuid，撞名不会发生，但把一个「属于别会话
+   * 的 id」塞进 `byId`，就等于给迟到帧（assistant-delta / tool-result）开了一扇门。
+   *
+   * `reactLive: true` = 这个落点受「真组件接管时不建 DOM」的门规约束。对照面板是 `false` ——
+   * 它恰恰**要**在 react-live 下照画（那是它选「全屏浮层」这个形态的唯一理由，C14 刚栽过）。
+   */
+  var LIVE_SINK = { container: messagesEl, registry: byId, reactLive: true };
 
   // 历史会话：扩展下发的列表摘要 + 当前活动会话 id
   var sessions = [];
@@ -336,9 +379,10 @@
   }
 
   function openReviewPanel() {
-    // C9：与运行检查器浮层互斥（两个同层满屏浮层同时开着没有视觉仲裁）。
-    // 函数声明会提升，这里直接调没问题；它自带 `!runsPanelOpen` 早退，重复调用无害。
+    // C9/C15：与另外两个同层满屏浮层互斥（同时开着没有视觉仲裁）。
+    // 函数声明会提升，这里直接调没问题；两个都自带早退，重复调用无害。
     closeRunsPanel();
+    closeComparePanel();
     reviewPanelOpen = true;
     reviewPanel.classList.add('open');
     renderReviewList();
@@ -1405,8 +1449,9 @@
   }
 
   function openRunsPanel() {
-    // 与审阅浮层互斥：两个同层（z-index 40）满屏浮层同时开着没有视觉仲裁
+    // 与另外两个同层（z-index 40）满屏浮层互斥：同时开着没有视觉仲裁
     closeReviewPanel();
+    closeComparePanel();
     runsPanelOpen = true;
     runsPanel.classList.add('open');
     post({ type: 'run-panel', open: true }); // 扩展据此把 details 一起发下来
@@ -1418,6 +1463,190 @@
     runsPanelOpen = false;
     runsPanel.classList.remove('open');
     post({ type: 'run-panel', open: false });
+  }
+
+  // ---------- C15 分支对照浮层 ----------
+
+  /**
+   * 对照面板的一次性落点（见 LIVE_SINK 的说明）。
+   *
+   * ⚠️ 绝不能写进 `byId` —— 那是**直播面**的表，assistant-delta / tool-result / forecast 都按 id
+   * 去那里取记录。两条会话的 id 各自带 uuid，撞名不会发生；但把一个「属于别会话的 id」塞进去，
+   * 就等于给迟到帧开了一扇门。
+   *
+   * `reactLive: false` 正是「在 react-live 下也照画」—— 那是这个浮层选全屏形态的**唯一理由**。
+   */
+  function compareSink(container) {
+    return { container: container, registry: new Map(), reactLive: false };
+  }
+
+  function openComparePanel() {
+    // 三个同层（z-index 40）满屏浮层互斥：同时开着没有视觉仲裁
+    closeReviewPanel();
+    closeRunsPanel();
+    compareState = { sides: {}, panes: {}, split: null, crosstalk: null, at: 0, live: false, pick: null };
+    compareTailExpanded = { a: false, b: false };
+    comparePanel.classList.add('open');
+    renderCompare(); // 先画「载入中…」（postMessage 是异步的）
+    post({ type: 'compare-open' });
+  }
+
+  function closeComparePanel() {
+    if (!compareState) return;
+    compareState = null;
+    comparePanel.classList.remove('open');
+  }
+
+  function renderCompare() {
+    if (!compareState) return;
+    comparePanelSub.textContent = compareState.at
+      ? '快照 ' + fmtTime(compareState.at) + (compareState.live ? ' · 取快照时那一轮仍在跑，此后的新消息不会进来' : '')
+      : '';
+    renderCompareVerdict();
+    renderComparePane('a');
+    renderComparePane('b');
+  }
+
+  /**
+   * 判定区两行（分叉点 + 串话）。⚠️ **文案与警示等级都由扩展侧拼好**（判据在 branchCompare.ts），
+   * 这里只排版 —— 两边各写一套判据必然漂移，而这条漂移的代价是「警示有时候不出现」。
+   */
+  function renderCompareVerdict() {
+    compareVerdict.textContent = '';
+    var items = [];
+    if (compareState.split) items.push({ text: compareState.split.line, title: compareState.split.title, warn: false });
+    if (compareState.crosstalk) {
+      items.push({
+        text: compareState.crosstalk.line,
+        title: compareState.crosstalk.title,
+        warn: compareState.crosstalk.level === 'warn',
+      });
+    }
+    compareVerdict.hidden = items.length === 0;
+    for (var i = 0; i < items.length; i++) {
+      var el = document.createElement('div');
+      el.className = 'cmp-verdict-line' + (items[i].warn ? ' warn' : '');
+      el.textContent = items[i].text;
+      el.title = items[i].title || '';
+      compareVerdict.appendChild(el);
+    }
+  }
+
+  /** 重画一栏。`pick === side` 时这一栏整体让给选择器（就地换内容，不用浮层菜单）。 */
+  function renderComparePane(side) {
+    var els = compareEls[side];
+    var box = els.transcript;
+    var keep = box.scrollTop;
+    // ⚠️ 清法**不是** removeAllMessages()：那个刻意只删 .msg / .msg-fold、保留 #messages 里的
+    // 空态提示节点（对照栏没有那个节点），在对照栏里它什么都删不掉。
+    box.textContent = '';
+
+    if (compareState.pick === side) {
+      els.meta.textContent = '选择会话…';
+      renderComparePicker(side, box);
+      box.scrollTop = keep;
+      return;
+    }
+
+    var pane = compareState.panes[side];
+    if (!pane) {
+      var empty = document.createElement('div');
+      empty.className = 'rp-empty';
+      // ⚠️ 三个状态必须分开说，别糊成一句：
+      //   ① 还没收到任何快照（at 为 0）—— postMessage 的这几毫秒，不是「没数据」；
+      //   ② 选中了一条但解不出来（已删 / 已空）；
+      //   ③ 压根还没选。
+      empty.textContent = !compareState.at
+        ? '载入中…'
+        : compareState.sides[side]
+          ? '这条会话已被删除或清空 —— 点上面「选择会话」换一条'
+          : '还没有可对照的会话 —— 点上面「选择会话」挑一条';
+      box.appendChild(empty);
+      els.meta.textContent = '';
+      box.scrollTop = keep;
+      return;
+    }
+
+    var meta = pane.title + ' · 此后 ' + pane.messages.length + ' 条';
+    if (pane.frozen > 0) meta += ' · 冻结 ' + pane.frozen + ' 条';
+    els.meta.textContent = meta;
+    els.meta.title =
+      (pane.dshId ? 'DSH 会话 ' + pane.dshId + '\n' : '') +
+      '最后更新 ' + fmtTime(pane.updatedAt) +
+      (pane.frozenNote ? '\n' + pane.frozenNote : '') +
+      '\n（只读快照；要全文用「导出会话」）';
+
+    // 共同前缀不渲染正文（两侧逐字相同）—— 只留一句说明 + 一条分叉线。
+    var shared = document.createElement('div');
+    shared.className = 'cmp-shared';
+    shared.textContent = pane.sharedNote;
+    box.appendChild(shared);
+    var fork = document.createElement('div');
+    fork.className = 'cmp-fork';
+    fork.textContent = pane.shared > 0 ? '分叉点之后' : '双方各自的全部';
+    box.appendChild(fork);
+
+    renderTranscriptInto(pane.messages, compareTailExpanded[side], compareSink(box), function () {
+      compareTailExpanded[side] = true;
+      renderComparePane(side);
+    });
+    box.scrollTop = keep;
+  }
+
+  /**
+   * 就地换掉这一栏的内容，列一列可选会话。数据源是 webview 侧那个 `sessions`
+   * （由 history-update 维护）—— 扩展侧 `_sendHistory` 的 `active()` 过滤 = 在列且有内容，
+   * 正好就是可对照的集合（一处实现，不另推一份）。
+   */
+  function renderComparePicker(side, box) {
+    var selfId = compareState.sides[side];
+    var otherId = compareState.sides[side === 'a' ? 'b' : 'a'];
+    var list = document.createElement('div');
+    list.className = 'cmp-list';
+    if (!sessions.length) {
+      var empty = document.createElement('div');
+      empty.className = 'rp-empty';
+      empty.textContent = '没有其它会话可选 —— 先「新建对话」，或从历史里挑一条。';
+      box.appendChild(empty);
+      return;
+    }
+    for (var i = 0; i < sessions.length; i++) {
+      var s = sessions[i];
+      var row = document.createElement('div');
+      row.className = 'lc-model-item cmp-item';
+      var name = document.createElement('span');
+      name.className = 'lc-mi-name';
+      name.textContent = s.title || '（未命名）';
+      row.appendChild(name);
+      var tag = document.createElement('span');
+      tag.className = 'cmp-item-here';
+      if (s.id === selfId) tag.textContent = '本侧';
+      else if (s.id === otherId) tag.textContent = '对侧';
+      else tag.textContent = fmtTime(s.updatedAt);
+      row.appendChild(tag);
+      if (s.id === selfId || s.id === otherId) {
+        // ⚠️ 置灰的行**连监听都不挂** —— 「灰了还能点出消息」是比不置灰更坏的一种
+        // （C11/C12 同款，探针里有反控）。
+        row.classList.add('disabled');
+      } else {
+        addComparePick(row, side, s.id);
+      }
+      list.appendChild(row);
+    }
+    box.appendChild(list);
+  }
+
+  function addComparePick(row, side, sessionId) {
+    row.addEventListener('click', function () {
+      // 只上报，不本地改动 —— 等扩展回整份 compare-set（回执）再重画，
+      // 免得本地的乐观更新与扩展的解析结果各说一套。
+      post({ type: 'compare-pick', side: side, sessionId: sessionId });
+    });
+  }
+
+  function toggleComparePanel() {
+    if (compareState) closeComparePanel();
+    else openComparePanel();
   }
 
   /**
@@ -2000,12 +2229,13 @@
   // ---------- DOM 构建 ----------
 
   function makeAssistantShell(id) {
-    var rec = makeBubble(id, 'assistant');
+    var rec = makeBubble(id, 'assistant', LIVE_SINK);
     rec.content.className = 'md';
     return rec;
   }
 
-  function makeBubble(id, role) {
+  /** `sink` 必填（C15）：漏传会当场 TypeError —— 那正是我们要的失败方式，静默画到直播面上才是最坏的。 */
+  function makeBubble(id, role, sink) {
     var wrap = document.createElement('div');
     wrap.className = 'msg msg-' + role;
     var bubble = document.createElement('div');
@@ -2013,10 +2243,10 @@
     var content = document.createElement('div');
     bubble.appendChild(content);
     wrap.appendChild(bubble);
-    messagesEl.appendChild(wrap);
+    sink.container.appendChild(wrap);
 
     var rec = { id: id, role: role, wrap: wrap, bubble: bubble, content: content, text: '', status: 'streaming', caret: null };
-    byId.set(id, rec);
+    sink.registry.set(id, rec);
     return rec;
   }
 
@@ -2127,8 +2357,12 @@
     rec.forecastToggle.hidden = lines.length === 0;
   }
 
-  function addToolMessage(msg) {
-    if (isReactLive()) return;
+  /**
+   * C15：工具卡的**落点化**实现 —— 直播面与对照面板共用这一份。
+   * ⚠️ 它自己**没有** react-live 门规：门规在三个 `add*` 包装器与 `renderMessageInto` 里
+   *    （共 4 处，探针钉着）。这样对照面板（`reactLive: false`）才能在 react-live 下照画。
+   */
+  function renderToolInto(msg, sink) {
     var wrap = document.createElement('div');
     wrap.className = 'msg msg-tool';
     var card = document.createElement('div');
@@ -2166,7 +2400,7 @@
     card.appendChild(output);
 
     wrap.appendChild(card);
-    messagesEl.appendChild(wrap);
+    sink.container.appendChild(wrap);
 
     var rec = {
       id: msg.id,
@@ -2182,18 +2416,23 @@
       status: 'done',
       caret: null,
     };
-    byId.set(msg.id, rec);
+    sink.registry.set(msg.id, rec);
     applyToolState(rec);
     return rec;
   }
 
-  /** 居中灰字说明行（role:'note'，如「已开启全新 DSH 会话…」）。恒 done、不流式。 */
-  function addNoteMessage(msg) {
+  /** 直播面的工具卡入口。门规**一字未改**地留在这里（C15 的落点化只把函数体挪进了 renderToolInto）。 */
+  function addToolMessage(msg) {
     if (isReactLive()) return;
+    return renderToolInto(msg, LIVE_SINK);
+  }
+
+  /** 居中灰字说明行（role:'note'，如「已开启全新 DSH 会话…」）。恒 done、不流式。 */
+  function renderNoteInto(msg, sink) {
     var wrap = document.createElement('div');
     wrap.className = 'msg msg-note';
     wrap.textContent = msg.text; // 纯文本渲染（CSS ::before/::after 加两侧 —）
-    messagesEl.appendChild(wrap);
+    sink.container.appendChild(wrap);
     var rec = {
       id: msg.id,
       role: 'note',
@@ -2204,19 +2443,33 @@
       status: 'done',
       caret: null,
     };
-    byId.set(msg.id, rec);
+    sink.registry.set(msg.id, rec);
     return rec;
   }
 
-  function addMessage(msg) {
-    if (isReactLive()) return; // 真组件画面接管，DOM 消息面整体停用
+  /** 直播面的 note 入口（门规同 addToolMessage）。 */
+  function addNoteMessage(msg) {
+    if (isReactLive()) return;
+    return renderNoteInto(msg, LIVE_SINK);
+  }
+
+  /**
+   * C15：**把一条消息渲染进一个落点** —— 直播面与对照面板的唯一分派处。
+   *
+   * ⚠️ 门规必须在这里也有一份：`renderSnapshot` 重渲染整条转写时走的是 `renderTranscriptInto`，
+   *    **不再经过 `add*` 包装器**。所以全仓一共 4 行门规（三个 `add*` + 这里），
+   *    这是**有意保留的重复** —— 比「把门规藏进 sink 字段」更难写错：漏传 sink 会当场
+   *    TypeError，而漏掉门规会静默把 DOM 画到 react-live 的直播面上。
+   */
+  function renderMessageInto(msg, sink) {
+    if (sink.reactLive && isReactLive()) return;
     if (msg.role === 'tool') {
-      return addToolMessage(msg);
+      return renderToolInto(msg, sink);
     }
     if (msg.role === 'note') {
-      return addNoteMessage(msg);
+      return renderNoteInto(msg, sink);
     }
-    var rec = makeBubble(msg.id, msg.role === 'user' ? 'user' : 'assistant');
+    var rec = makeBubble(msg.id, msg.role === 'user' ? 'user' : 'assistant', sink);
     rec.text = msg.text;
     rec.status = msg.status;
 
@@ -2231,6 +2484,12 @@
       renderMarkdownInto(rec.content, msg.text);
       if (msg.status === 'streaming') setStreaming(rec, true);
     }
+  }
+
+  /** 直播面的通用入口。 */
+  function addMessage(msg) {
+    if (isReactLive()) return; // 真组件画面接管，DOM 消息面整体停用
+    return renderMessageInto(msg, LIVE_SINK);
   }
 
   /** 只清掉消息气泡（与折叠行），保留 #messages 里的空状态提示元素。 */
@@ -2268,7 +2527,15 @@
    */
   var foldSource = [];
 
-  function buildFoldRow(n) {
+  /**
+   * 那一行「更早的 N 条已折叠」。
+   *
+   * C15：点击动作**由调用方给**（`onExpand`）—— 折叠展开态是**每个落点自己的**状态：
+   * 直播面是 `foldExpanded`，对照面板是 `compareTailExpanded.a/b`。写死成
+   * `foldExpanded = true; renderSnapshot(foldSource)` 的话，在对照面板里点这一行会去展开
+   * **直播面**（探针里有反控钉着这条串台）。
+   */
+  function buildFoldRow(n, onExpand) {
     var row = document.createElement('div');
     row.className = 'msg-fold';
     var btn = document.createElement('button');
@@ -2279,23 +2546,35 @@
       '折叠只影响这一屏的渲染量。消息一条没丢，DSH 那边的记忆也没有被改动 —— ' +
       '真正的上下文压缩是 DSH 按它自己的阈值做的，与这里无关。';
     btn.addEventListener('click', function () {
-      foldExpanded = true;
-      renderSnapshot(foldSource);
+      onExpand();
     });
     row.appendChild(btn);
     return row;
+  }
+
+  /**
+   * C15：**把一份转写渲染进一个落点**的**唯一实现**（折叠判据也只此一处）。
+   *
+   * ⚠️ 它**不清记录表、不清容器** —— 那是调用方的事：直播面要 `byId.clear()` +
+   *    `removeAllMessages()`（后者刻意保留 #messages 里的空态提示节点），对照面板直接换一张新表。
+   */
+  function renderTranscriptInto(messages, expanded, sink, onExpand) {
+    // 折的是**头部**：尾部是正在生长的对话，滚动位置与流式气泡都在那一头。
+    var head = !expanded && messages.length > FOLD_KEEP ? messages.length - FOLD_KEEP : 0;
+    if (head > 0) sink.container.appendChild(buildFoldRow(head, onExpand));
+    for (var i = head; i < messages.length; i++) {
+      renderMessageInto(messages[i], sink);
+    }
   }
 
   function renderSnapshot(messages) {
     byId.clear();
     removeAllMessages();
     foldSource = messages;
-    // 折的是**头部**：尾部是正在生长的对话，滚动位置与流式气泡都在那一头。
-    var head = !foldExpanded && messages.length > FOLD_KEEP ? messages.length - FOLD_KEEP : 0;
-    if (head > 0) messagesEl.appendChild(buildFoldRow(head));
-    for (var i = head; i < messages.length; i++) {
-      addMessage(messages[i]);
-    }
+    renderTranscriptInto(messages, foldExpanded, LIVE_SINK, function () {
+      foldExpanded = true;
+      renderSnapshot(foldSource);
+    });
     toggleEmptyHint();
     updateBusy();
     messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -2701,6 +2980,30 @@
     runsPanelClose.addEventListener('click', function () {
       closeRunsPanel();
     });
+
+    // ---- C15 分支对照浮层：入口在 header（不在 composer —— 那是「本轮的读数/动作」的地方）----
+    compareBtn.addEventListener('click', function () {
+      toggleComparePanel();
+    });
+    comparePanelClose.addEventListener('click', function () {
+      closeComparePanel();
+    });
+    compareRefresh.addEventListener('click', function () {
+      // 幂等：再发一次 compare-open = 重新取一份快照（两侧都重读）
+      if (!compareState) return;
+      compareState.pick = null;
+      renderCompare();
+      post({ type: 'compare-open' });
+    });
+    for (var csi = 0; csi < 2; csi++) {
+      (function (side) {
+        compareEls[side].pick.addEventListener('click', function () {
+          if (!compareState) return;
+          compareState.pick = compareState.pick === side ? null : side;
+          renderComparePane(side);
+        });
+      })(csi === 0 ? 'a' : 'b');
+    }
     // Esc 收起浮层：审阅面板优先，否则历史面板。自带 Esc 的输入框（标题/历史搜索/自定义模型）
     // 各自处理并回焦，全局监听不抢（否则会二次触发）。
     document.addEventListener('keydown', function (e) {
@@ -2725,6 +3028,11 @@
       if (runsPanelOpen) {
         // C9：运行检查器浮层 —— 审阅面板之后、历史面板之前（层次顺序与 z-index 一致）
         closeRunsPanel();
+        return;
+      }
+      if (compareState) {
+        // C15：分支对照浮层 —— 三个浮层里最后开的那个，按 z-index 同层的顺序收
+        closeComparePanel();
         return;
       }
       if (isHistoryOpen()) closeHistoryPanel();
@@ -2822,6 +3130,24 @@
         // C6：列表一变，正在显示的命中就可能是过期的（软删/恢复/重命名都会走到这里）→ 立刻重发
         requestSearch(true);
         renderHistory();
+        // C15：对照面板的选择器数据源就是这份列表 → 一变就重画（pick 与 panes 都不受影响，重绘幂等）
+        if (compareState) renderCompare();
+        break;
+
+      case 'compare-set':
+        // C15：⚠️ 浮层已关时**迟到的快照必须丢掉** —— 否则用户关掉面板后它又被画回来
+        // （打开/刷新是异步的，关掉之后那份快照一定还在路上）。
+        if (!compareState) break;
+        compareState.sides = data.sides || {};
+        compareState.panes = data.panes || {};
+        compareState.split = data.split || null;
+        compareState.crosstalk = data.crosstalk || null;
+        compareState.at = data.at || Date.now();
+        compareState.live = !!data.live;
+        // 收到快照 = 这次选择被处理了（被拒也回整份 set）→ 收起选择器，不卡在那一屏
+        compareState.pick = null;
+        compareTailExpanded = { a: false, b: false }; // 新快照复位展开态（同直播面换会话复位）
+        renderCompare();
         break;
 
       case 'search-results':
