@@ -25,6 +25,16 @@ import { randomBytes } from 'crypto';
 /** 请求体大小上限（自家脚本只会发几十字节；超了就是异常流量） */
 const MAX_BODY_BYTES = 256 * 1024;
 
+/**
+ * 命令原文 / 目标路径的入库上限（`str()` 的 `slice(0,max)`）。
+ *
+ * ⚠️ **导出是有原因的**：C16 的白名单按命令**逐字**比对，而截断会让两条不同的超长命令
+ * 变成同一个字符串。判据（`approvalTrust`）必须知道截断线在哪，所以这里的两条上限是
+ * **全仓唯一的定义处** —— 别在别处再写一遍字面量。
+ */
+export const MAX_COMMAND_CHARS = 32 * 1024;
+export const MAX_PATH_CHARS = 4096;
+
 /** 一次待确认的调用（来自 hook 脚本的 POST） */
 export interface ApprovalAsk {
   id: string;
@@ -188,12 +198,12 @@ export class ApprovalServer {
       const parsed = JSON.parse(raw) as Record<string, unknown>;
       const str = (v: unknown, max: number): string | undefined =>
         typeof v === 'string' && v ? v.slice(0, max) : undefined;
-      const command = str(parsed.command, 32 * 1024) ?? '';
+      const command = str(parsed.command, MAX_COMMAND_CHARS) ?? '';
       const ask: ApprovalAsk = {
         id: '',
         toolName: str(parsed.toolName, 128) ?? '',
         command,
-        filePath: str(parsed.filePath, 4096),
+        filePath: str(parsed.filePath, MAX_PATH_CHARS),
         cwd: str(parsed.cwd, 4096),
         toolUseId: str(parsed.toolUseId, 256),
       };

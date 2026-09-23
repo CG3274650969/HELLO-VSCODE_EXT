@@ -1456,6 +1456,19 @@ body.react-live #empty-hint {
   white-space: pre-wrap;
   word-break: break-word;
 }
+/* C16：「永久信任」这一下覆盖什么（含具体的工作区/目录）。比命令原文更弱 —— 它是注解。
+   用 **--dsw-alias-state-warn-primary**（注意是 warn 不是 warning：dsh-live.css 里只定义了
+   前者，写 -warning- 会静默退到 VS Code 的兜底色 —— 上面 .approval-note 就是那个情况，本次不顺手改它） */
+.approval-scope {
+  padding: 5px 8px;
+  border-left: 2px solid var(--dsw-alias-state-warn-primary, var(--vscode-editorWarning-foreground, #d29922));
+  border-radius: 4px;
+  background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.15));
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  font-size: 11px;
+  line-height: 1.5;
+  word-break: break-word;
+}
 .approval-actions {
   display: flex;
   align-items: center;

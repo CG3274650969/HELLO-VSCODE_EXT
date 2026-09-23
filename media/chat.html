@@ -104,8 +104,13 @@
       <pre id="approval-cmd" class="approval-cmd"></pre>
       <!-- C13：模型递上 POSIX 路径时的两读法说明（多行文本，只显示不改写）。无内容时整段隐藏 -->
       <pre id="approval-note" class="approval-note" hidden></pre>
+      <!-- C16：「永久信任」这一下到底覆盖什么（含具体的工作区/目录）。文案由扩展拼好、chat.js
+           用 textContent 落进来 —— **能不能永久信任是扩展判定的**（命令过长/路径解析不出来/
+           盘根/家目录都算不能），不能时这一行与下面那个按钮一起整段隐藏。 -->
+      <div id="approval-scope" class="approval-scope" hidden></div>
       <div class="approval-actions">
         <span class="approval-hint">Esc 拒绝</span>
+        <button id="approval-trust" class="button button-secondary" type="button" hidden></button>
         <button id="approval-deny" class="button button-secondary" type="button">拒绝</button>
         <button id="approval-allow" class="button button-primary" type="button">允许执行</button>
       </div>

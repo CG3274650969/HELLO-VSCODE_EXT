@@ -1578,6 +1578,170 @@ check('C15 结构守卫：CSS 与 chat.html 的形状（影子表达不了布局
   ok(html.indexOf('id="compare-verdict"') > 0 && /\shidden/.test(html.slice(html.indexOf('id="compare-verdict"') - 60, html.indexOf('id="compare-verdict"') + 60)), '#compare-verdict 的 hidden 初值被去掉了 —— 空判定区会占一块位置');
 });
 
+// ---------- C16 · 审批白名单记忆（「永久信任」） ----------
+//
+// 真机看到的是「拦停条上多一个『永久信任此命令/此目录』按钮 + 一行边界说明」。
+// 这里验影子能表达的部分：**能不能提供信任、提供哪一种、文案怎么写，全是扩展说了算**
+// （webview 只画它拿到的那份，不拼字、不推断），点下去回传的粒度原样，
+// 以及四条**不许发生**的事 —— Esc 被反转成信任、「允许执行」被静默升级成永久信任、
+// 下一条审批继承上一条的粒度、老载荷下留一个没字的空按钮。
+
+/** 一份「扩展允许永久信任」的载荷：`kind` 决定是命令档还是目录档 */
+const trustPayload = (id, kind, over = {}) =>
+  Object.assign(
+    {
+      type: 'approval-request',
+      id,
+      toolName: kind === 'dir' ? 'write' : 'bash',
+      command: kind === 'dir' ? 'write D:\\out\\a.ts' : 'rm -rf ./dist',
+      trust: {
+        kind,
+        label: kind === 'dir' ? '永久信任此目录' : '永久信任此命令',
+        scope:
+          kind === 'dir'
+            ? '这个目录及其子目录都不再问（D:\\out）'
+            : '只对这一条命令生效（在 D:\\proj 里）',
+      },
+    },
+    over
+  );
+
+/** 干净的局面：屏上不挂任何一条审批（走真实的两条消息收，不碰内部函数） */
+function resetApproval() {
+  send({ type: 'approval-request', id: 'c16-reset', toolName: 'bash', command: 'echo reset' });
+  send({ type: 'approval-resolved', id: 'c16-reset' });
+  posted.length = 0;
+}
+
+check('C16 拦停条：带 trust 的载荷 ⇒ 按钮与边界说明都出现，文案逐字是扩展给的那份', () => {
+  resetApproval();
+  send(trustPayload('c16-1', 'command'));
+  eq($('approval-bar').hidden, false, '前置条件不成立：条没弹出来');
+  eq($('approval-trust').hidden, false, '扩展说这次能给永久信任，按钮却没画出来');
+  eq($('approval-trust').textContent, '永久信任此命令', '按钮文字不是扩展给的那份 —— 带判定的文案不许在前端拼');
+  eq($('approval-scope').hidden, false, '给了信任却不说明它覆盖什么 —— 那才是这个按钮真正的分量');
+  eq($('approval-scope').textContent, '只对这一条命令生效（在 D:\\proj 里）', '边界说明被改字了');
+});
+
+check('C16 反控：不带 trust 的老载荷 ⇒ 按钮与说明行一起藏起来，且一个字都不留', () => {
+  resetApproval();
+  send({ type: 'approval-request', id: 'c16-2', toolName: 'bash', command: 'rm -rf ./dist' });
+  eq($('approval-trust').hidden, true, '没有 trust 的载荷也把按钮画出来了');
+  eq($('approval-trust').textContent, '', '藏起来了但文字还在 —— 换了显示方式就会漏出一句不属于这条审批的承诺');
+  eq($('approval-scope').hidden, true, '没有 trust 的载荷也把边界说明画出来了');
+  eq($('approval-scope').textContent, '', '藏起来了但说明还在');
+});
+
+check('C16 点「永久信任」⇒ 恰好一条 approval-answer，allow:true 且粒度原样回传', () => {
+  resetApproval();
+  send(trustPayload('c16-3', 'command'));
+  $('approval-trust').click();
+  eq(posted.length, 1, `点一下该只发一条消息，实际 ${posted.length} 条`);
+  const m = posted[0];
+  eq(m.type, 'approval-answer', '发出去的不是审批答复');
+  eq(m.id, 'c16-3', '回的 id 不对 —— 扩展那边会当失效帧静默丢掉，这个按钮就成了摆设');
+  eq(m.allow, true, '点了永久信任却没允许这次执行');
+  eq(m.trust, 'command', '粒度丢了或串成了别的档');
+  eq($('approval-bar').hidden, true, '拍板后条没收起 —— 下一次审批会先闪出上一次的命令');
+});
+
+check('C16 连点只发一条（收起发生在回话之前）', () => {
+  resetApproval();
+  send(trustPayload('c16-4', 'dir'));
+  $('approval-trust').click();
+  $('approval-trust').click();
+  eq(posted.length, 1, `连点第二下又发了一条（共 ${posted.length} 条）—— 扩展侧会拿到两条答复`);
+});
+
+check('C16 dir 档走同一条路（webview 不擅自把粒度改成 command）', () => {
+  resetApproval();
+  send(trustPayload('c16-5', 'dir'));
+  eq($('approval-trust').textContent, '永久信任此目录', 'dir 档的按钮文字不对');
+  $('approval-trust').click();
+  eq(posted.length, 1, '点一下该只发一条消息');
+  eq(posted[0].trust, 'dir', 'dir 档被前端改成了别的粒度 —— 那就成了「我准的是目录、它记下的是命令」或反过来');
+});
+
+check('C16 Esc 仍然是拒绝：allow:false 且**不带 trust**（把拒绝反转成信任是最坏的一种）', () => {
+  resetApproval();
+  send(trustPayload('c16-6', 'command'));
+  pressKey('Escape');
+  eq(posted.length, 1, `Esc 该只发一条消息，实际 ${posted.length} 条`);
+  eq(posted[0].allow, false, 'Esc 没被当成拒绝');
+  ok(!('trust' in posted[0]), 'Esc 的答复里带上了 trust —— 一次拒绝会被记成永久信任');
+  eq($('approval-trust').hidden, true, 'Esc 之后按钮还亮着');
+});
+
+check('C16 点「允许执行」⇒ 只允许这次，答复里不带 trust（不许静默升级）', () => {
+  resetApproval();
+  send(trustPayload('c16-9', 'command'));
+  $('approval-allow').click();
+  eq(posted.length, 1, '点一下该只发一条消息');
+  eq(posted[0].allow, true, '点了允许执行却没允许');
+  ok(!('trust' in posted[0]), '「允许执行」被静默升级成了永久信任 —— 那是替用户按下了另一个按钮');
+});
+
+check('C16 收起即复位：下一条不带 trust 的审批不许继承上一条的按钮文字与说明', () => {
+  resetApproval();
+  send(trustPayload('c16-7', 'dir'));
+  send({ type: 'approval-resolved', id: 'c16-7' });
+  send({ type: 'approval-request', id: 'c16-7b', toolName: 'bash', command: 'echo hi' });
+  eq($('approval-trust').hidden, true, '下一条（不给信任的）审批把上一条的按钮继承下来了');
+  eq($('approval-trust').textContent, '', '按钮藏起来了却还写着上一条的粒度 —— 一旦显示出来就是错的粒度');
+  eq($('approval-scope').hidden, true, '边界说明也被继承了 —— 它会指着一个与这条命令无关的目录');
+});
+
+check('C16 复位后即使按下那个（已隐藏的）按钮，也不会替扩展记下上一条的粒度', () => {
+  resetApproval();
+  send(trustPayload('c16-8', 'dir'));
+  send({ type: 'approval-resolved', id: 'c16-8' });
+  posted.length = 0;
+  send({ type: 'approval-request', id: 'c16-8b', toolName: 'bash', command: 'echo hi' });
+  // 真实用户点不到（hidden），但 DOM 上点得动 —— 这是 check「kind 有没有被复位」唯一的手段
+  $('approval-trust').click();
+  eq(posted.length, 1, `该只发一条（允许这次），实际 ${posted.length} 条`);
+  eq(posted[0].allow, true, '按钮的处理器不认这条审批了');
+  ok(!('trust' in posted[0]), '按下了上一条遗留的按钮，却把 dir 档记到了这条根本无从信任的命令上');
+});
+
+check('C16 结构守卫：#approval-trust 在按钮行里、#approval-scope 另起一行，两者初始 hidden', () => {
+  const html = readFileSync(htmlPath, 'utf8');
+  const actAt = html.indexOf('class="approval-actions"');
+  const actEnd = html.indexOf('</div>', actAt);
+  const btnAt = html.indexOf('id="approval-trust"');
+  ok(actAt > 0 && actEnd > actAt, 'chat.html 里找不到 .approval-actions 的区间');
+  ok(btnAt > actAt && btnAt < actEnd, '#approval-trust 不在 .approval-actions 里 —— 窄侧栏下它会掉出按钮行');
+  ok(/id="approval-trust"[^>]*\shidden(?=[\s/>])/.test(html), '#approval-trust 没写**初始 hidden** —— 老载荷下会留一个没字的空按钮');
+  const scopeAt = html.indexOf('id="approval-scope"');
+  ok(scopeAt > 0, 'chat.html 里没有 #approval-scope（信任的边界没有落点）');
+  ok(scopeAt < actAt || scopeAt > actEnd, '#approval-scope 挤进了 .approval-actions —— 它是整段文本，塞进按钮行会把按钮挤走');
+  ok(/id="approval-scope"[^>]*\shidden(?=[\s/>])/.test(html), '#approval-scope 没写初始 hidden —— 每次审批都会先闪出一块空说明');
+  // 静态标签只能从源码上验（影子不解析 HTML 里的文本节点）：三个按钮读作
+  // 允许执行 / 永久信任… / 拒绝 —— 「允许执行」本来就是「信任这次」，改字只会让既有断言白白重跑
+  ok(
+    /<button[^>]*id="approval-allow"[^>]*>[^<]*允许执行/.test(html),
+    '「允许执行」的标签被改了 —— 它承载的语义是「信任这次」，不是「总是允许」'
+  );
+});
+
+check('C16 CSS 守卫：.approval-scope 走 warn 那套 token（不是 warning）且没写 display', () => {
+  const css = readFileSync(join(repoRoot, 'media', 'chat.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  const block = (sel) => {
+    for (const m of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      if (m[1].split(',').some((s) => s.trim() === sel)) return m[2];
+    }
+    return undefined;
+  };
+  const scope = block('.approval-scope');
+  ok(scope, 'chat.css 里找不到 .approval-scope');
+  ok(/--dsw-alias-state-warn-primary/.test(scope), '.approval-scope 没走 warn 那套 token —— 它和命令原文就只剩字号不一样');
+  ok(
+    !/state-warning-/.test(scope),
+    '.approval-scope 写了 -warning- 那套 token —— dsh-live.css 里没有它，会静默退到 VS Code 兜底色（.approval-note 正是这个情况）'
+  );
+  ok(!/display:/.test(scope), '.approval-scope 里写了 display —— [hidden] 会失效，没信任可说时也占一块位置');
+});
+
 console.log('');
 if (failures.length) {
   console.log(`✗ ${failures.length} 条未过（共 ${passed + failures.length} 条）：`);

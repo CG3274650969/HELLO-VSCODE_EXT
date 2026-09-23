@@ -415,6 +415,165 @@ await check('⑱ 生成的 hook 脚本自身不执行任何东西（只问不跑
   ok(!/\b(spawn|execSync|execFileSync|fork)\s*\(/.test(script), `hook 脚本里出现了进程调用：${RegExp.lastMatch}`);
 });
 
+// ========== 六、C16：白名单命中时，回路一个字节都不用改 ==========
+//
+// C16 的成败点全在**接在哪一处**：`_askNeedsApproval` 返回 false 时服务端直接放行、
+// 根本不调 `_onAsk`（`approvalServer.ts`），所以 hook 脚本、hooks.json、派生配置、令牌
+// 全都不用动 —— 下面 ⑲ 用**真的白名单文件 + 真的 hook 子进程**把这句话走一遍，
+// 而不是靠读源码相信它。㉑-㉔ 则把「判定只有一处」「坏掉只许变成多问」这两条钉在源码上。
+
+const { addTrust, matchTrust, readTrustFile, writeTrustFile } = await load('approvalTrust.js');
+
+/**
+ * 把 C16 接进这条回路：**白名单先说话**（命中 ⇒ 不弹条），不命中照旧走 C1 的 bash 策略。
+ * 与 `_askNeedsApproval` 的前三句逐字对应（`chatViewProvider.ts:2627-2631`）；C4 的区外写那半
+ * 不在本探针的范围内（⑩ 管的是它的理由文案）。
+ */
+function wiredPolicy(trustFile) {
+  return (ask) => {
+    const hit = matchTrust(readTrustFile(trustFile).entries, {
+      toolName: ask.toolName,
+      command: ask.command,
+      cwd: ask.cwd,
+      targetAbs: ask.filePath,
+    });
+    if (hit) return false;
+    return bashPolicy(ask);
+  };
+}
+
+await check('⑲ C16：白名单命中 ⇒ 条根本不弹、脚本一个字不表态（同一条命令第二次真的不再问）', async () => {
+  const file = join(scratch, 'c16-trust.json');
+  const h = await harness({ shouldAsk: wiredPolicy(file) });
+  const first = h.run(bashPayload(DANGEROUS, 'tu-19'));
+  const ask = await waitForAsk(h);
+  eq(ask.cwd, 'D:/ws', 'cwd 没透传 —— 键的另一半就没了，记下的信任会绑到空工作区上');
+  // 模拟用户在条上点了「永久信任此命令」
+  const added = addTrust(readTrustFile(file).entries, { toolName: 'bash', command: ask.command, cwd: ask.cwd }, 'command', Date.now());
+  ok(added.ok, `记不下这条信任：${added.ok ? '' : added.reason}`);
+  writeTrustFile(file, added.entries);
+  h.server.answer(ask.id, true);
+  await first;
+
+  const again = await h.run(bashPayload(DANGEROUS, 'tu-19b'));
+  eq(again.stdout, '', '被信任的命令被表态了 —— 放行必须一个字都不输出');
+  eq(again.code, 0, 'hook 退出码非 0');
+  eq(h.asks.length, 1, `同一条命令第二次又弹了条（asks=${h.asks.length}）—— 记了等于没记`);
+  // F2：被白名单**静默放行**的那次照样进 onObserved ⇒ C4 的轮前快照没漏（放行不等于隐身）
+  eq(h.observed.length, 2, '白名单放行的那次没进 onObserved —— 区外写的可见性会跟着丢');
+});
+
+/**
+ * 表里放一条信任（`seed`），然后在 `run` 的条件下跑一次，返回**弹没弹条**。
+ * 种子与实跑分开写是必须的：「同一条命令换一个工作区」那一条只有让两边的 cwd 不同才验得出来
+ * （第一版把两者写成同一个参数，于是它测的是「同一个工作区命中」—— 永远绿，什么都没验）。
+ *
+ * 两种结果都要能测出来：命中时不弹（正控，否则下面三条绿的全不作数）、不命中时必弹。
+ */
+async function askedWithSeed(seed, run, tag) {
+  const file = join(scratch, `c16-trust-${tag}.json`);
+  const h = await harness({ shouldAsk: wiredPolicy(file) });
+  const added = addTrust([], { toolName: 'bash', command: seed.command, cwd: seed.cwd }, 'command', Date.now());
+  ok(added.ok, '表里的种子信任没建起来 —— 这次断言会变成空转');
+  writeTrustFile(file, added.entries);
+  const p = h.run({ tool_name: 'bash', tool_input: { command: run.command }, tool_use_id: `tu-${tag}`, cwd: run.cwd });
+  // 「弹没弹」用**两个真实结局**赛跑，不用定时器：要问 ⇒ hook 会一直挂着等答复（waitForAsk 赢）；
+  // 不问 ⇒ 服务端当场放行、hook 自己退出（进程结束赢）。写成「等 900ms 看有没有」会随机器负载
+  // 假红（变异测试那一轮就撞上过：编译在跑，900ms 内连 spawn 都没起来）。
+  const asked = await Promise.race([
+    // 第二个回调是必须的：两个分支都会留下一个悬着的 waitForAsk，没人接它的拒绝就是
+    // 一个 unhandled rejection，整个探针会当场死掉。
+    waitForAsk(h, 1, 8000).then(() => true, () => false),
+    p.then(() => false, () => false),
+  ]);
+  if (asked) h.server.answer(h.asks[0].id, true); // 别让 hook 挂在那儿等
+  await p;
+  return asked;
+}
+
+await check('⑳ C16：白名单只认那一条 —— 逐字精确、cwd 是键的一半、表非空绝不等于全放行', async () => {
+  const OTHER = 'rm -f -- ./另一个文件.txt';
+  const ws = { command: DANGEROUS, cwd: 'D:/ws' };
+  eq(
+    await askedWithSeed(ws, ws, 'hit'),
+    false,
+    '正控：亲手信任过的那条命令居然还弹条 —— 这条要是红的，下面三条绿的都不作数'
+  );
+  eq(
+    await askedWithSeed({ command: OTHER, cwd: 'D:/ws' }, ws, 'other'),
+    true,
+    '表里有一条别的信任就把这条放过了 —— 那等于「表非空即全放行」'
+  );
+  eq(
+    await askedWithSeed(ws, { command: DANGEROUS, cwd: 'D:/other' }, 'cwd'),
+    true,
+    '同一条命令换到另一个工作区不再问了 —— cwd 没被当成键的一半'
+  );
+  eq(
+    await askedWithSeed(ws, { command: 'rm -f --  ./destructive_test_workspace.txt', cwd: 'D:/ws' }, 'space'),
+    true,
+    '多一个空格被当成了同一条命令 —— 逐字精确退化成了折叠空白'
+  );
+});
+
+await check('㉑ C16：白名单接在 `_askNeedsApproval` 的第一句 —— 接在别处就是「先弹条，事后才想起信任过」', () => {
+  const lines = readFileSync(join(repoRoot, 'src', 'chatViewProvider.ts'), 'utf8').split(/\r?\n/);
+  const def = lines.findIndex((l) => l.includes('private _askNeedsApproval('));
+  ok(def >= 0, '找不到 _askNeedsApproval 的定义');
+  const head = lines.slice(def, def + 3).join('\n');
+  ok(/if \(this\._isTrusted\(ask\)\) return false;/.test(head), `_askNeedsApproval 的开头不是白名单：\n${head}`);
+});
+
+await check('㉒ C16：判定只有一处 —— 命中走 matchTrust、能不能给走 offerTrust、包含判定走 isInsideDir', () => {
+  const src = readFileSync(join(repoRoot, 'src', 'chatViewProvider.ts'), 'utf8').replace(/\r\n/g, '\n');
+  const bodyOf = (sig) => {
+    const at = src.indexOf(sig);
+    ok(at > 0, `找不到 ${sig}`);
+    const open = src.indexOf('{', at);
+    let depth = 0;
+    for (let i = open; i < src.length; i++) {
+      if (src[i] === '{') depth++;
+      else if (src[i] === '}' && --depth === 0) return src.slice(open, i + 1);
+    }
+    return '';
+  };
+  const trusted = bodyOf('private _isTrusted(');
+  ok(/matchTrust\(/.test(trusted), '_isTrusted 没走 matchTrust —— 判据在第二处长了一份');
+  ok(!/includes\(|startsWith\(/.test(trusted), '_isTrusted 里自己写起了匹配 —— 逐字精确只准有一处实现');
+  ok(/offerTrust\(/.test(bodyOf('private _offerTrust(')), '_offerTrust 没走 offerTrust —— 「能不能给」会在两处各判一次');
+  const inside = bodyOf('private _isInside(');
+  ok(/isInsideDir\(/.test(inside), '_isInside 没委派给 changeForecast.isInsideDir —— 包含判定有了第二份实现');
+  ok(!/startsWith\(/.test(inside), '_isInside 里写了 startsWith —— D:\\proj2 会被 D:\\proj 骗过');
+});
+
+await check('㉓ C16：白名单坏掉时降级方向只能是「多问」—— 纯模块不带 vscode，判定失败一律 false', () => {
+  const pure = readFileSync(join(repoRoot, 'src', 'approvalTrust.ts'), 'utf8');
+  ok(!/from 'vscode'|require\('vscode'\)/.test(pure), 'approvalTrust.ts import vscode 了 —— 判据又变回「只有肉眼能验」（C10b 的教训）');
+  const src = readFileSync(join(repoRoot, 'src', 'chatViewProvider.ts'), 'utf8').replace(/\r\n/g, '\n');
+  const at = src.indexOf('private _isTrusted(');
+  const body = src.slice(at, src.indexOf('\n  }', at));
+  ok(/return false;/.test(body), '_isTrusted 的失败路径没有 return false —— 读盘出错会变成「全放行」');
+  ok(!/return true;/.test(body), '_isTrusted 里出现了 return true —— 有分支会把没命中的情况放行');
+});
+
+await check('㉔ C16：记不记得住不改变这次允许 —— 先回话、再记盘，且记盘失败只写留痕', () => {
+  const src = readFileSync(join(repoRoot, 'src', 'chatViewProvider.ts'), 'utf8').replace(/\r\n/g, '\n');
+  const at = src.indexOf('private _answerApproval(');
+  ok(at > 0, '找不到 _answerApproval 的定义');
+  const body = src.slice(at, src.indexOf('\n  }', at));
+  const trustAt = body.indexOf('_createTrust(');
+  const answerAt = body.indexOf('this._approval?.answer(');
+  ok(trustAt > 0, '_answerApproval 里没有 _createTrust —— 点「永久信任」什么都不会被记下');
+  ok(answerAt > 0, '_answerApproval 里没有回话 —— 条点了不会收');
+  ok(trustAt < answerAt, '_answerApproval 先记盘再回话 —— 写盘慢/失败会把用户已经点下的放行卡在后面');
+  // _createTrust 只到它自己的右花括号（按到下一个方法名切会把 _answerApproval 一起吞进来，
+  // 那一版的 "allow" 是隔壁方法的，判据会永远假红）
+  const createAt = src.indexOf('private _createTrust(');
+  ok(createAt > 0, '找不到 _createTrust 的定义');
+  const create = src.slice(createAt, src.indexOf('\n  }', createAt));
+  ok(!/allow/.test(create), '_createTrust 里出现了 allow —— 记信任这件事不许反过来改这次放不放行');
+});
+
 // ---------- 收尾 ----------
 
 console.log('');

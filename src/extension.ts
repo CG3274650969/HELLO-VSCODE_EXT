@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { NEW_CHAT_COMMAND, VIEW_ID } from './protocol';
+import { FORGET_TRUST_COMMAND, NEW_CHAT_COMMAND, VIEW_ID } from './protocol';
 import { ChatViewProvider } from './chatViewProvider';
 
 // VS Code 加载插件后，会先调用 activate()。
@@ -26,7 +26,12 @@ export function activate(context: vscode.ExtensionContext) {
   const configureDsh = vscode.commands.registerCommand('hello.dsh.configure', () => {
     void chatProvider.configureDsh();
   });
-  context.subscriptions.push(registerChatView, newChat, configureDsh, chatProvider);
+  // C16：审批白名单的撤销入口（列出 / 逐条 / 全部清除）。信任是「点一下给出去的权限」，
+  // 撤销路径必须存在且好找 —— 放在命令面板，而不是只藏在那个 JSON 文件里。
+  const forgetApprovalTrust = vscode.commands.registerCommand(FORGET_TRUST_COMMAND, () => {
+    void chatProvider.forgetApprovalTrust();
+  });
+  context.subscriptions.push(registerChatView, newChat, configureDsh, forgetApprovalTrust, chatProvider);
 
   // ---- 命令 1：弹一个招呼 ----
   const sayHello = vscode.commands.registerCommand('hello.sayHello', () => {

@@ -60,8 +60,22 @@ import {
   isForecastTool,
   parseToolArgs,
   resolveTargetPath,
+  isInsideDir,
   ForecastIO,
 } from './changeForecast';
+import {
+  addTrust,
+  describeTrust,
+  matchTrust,
+  offerTrust,
+  readTrustFile,
+  removeTrust,
+  TrustEntry,
+  TrustOffer,
+  TrustQuery,
+  TRUST_FILE_NAME,
+  writeTrustFile,
+} from './approvalTrust';
 import {
   EFFORT_VALUES,
   EffortPluginMount,
@@ -481,6 +495,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** C13：挂起审批的路径两读法说明（id → note）。**与 `_approvalCmds` 分开存** ——
    *  它只在 POSIX 形态的 write/edit 上才有，而 `_approvalCmds` 每条都必须有（留痕要用） */
   private readonly _approvalNotes = new Map<string, string>();
+  /** C16：挂起审批的**原样载荷**（id → ask）。`ApprovalServer._pending` 只留结算器，
+   *  而建「永久信任」需要命令原文/目标路径 ⇒ 这里补一份，`_onApprovalResolved` 里删。 */
+  private readonly _approvalAsks = new Map<string, ApprovalAsk>();
+  /** C16：这一答记没记住（id → 说明）。走下一条同样的通道并进留痕，不另推一条 note */
+  private readonly _approvalTrustNotes = new Map<string, string>();
+  /** C16：白名单读不下去的告警是否已弹过（每次 activation 最多一句） */
+  private _trustWarned = false;
   /** 审批相关告警是否已弹过（每次 activation 最多烦用户一次） */
   private _approvalWarned = false;
   /**
@@ -841,7 +862,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case 'approval-answer':
         // C1：确认条上的允许/拒绝；对已失效的 id 静默忽略（超时/已答过）
-        this._approval?.answer(msg.id, msg.allow);
+        // C16：带 trust 时先记白名单 —— **记不记得住都不改变这次允许**（见 _createTrust）
+        this._answerApproval(msg.id, msg.allow, msg.trust);
         break;
       case 'run-panel':
         // C9：浮层开着才把详情随读数一起发（关掉时不必回发 —— 前端自己就把面板收了）
@@ -2574,14 +2596,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return resolveTargetPath(ask.filePath, this._sessionWorkspaceRoot(ask));
   }
 
-  /** target 是否落在 root 之内（含 root 自身）。win32 下 path.relative 已做大小写归一。
-   *  **绝不用 startsWith 比前缀**：`C:\proj2` 会被 `C:\proj` 骗过。 */
+  /** target 是否落在 root 之内（含 root 自身）。
+   *  C16 起**委派**给 `changeForecast.isInsideDir`：审批白名单的目录档用的是同一条包含判定，
+   *  两处各写一份迟早会漂成「这边算区外、那边算已信任」。规则一个字没改（多了一条
+   *  「target 为空 → false」的兜底，本类的调用点都先判过非空，等于没变）。 */
   private _isInside(target: string, root: string): boolean {
-    if (!root) return false;
-    const rel = path.relative(path.resolve(root), path.resolve(target));
-    if (!rel) return true; // 就是根本身
-    if (path.isAbsolute(rel)) return false; // 不同盘符 → relative 返回绝对路径
-    return rel !== '..' && !rel.startsWith('..' + path.sep);
+    return isInsideDir(target, root);
   }
 
   /** 平台临时区内的路径（DSH 沙箱也刻意放行那里；temp churn 不该进审阅，也不该弹条）。 */
@@ -2602,8 +2622,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /**
    * 审批策略（注入给 ApprovalServer 的谓词，每次现读）。
    * bash 走 C1 的正则清单；write/edit 走 C4 的越界判定；其余工具不表态。
+   * C16：白名单先说话 —— 命中就是「用户已经准过这一条」，直接放行、连条都不弹。
    */
   private _askNeedsApproval(ask: ApprovalAsk): boolean {
+    if (this._isTrusted(ask)) return false;
     if (ask.toolName === 'bash') {
       return matchesAnyPattern(this._approvalPatterns(), ask.command);
     }
@@ -3091,6 +3113,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _onApprovalAsk(ask: ApprovalAsk): void {
     const label = this._approvalLabel(ask);
     this._approvalCmds.set(ask.id, label);
+    // C16：留一份原样载荷（结算时删）——建「永久信任」要用它取命令原文/目标路径
+    this._approvalAsks.set(ask.id, ask);
     // C13：POSIX 形态的路径多给一段两读法说明（只显示，不改写，也不给按钮）
     const pathNote = this._approvalPathNote(ask);
     if (pathNote) this._approvalNotes.set(ask.id, pathNote);
@@ -3101,6 +3125,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       toolName: ask.toolName,
       command: label,
       pathNote,
+      // C16：「能不能永久信任」由扩展判定（命令过长 / 路径解析不出来 / 盘根 / 家目录都算不能），
+      // 不能就不带这个字段 —— 前端照着画，自己不做判断
+      trust: this._offerTrust(ask),
     });
     // 视图折叠着就看不到确认条，只能干等到超时 → 主动把它亮出来（失败也不影响流程）
     vscode.commands.executeCommand('hello.chatView.focus').then(undefined, () => {});
@@ -3111,8 +3138,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _onApprovalResolved(id: string, outcome: ApprovalOutcome): void {
     const command = this._approvalCmds.get(id);
     this._approvalCmds.delete(id);
+    this._approvalAsks.delete(id);
     const pathNote = this._approvalNotes.get(id);
     this._approvalNotes.delete(id);
+    const trustNote = this._approvalTrustNotes.get(id);
+    this._approvalTrustNotes.delete(id);
     this._post({ type: 'approval-resolved', id, outcome });
     if (!command) return;
     const label =
@@ -3125,7 +3155,151 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             : '审批已取消（本轮停止或切换），未执行';
     // C13：留痕里带上那句「按 DSH 的解析方式会落到 X」—— 事后再看转写时，这是唯一能解释
     // 「我明明写的是 /mnt/d/x，为什么盘上多了一个 D:\mnt\d\x」的地方
-    this._pushNote(`${label}：${oneLine(command, 120)}${pathNote ? `（${oneLine(pathNote, 160)}）` : ''}`);
+    // C16：这条信任记没记住也写在同一行里 —— 「点过永久信任」这件事**必须留痕**，
+    // 否则事后没人知道那条命令是从哪一刻起不再受拦的
+    this._pushNote(
+      `${label}：${oneLine(command, 120)}${pathNote ? `（${oneLine(pathNote, 160)}）` : ''}` +
+        `${trustNote ? `；${oneLine(trustNote, 200)}` : ''}`
+    );
+  }
+
+  // ---------- C16 审批白名单记忆（「永久信任」） ----------
+
+  /**
+   * 白名单文件：扩展 globalStorage 顶层，与 `sessions.json` 并列。
+   *
+   * **为什么不放进 VS Code 设置**（这是本次一个已拍板的决定）：设置那条路会让扩展开始
+   * 改写用户的 `settings.json`（那个文件里可能有明文 API key），而且 `array` 只能存字符串，
+   * 带不了「在哪个工作区、什么时候给的」。放文件里还能让用户直接看、直接删。
+   */
+  private _trustFilePath(): string {
+    return path.join(this._storageDir, TRUST_FILE_NAME);
+  }
+
+  /**
+   * 现在盘上的白名单。**每次现读、不缓存** —— 于是手改/手删那个文件即时生效
+   * （F5 有一条就是「删掉文件，下一次又弹条」），也省掉一处会与盘上不一致的内存态。
+   */
+  private _trustEntries(): TrustEntry[] {
+    const file = this._trustFilePath();
+    const { entries, corrupt } = readTrustFile(file);
+    // 文件在、内容非空、却一条都解不出来 ⇒ 多半是手改坏了。**只提示一次**，且只影响提示：
+    // 判定这时早就退回「每次都问」了（fail closed），不会因为读不懂就放行任何东西。
+    if (corrupt && !this._trustWarned) {
+      this._trustWarned = true;
+      console.warn('[approval] 白名单文件解析不出任何条目，按「没有信任」处理：', file);
+      void vscode.window.showWarningMessage(
+        '审批白名单文件无法解析，已按「没有任何信任」处理：每条仍会照常询问，不会有命令被静默放行。'
+      );
+    }
+    return entries;
+  }
+
+  /** 一次审批里参与白名单判定的那几样（**路径在这里解析**，纯模块不认识 `ApprovalAsk`） */
+  private _trustQuery(ask: ApprovalAsk): TrustQuery {
+    return {
+      toolName: ask.toolName,
+      command: ask.command,
+      cwd: ask.cwd,
+      targetAbs: this._fsTargetAbs(ask),
+    };
+  }
+
+  /**
+   * C16 的**单一咽喉**：这条审批是否已经被「永久信任」过。命中 ⇒ 不弹条、静默放行
+   * （`ApprovalServer` 直接回 allow，`_onAsk` 根本不会被调用）。
+   *
+   * ⚠️ 这条路**只许少给功能，不许拦住调用**：任何判不出来的情况一律当「没信任」（照常弹条）。
+   * 白名单是为了少打断人，不是为了多拦人 —— 反过来兜底会把一次读盘异常变成「所有 rm 都被拒」。
+   */
+  private _isTrusted(ask: ApprovalAsk): boolean {
+    try {
+      return matchTrust(this._trustEntries(), this._trustQuery(ask)) !== undefined;
+    } catch (err) {
+      console.log('[approval] trust match failed:', (err as Error)?.message ?? err);
+      return false;
+    }
+  }
+
+  /** 这条审批能提供哪种「永久信任」（不能就 undefined ⇒ 前端不画那个按钮） */
+  private _offerTrust(ask: ApprovalAsk): TrustOffer | undefined {
+    try {
+      return offerTrust(this._trustQuery(ask));
+    } catch (err) {
+      console.log('[approval] trust offer failed:', (err as Error)?.message ?? err);
+      return undefined;
+    }
+  }
+
+  /**
+   * 用户在确认条上点了「永久信任…」。**记不记得住都不改变这次允许** —— 点击的语义是允许，
+   * 白名单只是附加动作，所以这里的每一条失败路径都只往留痕里写一句，绝不改判。
+   *
+   * 粒度要**重算一遍**（`addTrust` 内部就是对 `offerTrust` 的复算）：webview 传来的东西
+   * 不是可信输入，一个被改过的 `approval-answer` 不能凭空造出「信任整个目录」。
+   */
+  private _createTrust(id: string, kind: 'command' | 'dir'): void {
+    const ask = this._approvalAsks.get(id);
+    if (!ask) return; // 迟到的点击（已经超时/取消/答过）—— 静默忽略
+    const r = addTrust(this._trustEntries(), this._trustQuery(ask), kind, Date.now());
+    if (!r.ok) {
+      this._approvalTrustNotes.set(id, `未能记住（${r.reason}）`);
+      return;
+    }
+    try {
+      writeTrustFile(this._trustFilePath(), r.entries);
+    } catch (err) {
+      // 写盘失败（目录没了/盘满）同样不影响这次放行
+      this._approvalTrustNotes.set(id, `未能记到盘上（${(err as Error)?.message ?? err}）`);
+      return;
+    }
+    this._approvalTrustNotes.set(
+      id,
+      `已永久信任 ${describeTrust(r.entry)} —— 可在命令面板「AlohaDSH: 查看/清除审批白名单」里撤销`
+    );
+  }
+
+  /** 确认条上的一答（C16 起可能附带「永久信任」）。 */
+  private _answerApproval(id: string, allow: boolean, trust?: 'command' | 'dir'): void {
+    if (allow && (trust === 'command' || trust === 'dir')) this._createTrust(id, trust);
+    this._approval?.answer(id, allow);
+  }
+
+  /**
+   * 命令面板入口：列出白名单、逐条或全部清除。零依赖（`showQuickPick` 是 VS Code 自带的）。
+   *
+   * 落点选这里而不是「确认条上常驻一个入口」：确认条是**拦停态**，塞管理入口会分心；
+   * 而信任是「点一下给出去的权限」，撤销路径也不能只藏在文件里。
+   */
+  async forgetApprovalTrust(): Promise<void> {
+    const entries = this._trustEntries();
+    if (!entries.length) {
+      void vscode.window.showInformationMessage(
+        '审批白名单是空的 —— 目前没有任何「永久信任」，每条都会照常询问。'
+      );
+      return;
+    }
+    type Item = vscode.QuickPickItem & { target?: TrustEntry | 'all' };
+    const items: Item[] = [
+      { label: '$(trash) 全部清除', description: `共 ${entries.length} 条`, target: 'all' },
+      ...entries.map((e) => ({ label: describeTrust(e), target: e as TrustEntry })),
+    ];
+    const picked = await vscode.window.showQuickPick(items, {
+      title: `审批白名单（${entries.length} 条）`,
+      placeHolder: '选中一条即撤销它 —— 撤销后它的下一次会重新询问',
+    });
+    const target = picked?.target;
+    if (!target) return;
+    const next = target === 'all' ? [] : removeTrust(entries, target);
+    try {
+      writeTrustFile(this._trustFilePath(), next);
+    } catch (err) {
+      void vscode.window.showErrorMessage(`写审批白名单失败：${(err as Error)?.message ?? err}`);
+      return;
+    }
+    void vscode.window.showInformationMessage(
+      target === 'all' ? `已清除全部 ${entries.length} 条信任` : `已撤销：${describeTrust(target)}`
+    );
   }
 
   /** 审批相关告警：控制台始终留痕，用户侧每次 activation 只弹一次（不刷屏）。 */

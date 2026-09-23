@@ -107,7 +107,12 @@
   var approvalTool = document.getElementById('approval-tool');
   var approvalAllowBtn = document.getElementById('approval-allow');
   var approvalDenyBtn = document.getElementById('approval-deny');
+  // C16：「永久信任」按钮 + 它的边界说明行。**能不能出现由扩展决定** —— 载荷不带 trust
+  // 就是不能（命令过长 / 路径解析不出来 / 盘根 / 家目录），那时两个都藏起来。
+  var approvalTrustBtn = document.getElementById('approval-trust');
+  var approvalScope = document.getElementById('approval-scope');
   var approvalId = null;
+  var approvalTrustKind = null; // 亮着的这一条能提供哪种永久信任（'command' | 'dir' | null）
   var expandedRel = null; // 当前展开 diff 的审阅项 id（同刻只开一行；键用 id 不用 rel，C4 起可跨根）
 
   // C8「继续」条：扩展 retry-offer 驱动显隐（on = 上一轮以中断/出错收场）。
@@ -315,6 +320,14 @@
     // 反控也在这儿：不带 pathNote 的老载荷走同一行代码，得到的就是 hidden
     approvalNote.textContent = data.pathNote || '';
     approvalNote.hidden = !data.pathNote;
+    // C16：「永久信任」这一下覆盖什么。**文案与可不可能都由扩展给**（带判定的文案不在前端拼），
+    // 不带 trust 的老载荷走同一行代码 → 按钮与说明行一起藏起来
+    var trust = data.trust;
+    approvalTrustKind = trust && trust.kind ? trust.kind : null;
+    approvalTrustBtn.textContent = trust ? trust.label || '' : '';
+    approvalTrustBtn.hidden = !approvalTrustKind;
+    approvalScope.textContent = trust ? trust.scope || '' : '';
+    approvalScope.hidden = !approvalTrustKind;
     approvalBar.hidden = false;
     scrollToBottom();
   }
@@ -327,17 +340,31 @@
     approvalNote.textContent = '';
     approvalNote.hidden = true;
     approvalTool.textContent = '';
+    // C16：一起复位。它与 renderApproval 里那五行的**无条件赋值**互为备份（2026-09-22 变异测试
+    // 逐条确认过）：拆掉这里 ⇒ Esc 之后按钮还亮着，被抓红；只把 renderApproval 改成「有 trust 才
+    // 赋值」⇒ 一条都不红（复位兜着）；两处一起拆才红（下一条审批会继承上一条的粒度）。
+    // 也就是说：这一处是有判据盯着的，而那半边是无条件的兜底 —— 别只删一边就以为还安全。
+    approvalTrustKind = null;
+    approvalTrustBtn.textContent = '';
+    approvalTrustBtn.hidden = true;
+    approvalScope.textContent = '';
+    approvalScope.hidden = true;
   }
 
   /**
    * 用户在确认条上拍板。先收起再回话：按钮立即失效，避免连点发出两条答复
    * （扩展侧对失效 id 也会静默忽略，两头都不怕重复）。
+   *
+   * `trust`（C16）只在点「永久信任…」时非空 —— 扩展侧会拿这次审批**重算一遍**粒度，
+   * 对不上就不记（比如 dir 档要求目标路径能解析出来）。**记不记得住都不改变这次允许。**
    */
-  function answerApproval(allow) {
+  function answerApproval(allow, trust) {
     if (!approvalId) return;
     var id = approvalId;
     clearApproval();
-    post({ type: 'approval-answer', id: id, allow: !!allow });
+    var msg = { type: 'approval-answer', id: id, allow: !!allow };
+    if (allow && trust) msg.trust = trust;
+    post(msg);
   }
 
   // ---------- C8「继续」条（retry-offer 驱动） ----------
@@ -2949,6 +2976,11 @@
     });
     approvalDenyBtn.addEventListener('click', function () {
       answerApproval(false);
+    });
+    // C16：「永久信任…」= 允许 + 记住。粒度取**画这条时**记下的那个值（不是此刻的 DOM），
+    // 所以两条审批之间不会串味
+    approvalTrustBtn.addEventListener('click', function () {
+      answerApproval(true, approvalTrustKind);
     });
 
     // ---- 2.1 改动审阅：审阅条 / 浮层面板 ----

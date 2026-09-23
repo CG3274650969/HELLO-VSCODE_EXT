@@ -78,6 +78,24 @@ export function resolveTargetPath(raw: unknown, base: string): string | undefine
   return b ? path.resolve(path.join(b, s)) : undefined;
 }
 
+/**
+ * `target` 是否落在 `root` 之内（含 root 自身）。C16 起这**一条**实现同时供两处用：
+ * ① 工作区边界（`_isOutsideWorkspace` 那个「区外」判定）② 审批白名单的目录档。
+ * 两处必须永远是同一条规则 —— 各写一份迟早会漂成「这边算区外、那边算已信任」。
+ *
+ * **绝不用 `startsWith` 比前缀**：`C:\proj2` 会被 `C:\proj` 骗过。win32 下 `path.relative`
+ * 已做大小写归一；不同盘符时它返回绝对路径，那就是「不包含」。
+ */
+export function isInsideDir(target: unknown, root: unknown): boolean {
+  const r = String(root ?? '').trim();
+  const t = String(target ?? '').trim();
+  if (!r || !t) return false;
+  const rel = path.relative(path.resolve(r), path.resolve(t));
+  if (!rel) return true; // 就是根本身
+  if (path.isAbsolute(rel)) return false; // 不同盘符 → relative 返回绝对路径
+  return rel !== '..' && !rel.startsWith('..' + path.sep);
+}
+
 /** 注入的 IO：探针给假实现，扩展宿主里用真盘（**判据与实现分离**）。 */
 export interface ForecastIO {
   /** 现在盘上的文本；不存在 / 二进制 / 超大 / 读失败 ⇒ undefined。缺省 = 一律说不出来。 */

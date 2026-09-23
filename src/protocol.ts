@@ -16,6 +16,11 @@ export const VIEW_ID = 'hello.chatView';
 /** 命令：新建对话 */
 export const NEW_CHAT_COMMAND = 'hello.chat.newChat';
 
+/** C16 命令：查看 / 清除审批白名单（「永久信任」的撤销入口）。
+ *  ⚠️ 这份字符串必须与 package.json `contributes.commands` 里那条一字不差
+ *  —— 不然命令面板里就没有它（自检里有一条钉着这个对应关系）。 */
+export const FORGET_TRUST_COMMAND = 'hello.chat.forgetApprovalTrust';
+
 export type MsgStatus = 'streaming' | 'done' | 'error' | 'interrupted';
 
 /** 顶部模式：内嵌聊天 / harness（恒为 DSH 直播）。两套会话完全独立。 */
@@ -335,6 +340,12 @@ export type ExtToWebview =
        * 只有拿得到 hook 载荷里的 `cwd` 才算得出来 —— 缺了就不带这个字段。
        */
       pathNote?: string;
+      /**
+       * C16：这一条能不能「永久信任」——**能不能由扩展判定**，webview 只负责画拿到的东西
+       * （命令过长、目标路径解析不出来、目录是盘根/家目录，都算不能，那时不带这个字段，
+       * 拦停条上就不出现那个按钮）。带判定的文案都在扩展侧拼好，同 C15 的分工线。
+       */
+      trust?: { kind: 'command' | 'dir'; label: string; scope: string };
     }
   /** 这条审批有结果了：收起确认条（允许/拒绝/超时/取消） */
   | { type: 'approval-resolved'; id: string; outcome: ApprovalOutcome }
@@ -427,8 +438,12 @@ export type WebviewToExt =
   // 「在新对话中分支」：真 DSH ChatView 轮尾动作栏的分支按钮点击（无参数；MVP 固定
   // fork 整份当前会话 → 新会话保留全部转写并切换过去，记忆沿用源 DSH 会话）。
   | { type: 'fork-session' }
-  /** C1：用户在确认条上拍了板（allow=true 允许执行；对失效的 id 扩展会静默忽略） */
-  | { type: 'approval-answer'; id: string; allow: boolean }  /** C9：运行检查器浮层开/关。开着才把 `details` 随 `runs` 一起下发（体积控制）。 */
+  /** C1：用户在确认条上拍了板（allow=true 允许执行；对失效的 id 扩展会静默忽略）。
+   *  C16：`trust` 只在 `allow:true` 时有意义 —— 表示这一答还附带「记住它」。
+   *  ⚠️ **webview 不是可信输入**：扩展侧会拿这次审批重算一遍可提供的粒度，对不上就不记
+   *  （照样允许，只是没记住）。 */
+  | { type: 'approval-answer'; id: string; allow: boolean; trust?: 'command' | 'dir' }
+  /** C9：运行检查器浮层开/关。开着才把 `details` 随 `runs` 一起下发（体积控制）。 */
   | { type: 'run-panel'; open: boolean }
   /** C15：打开/刷新分支对照浮层。**幂等**（面板开着时再点 = 重新取一份快照）。
    *
