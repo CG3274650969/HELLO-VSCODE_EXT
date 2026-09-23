@@ -53,6 +53,11 @@
         "command": "hello.dsh.configure",
         "title": "配置 DSH 运行路径",
         "category": "AlohaDSH"
+      },
+      {
+        "command": "hello.chat.forgetApprovalTrust",
+        "title": "查看/清除审批白名单（「永久信任」的命令与目录）",
+        "category": "AlohaDSH"
       }
     ],
     "configuration": [
@@ -164,7 +169,7 @@
           "hello.chat.approval.enabled": {
             "type": "boolean",
             "default": true,
-            "markdownDescription": "**事前审批**（**默认开启**）：命中下方策略的 bash 命令、以及越出工作区的写文件/改文件，在**执行前**弹确认条，整轮暂停等你点「允许执行 / 拒绝」；拒绝则该调用不会执行，转写里留一条记录。实现方式是在 DSH 组合配置里挂一条 `PreToolUse` hook（派生配置写在扩展存储目录，不改动你的 cordis.yml）。不需要这道护栏就把这里关掉。\n\n**关掉它会连带关掉「工作区外改动」的可见性** —— 那条 hook 是唯一的传感器。另外注意它**只覆盖 bash 与 write/edit 工具**：agent 用 bash 命令（`cp`/`mv`/重定向）写到工作区外时既不弹条、也不会出现在审阅里（见 `hello.chat.approval.outsideWorkspace` 说明）。\n\n改这个开关后需重连（切模型或重载窗口）才生效；`patterns` / `timeoutSec` / `outsideWorkspace` 改动即时生效。若 `hello.dsh.command` 整段覆盖了启动命令，则此功能不可用（会提示）。\n\n**Pre-execution approval** (on by default): matching bash commands, plus file writes outside the workspace, raise a confirm bar before running. Turning this off also disables outside-workspace change visibility (the hook is the only sensor). Covers `bash` and `write`/`edit` only — writes made by a bash command are neither gated nor reviewed. Requires a reconnect after toggling.",
+            "markdownDescription": "**事前审批**（**默认开启**）：命中下方策略的 bash 命令、以及越出工作区的写文件/改文件，在**执行前**弹确认条，整轮暂停等你点「允许执行 / 拒绝」；拒绝则该调用不会执行，转写里留一条记录。实现方式是在 DSH 组合配置里挂一条 `PreToolUse` hook（派生配置写在扩展存储目录，不改动你的 cordis.yml）。不需要这道护栏就把这里关掉。\n\n**关掉它会连带关掉「工作区外改动」的可见性** —— 那条 hook 是唯一的传感器。另外注意它**只覆盖 bash 与 write/edit 工具**：agent 用 bash 命令（`cp`/`mv`/重定向）写到工作区外时既不弹条、也不会出现在审阅里（见 `hello.chat.approval.outsideWorkspace` 说明）。\n\n不想整条正则地放开、又不想每条都点：拦停条上还有**永久信任**。bash 条给的是「永久信任此命令」、写文件/改文件条给的是「永久信任此目录」，点了之后落进扩展存储目录的 `approval-trust.json`。**匹配是逐字精确的** —— bash 的键是「命令原文 + 当时的工作区」，一个字符都不归一化，所以模型换个写法（哪怕只多一个空格）仍会再问一次，这是有意的。每个永久信任在转写里各留一条痕。撤销走命令面板的 `AlohaDSH: 查看/清除审批白名单（「永久信任」的命令与目录）`，也可以直接编辑或删掉那个 JSON 文件 —— **它是唯一真相**，删掉即退回「每次都问」。文件损坏或被删只会让你多被问几次，**永远不会变成全放行**。\n\n**Trust a command/directory permanently**: the confirm bar offers 「永久信任此命令」 (bash) and 「永久信任此目录」 (write/edit), stored in `approval-trust.json` under the extension's global storage. Matching is byte-exact — a bash trust is keyed to (command, workspace), so a differently-written command asks again. Revoke via the command palette (`AlohaDSH: 查看/清除审批白名单…`) or by editing/deleting that JSON file, which is the single source of truth. A missing or corrupt file degrades to asking every time, never to allowing everything.\n\n改这个开关后需重连（切模型或重载窗口）才生效；`patterns` / `timeoutSec` / `outsideWorkspace` 改动即时生效。若 `hello.dsh.command` 整段覆盖了启动命令，则此功能不可用（会提示）。\n\n**Pre-execution approval** (on by default): matching bash commands, plus file writes outside the workspace, raise a confirm bar before running. Turning this off also disables outside-workspace change visibility (the hook is the only sensor). Covers `bash` and `write`/`edit` only — writes made by a bash command are neither gated nor reviewed. Requires a reconnect after toggling.",
             "scope": "window"
           },
           "hello.chat.approval.outsideWorkspace": {

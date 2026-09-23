@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { NEW_CHAT_COMMAND, VIEW_ID } from './protocol';
+import { FORGET_TRUST_COMMAND, NEW_CHAT_COMMAND, VIEW_ID } from './protocol';
 import { ChatViewProvider } from './chatViewProvider';
 
 // VS Code 加载插件后，会先调用 activate()。
@@ -15,6 +15,9 @@ export function activate(context: vscode.ExtensionContext) {
     context.workspaceState, // C12：本项目激活的 agent profile（**每工作区**，且不落任何用户文件）
     context.secrets // live 后端从密钥库取 DEEPSEEK_API_KEY（无则回退读 credentialsFile）
   );
+  // C17：启动时补扫一次图片落盘目录（7 天存活期）。只贴过一张图就再没贴过的用户，
+  // 光靠「下次落盘时顺带扫」永远等不到那一次 —— 启动是确定性事件，放这里刚好补上。
+  chatProvider.sweepImageAttachments();
   const registerChatView = vscode.window.registerWebviewViewProvider(VIEW_ID, chatProvider, {
     // 不保留隐藏 webview 的上下文：折叠后内容销毁，靠扩展侧 snapshot 重建（省内存）
     webviewOptions: { retainContextWhenHidden: false },
@@ -26,7 +29,12 @@ export function activate(context: vscode.ExtensionContext) {
   const configureDsh = vscode.commands.registerCommand('hello.dsh.configure', () => {
     void chatProvider.configureDsh();
   });
-  context.subscriptions.push(registerChatView, newChat, configureDsh, chatProvider);
+  // C16：审批白名单的撤销入口（列出 / 逐条 / 全部清除）。信任是「点一下给出去的权限」，
+  // 撤销路径必须存在且好找 —— 放在命令面板，而不是只藏在那个 JSON 文件里。
+  const forgetApprovalTrust = vscode.commands.registerCommand(FORGET_TRUST_COMMAND, () => {
+    void chatProvider.forgetApprovalTrust();
+  });
+  context.subscriptions.push(registerChatView, newChat, configureDsh, forgetApprovalTrust, chatProvider);
 
   // ---- 命令 1：弹一个招呼 ----
   const sayHello = vscode.commands.registerCommand('hello.sayHello', () => {

@@ -10,6 +10,7 @@
  * - **Markdown = 给人看的转写**。它是**忠实转储、不做转义**：正文里以 `#` 开头的一行会被
  *   渲染成标题。这是有意的（转义会把代码片段改得面目全非），代价写在文档里。
  */
+import { formatBytes } from './imageAttach';
 import type { Attachment, ChatMessage } from './protocol';
 import type { StoredSession } from './sessionStore';
 
@@ -83,6 +84,12 @@ function titleLine(title: string): string {
 
 function attachmentLine(a: Attachment): string {
   const flags: string[] = [];
+  if (a.kind === 'image') {
+    // C17：点明「图片」并带上大小。**理由不只是好看**：附件正文（`content`）本来就不进导出，
+    // 于是图片附件与普通附件在这里长得一模一样 —— 而图片是唯一一类**模型根本没看见内容**的
+    // 附件，读导出的人有权知道这一条。
+    flags.push(typeof a.bytes === 'number' ? `图片 ${formatBytes(a.bytes)}` : '图片');
+  }
   if (a.selection) {
     flags.push('编辑器选区');
   }

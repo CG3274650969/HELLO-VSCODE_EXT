@@ -16,6 +16,11 @@ export const VIEW_ID = 'hello.chatView';
 /** 命令：新建对话 */
 export const NEW_CHAT_COMMAND = 'hello.chat.newChat';
 
+/** C16 命令：查看 / 清除审批白名单（「永久信任」的撤销入口）。
+ *  ⚠️ 这份字符串必须与 package.json `contributes.commands` 里那条一字不差
+ *  —— 不然命令面板里就没有它（自检里有一条钉着这个对应关系）。 */
+export const FORGET_TRUST_COMMAND = 'hello.chat.forgetApprovalTrust';
+
 export type MsgStatus = 'streaming' | 'done' | 'error' | 'interrupted';
 
 /** 顶部模式：内嵌聊天 / harness（恒为 DSH 直播）。两套会话完全独立。 */
@@ -33,20 +38,45 @@ export interface FileRef {
   name: string;
   /** 绝对路径（能拿到时才有；浏览器拖拽/粘贴的文件没有） */
   path?: string;
-  /** 已读出的文本内容（拖拽/粘贴时由 webview 先读出） */
+  /** 已读出的文本内容（拖拽/粘贴时由 webview 先读出）。
+   *  ⚠️ **图片附件永不带这个字段** —— 见下方 `dataBase64` 的注释。 */
   content?: string;
   /** 1.1 自动附选区注入的引用（非手动附件）：content = 编辑器缓冲里选中的确切文本（dirty 未保存
    *  也含）。组包时把它落成临时文件、只发 `@"临时文件"` chip → 原生 DSH 气泡保持干净（chip + 用户
    *  手打的话），agent 打开文件读到精确的选中行。写盘失败才回退内联摘录。 */
   selection?: boolean;
+  /** C17：普通文件还是图片。缺省 = `'file'`（老 webview 不带这个字段，一切照旧）。 */
+  kind?: 'file' | 'image';
+  /** C17：图片的 MIME（只可能是上游认的那四种，见 `imageAttach.IMAGE_MEDIA_TYPES`）。
+   *  **扩展侧不信这个值**：落盘时拿解出来的字节重新嗅探一遍（webview 不是可信输入）。 */
+  mediaType?: string;
+  /** C17：图片的原始字节数（webview 侧的 `file.size`；仅用于展示）。 */
+  bytes?: number;
+  /**
+   * C17：图片字节的 base64（**不含 `data:` 前缀**）。
+   *
+   * ⚠️ 这是 **webview → 扩展的单向字段**：在 `_resolveAttachments` 里被消费掉（落盘成文件），
+   * **绝不进 `Attachment`**。整份 `attachments` 会**原样落进 `sessions*.json`**，而用户提示词正文
+   * 没有任何上限 —— 一次贴图就能把会话存储写成几十 MB。
+   */
+  dataBase64?: string;
+  /**
+   * 内容超限被截断。**C17 从 `Attachment` 上移到这里**：webview 自己也会截断（`MAX_CHIP_TEXT`），
+   * 这个标记本来该由它发上来，扩展侧才好补一句「已截断」—— 而旧协议只允许扩展侧产出它，
+   * 于是 webview 截过的那一段在扩展侧看起来是完好的（今天真实存在的一个缺陷）。
+   */
+  truncated?: boolean;
 }
 
 /** 读取/整理后的附件：带大小截断或读取失败的标记。 */
 export interface Attachment extends FileRef {
-  /** 内容超限被截断 */
-  truncated?: boolean;
-  /** 读取失败原因（存在则 content 为空） */
+  /** 读取失败原因（存在则 content 为空）。**图片的失败原因走它**：超限 / 不是可用图片 /
+   *  二进制非文本，三条各有各的话（今天它们全都说成「文件过大（>10KB）」或干脆说成乱码）。 */
   readError?: string;
+  /** C17：图片附件**发给模型的那段说明文字**（路径 + 「当前模型不支持图片输入、你看不到它」）。
+   *  组包时优先用它；缺省则由 `imageAttach.imageNote` 现算 —— 两个模式（live / chat）都读这里，
+   *  不许各说各的话。 */
+  note?: string;
 }
 
 /** 一条对话消息。id 由扩展签发，全局唯一（带会话前缀），webview 只消费。
@@ -335,9 +365,58 @@ export type ExtToWebview =
        * 只有拿得到 hook 载荷里的 `cwd` 才算得出来 —— 缺了就不带这个字段。
        */
       pathNote?: string;
+      /**
+       * C16：这一条能不能「永久信任」——**能不能由扩展判定**，webview 只负责画拿到的东西
+       * （命令过长、目标路径解析不出来、目录是盘根/家目录，都算不能，那时不带这个字段，
+       * 拦停条上就不出现那个按钮）。带判定的文案都在扩展侧拼好，同 C15 的分工线。
+       */
+      trust?: { kind: 'command' | 'dir'; label: string; scope: string };
     }
   /** 这条审批有结果了：收起确认条（允许/拒绝/超时/取消） */
-  | { type: 'approval-resolved'; id: string; outcome: ApprovalOutcome };
+  | { type: 'approval-resolved'; id: string; outcome: ApprovalOutcome }
+  /** C15 分支对照：一份**只读快照**（打开 / 换侧 / 点刷新时才发，没有持续推送）。
+   *
+   *  全字段可选 —— 旧 webview 见到不认的 type 直接忽略，不会炸（同 `forecast` 的约定）。
+   *
+   *  **分工线**（防两边各写一套）：**带判定的文案（`split` / `crosstalk`）扩展侧拼好**
+   *  （那是判据 + level）；**纯排版（`title · 此后 N 条 · 时间`）webview 侧拼**
+   *  —— 后者只是把 payload 里已有的字段摆出来。 */
+  | {
+      type: 'compare-set';
+      /** 两侧**当前选中的会话 id**（**不是**「解出来了」的意思）。选择器要靠它置灰「本侧/对侧」，
+       *  而解不出来的那一侧在 `panes` 里是缺的 —— 两个概念必须分开。 */
+      sides?: { a?: string; b?: string };
+      panes?: { a?: ComparePane; b?: ComparePane };
+      split?: { shared: number; aAfter: number; bAfter: number; kind: 'same' | 'fork' | 'none'; line: string; title: string };
+      /** 串话标注。`level: 'warn'` **只**由 `shared` 一档产生（无关会话不许出警示）。 */
+      crosstalk?: { line: string; title: string; level: 'ok' | 'warn' };
+      /** 快照时刻（epoch ms） */
+      at?: number;
+      /** 快照落下时那一轮还在跑 ⇒ 面板头要说「此后两侧的新消息不会进来」。 */
+      live?: boolean;
+    };
+
+/**
+ * C15 对照里的一侧。**只有分叉点之后的尾段** —— 共同前缀两侧逐字相同，不发也不渲染
+ * （要全文用「导出会话」）。
+ */
+export interface ComparePane {
+  id: string;
+  title: string;
+  /** 已**冻结**的尾段（`streaming`→`interrupted`、`running`→`unknown`，见 sessionStore.freezeTranscript）。
+   *  冻结是为了与「真打开这条会话」看到的一致。 */
+  messages: ChatMessage[];
+  /** 这一侧共同前缀的条数。 */
+  shared: number;
+  /** 共同前缀那句说明（判定的部分扩展侧拼好，webview 只排版）。 */
+  sharedNote: string;
+  /** 尾段里被冻结的条数；>0 时 `frozenNote` 一并给出。 */
+  frozen: number;
+  frozenNote?: string;
+  /** 只显示用（判据在 `crosstalk` 里），面板头写「DSH 会话 a1b2…」。 */
+  dshId?: string;
+  updatedAt: number;
+}
 
 /** C1 一条审批的最终去向（与 src/approvalServer.ts 的 ApprovalOutcome 同构） */
 export type ApprovalOutcome = 'allowed' | 'rejected' | 'timeout' | 'cancelled';
@@ -384,7 +463,18 @@ export type WebviewToExt =
   // 「在新对话中分支」：真 DSH ChatView 轮尾动作栏的分支按钮点击（无参数；MVP 固定
   // fork 整份当前会话 → 新会话保留全部转写并切换过去，记忆沿用源 DSH 会话）。
   | { type: 'fork-session' }
-  /** C1：用户在确认条上拍了板（allow=true 允许执行；对失效的 id 扩展会静默忽略） */
-  | { type: 'approval-answer'; id: string; allow: boolean }
+  /** C1：用户在确认条上拍了板（allow=true 允许执行；对失效的 id 扩展会静默忽略）。
+   *  C16：`trust` 只在 `allow:true` 时有意义 —— 表示这一答还附带「记住它」。
+   *  ⚠️ **webview 不是可信输入**：扩展侧会拿这次审批重算一遍可提供的粒度，对不上就不记
+   *  （照样允许，只是没记住）。 */
+  | { type: 'approval-answer'; id: string; allow: boolean; trust?: 'command' | 'dir' }
   /** C9：运行检查器浮层开/关。开着才把 `details` 随 `runs` 一起下发（体积控制）。 */
-  | { type: 'run-panel'; open: boolean };
+  | { type: 'run-panel'; open: boolean }
+  /** C15：打开/刷新分支对照浮层。**幂等**（面板开着时再点 = 重新取一份快照）。
+   *
+   *  ⚠️ 有意**没有** `compare-close`：扩展对面板的开合**无状态**（快照只在打开/换侧/刷新时发，
+   *  不像 `runs` 那样持续推送，所以不需要「开着吗」这个闸）。面板关了不必告诉扩展 ——
+   *  不是漏了。 */
+  | { type: 'compare-open' }
+  /** C15：换某一侧的会话。`side` 只有两侧（`'a'` 左 / `'b'` 右）—— 不做第三栏。 */
+  | { type: 'compare-pick'; side: 'a' | 'b'; sessionId: string };

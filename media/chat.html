@@ -48,6 +48,11 @@
     </div>
     <div class="header-actions">
       <button id="history-btn" class="link-button" title="历史会话">历史</button>
+      <!-- C15：分支对照的入口。放 header 而不是 composer：composer 里那四条 bar 都是「本轮的读数/
+           动作」，而对照是**跨会话**的；且 composer 已挤着模型/档位/profile/配置 DSH/API 五样东西。
+           恒显示、不按「有没有第二条会话」隐藏 —— 要等有对手才出现的入口等于没有入口（C9 的老调），
+           没有对手时面板自己解释。 -->
+      <button id="compare-btn" class="link-button" title="把两条会话的转写并排对照（只读）">对照</button>
       <button id="new-chat-btn" class="link-button" title="开始新对话">新建对话</button>
     </div>
     <!-- 必须挂在 header 内：absolute 的定位基准是最近的 position:relative 祖先 -->
@@ -99,8 +104,13 @@
       <pre id="approval-cmd" class="approval-cmd"></pre>
       <!-- C13：模型递上 POSIX 路径时的两读法说明（多行文本，只显示不改写）。无内容时整段隐藏 -->
       <pre id="approval-note" class="approval-note" hidden></pre>
+      <!-- C16：「永久信任」这一下到底覆盖什么（含具体的工作区/目录）。文案由扩展拼好、chat.js
+           用 textContent 落进来 —— **能不能永久信任是扩展判定的**（命令过长/路径解析不出来/
+           盘根/家目录都算不能），不能时这一行与下面那个按钮一起整段隐藏。 -->
+      <div id="approval-scope" class="approval-scope" hidden></div>
       <div class="approval-actions">
         <span class="approval-hint">Esc 拒绝</span>
+        <button id="approval-trust" class="button button-secondary" type="button" hidden></button>
         <button id="approval-deny" class="button button-secondary" type="button">拒绝</button>
         <button id="approval-allow" class="button button-primary" type="button">允许执行</button>
       </div>
@@ -280,6 +290,39 @@
     <div id="runs-list" class="rp-scroll"></div>
     <div class="rp-actions">
       <span id="runs-panel-note" class="runs-note"></span>
+    </div>
+  </div>
+
+  <!-- C15 分支对照浮层：body 直系子元素（绝不放进 #messages —— react-live 时被 display:none）。
+       容器与头部复用 .review-panel / .rp-* 的配方（同 #runs-panel）。
+       ⚠️ 现在是**三个**同层（z-index 40）满屏浮层互斥：chat.js 在任何一个 open 时把另外两个 close。 -->
+  <div id="compare-panel" class="review-panel">
+    <div class="rp-head">
+      <span class="rp-title">分支对照</span>
+      <span id="compare-panel-sub" class="rp-sub"></span>
+      <button id="compare-refresh" class="link-button" type="button" title="重新取一份快照（两侧都重读）">刷新</button>
+      <button id="compare-panel-close" class="link-button" type="button" title="关闭">✕</button>
+    </div>
+    <!-- 判定的文案由扩展侧拼好（判据 + level），这里只排版。用 hidden 显隐 —— chat.css 顶部有
+         [hidden]{display:none!important} 兜底，所以下面那块里的 display:flex 压不掉它。 -->
+    <div id="compare-verdict" class="cmp-verdict" hidden></div>
+    <div class="cmp-body">
+      <section class="cmp-pane">
+        <div class="cmp-pane-head">
+          <span class="cmp-side">左</span>
+          <button id="compare-pick-a" class="link-button cmp-pick" type="button" title="换这一侧的会话">选择会话</button>
+          <span id="compare-meta-a" class="cmp-meta"></span>
+        </div>
+        <div id="compare-transcript-a" class="cmp-transcript"></div>
+      </section>
+      <section class="cmp-pane">
+        <div class="cmp-pane-head">
+          <span class="cmp-side">右</span>
+          <button id="compare-pick-b" class="link-button cmp-pick" type="button" title="换这一侧的会话">选择会话</button>
+          <span id="compare-meta-b" class="cmp-meta"></span>
+        </div>
+        <div id="compare-transcript-b" class="cmp-transcript"></div>
+      </section>
     </div>
   </div>
 

@@ -109,6 +109,43 @@ export function capToolInput(text: string): string {
 }
 
 /**
+ * C15：把一份转写里「还在跑」的两个状态**就地冻结**成终态 —— 助手消息的 `streaming` 落成
+ * `interrupted`，工具消息的 `running` 落成 `unknown`。返回被改动的**条数**（同一条两个字段都
+ * 改也只算 1 条）。
+ *
+ * 这是「打开一条不会再续跑的会话时，线上残留状态该怎么收」的**唯一规则**。两个调用方：
+ *   · `_openSession` —— 打开历史会话（C15 之前这段逻辑就内联在那里，本次原样搬出来）；
+ *   · C15 的分支对照 —— 面板里渲染的每一侧都要跟「真打开那条会话」逐字一致，否则用户在
+ *     面板里看到的和点进去看到的会是两张脸。
+ *
+ * ⚠️ 两个 `if` **不是 else 关系**：一条工具消息若同时带着 `status:'streaming'`，两个字段都该改。
+ *   别「顺手」把它改成 else —— 那会漏掉一半。
+ *
+ * ⚠️ `unknown` 不是随口挑的：落盘的 `running` 意味着那条 `tool/result` 从没到过（进程被杀 /
+ *   窗口关掉），**跑没跑完不可知**。判成失败是谎报 —— 会让人去重试一条可能已经生效的命令
+ *   （同 `_finishTurn` 那条注释）。`interrupted` 同理：是「没跑完」，不是「失败」。
+ *
+ * 放在本文件（而不是 `chatViewProvider`）同 `capToolInput` 的理由：那个文件 `import vscode`，
+ * probe 加载不了 —— 而这条规则正是 C15 最需要机验的一块。
+ */
+export function freezeTranscript(messages: ChatMessage[]): number {
+  let frozen = 0;
+  for (const m of messages) {
+    let touched = false;
+    if (m.status === 'streaming') {
+      m.status = 'interrupted';
+      touched = true;
+    }
+    if (m.role === 'tool' && m.toolState === 'running') {
+      m.toolState = 'unknown';
+      touched = true;
+    }
+    if (touched) frozen++;
+  }
+  return frozen;
+}
+
+/**
  * C8c：构造期的加载结局。纯模块不能 `import vscode`，所以这里只**陈述事实**，
  * 由 `chatViewProvider._checkStorageHealth()` 翻译成用户可见的告警。
  *

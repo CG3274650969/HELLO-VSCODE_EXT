@@ -914,8 +914,12 @@ async function main() {
   if (toolName === 'bash') {
     const command = typeof input.command === 'string' ? input.command : ''
     if (!command) return
+    // cwd 是 DSH 给的会话工作区。**bash 也要带上**：C16 的白名单键是 (command, cwd) 二元组，
+    // 少了这一半，「同一条 rm 在另一个工作区」就会被静默放行（探针 ⑳ 就是为这条红的）。
+    // C1/C4/C13 都不看 bash 的 cwd（区外写与 POSIX 两读法只走 write/edit），所以这是纯增量。
+    const cwd = typeof payload.cwd === 'string' ? payload.cwd : ''
     const res = url
-      ? await ask(url, token, { toolName: 'bash', command: command, toolUseId: payload.tool_use_id }, timeoutMs)
+      ? await ask(url, token, { toolName: 'bash', command: command, cwd: cwd, toolUseId: payload.tool_use_id }, timeoutMs)
       : null
     if (res && typeof res.decision === 'string') {
       if (res.decision === 'deny') {

@@ -107,7 +107,12 @@
   var approvalTool = document.getElementById('approval-tool');
   var approvalAllowBtn = document.getElementById('approval-allow');
   var approvalDenyBtn = document.getElementById('approval-deny');
+  // C16：「永久信任」按钮 + 它的边界说明行。**能不能出现由扩展决定** —— 载荷不带 trust
+  // 就是不能（命令过长 / 路径解析不出来 / 盘根 / 家目录），那时两个都藏起来。
+  var approvalTrustBtn = document.getElementById('approval-trust');
+  var approvalScope = document.getElementById('approval-scope');
   var approvalId = null;
+  var approvalTrustKind = null; // 亮着的这一条能提供哪种永久信任（'command' | 'dir' | null）
   var expandedRel = null; // 当前展开 diff 的审阅项 id（同刻只开一行；键用 id 不用 rel，C4 起可跨根）
 
   // C8「继续」条：扩展 retry-offer 驱动显隐（on = 上一轮以中断/出错收场）。
@@ -135,6 +140,37 @@
   var runsDetails = null; // RunRecord[]；**只在面板开着时**扩展才下发
   var runsPanelOpen = false;
 
+  // ---------- C15 分支对照浮层 ----------
+  var comparePanel = document.getElementById('compare-panel');
+  var comparePanelSub = document.getElementById('compare-panel-sub');
+  var compareVerdict = document.getElementById('compare-verdict');
+  var compareRefresh = document.getElementById('compare-refresh');
+  var comparePanelClose = document.getElementById('compare-panel-close');
+  var compareBtn = document.getElementById('compare-btn');
+  /** 两侧的 DOM 引用（'a' = 左 / 'b' = 右）。 */
+  var compareEls = {
+    a: {
+      transcript: document.getElementById('compare-transcript-a'),
+      meta: document.getElementById('compare-meta-a'),
+      pick: document.getElementById('compare-pick-a'),
+    },
+    b: {
+      transcript: document.getElementById('compare-transcript-b'),
+      meta: document.getElementById('compare-meta-b'),
+      pick: document.getElementById('compare-pick-b'),
+    },
+  };
+  /**
+   * 面板状态。⚠️ **`null` 就是「关着」** —— 不另起一个布尔（同 reviewPanelOpen 那条教训：
+   * 两个标志必然漂移，而漂移的表现是「面板关着却还在吃消息」或反过来）。
+   */
+  var compareState = null;
+  /**
+   * 两侧尾段的折叠展开态。**每个落点自己的** —— 直播面那个 `foldExpanded` 是单例，
+   * 共用一个的话在对照栏点「显示」会把直播面也展开（探针有反控钉着这条串台）。
+   */
+  var compareTailExpanded = { a: false, b: false };
+
   // 顶部模式：chat（内嵌聊天）/ harness（Agent）。两种模式各一套草稿与待发附件，互不串。
   var modeTabs = Array.prototype.slice.call(document.querySelectorAll('.mode-tab'));
   var currentMode = 'harness'; // mode-set 到达前的占位，扩展回执后纠正为真正模式（默认 harness）
@@ -146,6 +182,18 @@
   /** id -> 该条消息的 DOM 记录；text 字段是本端对当前可见文本的唯一累积处 */
   var byId = new Map();
   var atBottom = true; // 用户是否接近底部（决定要不要抢滚）
+
+  /**
+   * C15：**渲染落点** —— 一份转写画到哪儿、记录进哪张表。
+   *
+   * 直播面就是模块单例（`messagesEl` + `byId`）。C15 的对照面板每次渲染现建一个**一次性**落点
+   * （见 `compareSink`）：两条会话的消息 id 各带自己的 uuid，撞名不会发生，但把一个「属于别会话
+   * 的 id」塞进 `byId`，就等于给迟到帧（assistant-delta / tool-result）开了一扇门。
+   *
+   * `reactLive: true` = 这个落点受「真组件接管时不建 DOM」的门规约束。对照面板是 `false` ——
+   * 它恰恰**要**在 react-live 下照画（那是它选「全屏浮层」这个形态的唯一理由，C14 刚栽过）。
+   */
+  var LIVE_SINK = { container: messagesEl, registry: byId, reactLive: true };
 
   // 历史会话：扩展下发的列表摘要 + 当前活动会话 id
   var sessions = [];
@@ -272,6 +320,14 @@
     // 反控也在这儿：不带 pathNote 的老载荷走同一行代码，得到的就是 hidden
     approvalNote.textContent = data.pathNote || '';
     approvalNote.hidden = !data.pathNote;
+    // C16：「永久信任」这一下覆盖什么。**文案与可不可能都由扩展给**（带判定的文案不在前端拼），
+    // 不带 trust 的老载荷走同一行代码 → 按钮与说明行一起藏起来
+    var trust = data.trust;
+    approvalTrustKind = trust && trust.kind ? trust.kind : null;
+    approvalTrustBtn.textContent = trust ? trust.label || '' : '';
+    approvalTrustBtn.hidden = !approvalTrustKind;
+    approvalScope.textContent = trust ? trust.scope || '' : '';
+    approvalScope.hidden = !approvalTrustKind;
     approvalBar.hidden = false;
     scrollToBottom();
   }
@@ -284,17 +340,31 @@
     approvalNote.textContent = '';
     approvalNote.hidden = true;
     approvalTool.textContent = '';
+    // C16：一起复位。它与 renderApproval 里那五行的**无条件赋值**互为备份（2026-09-22 变异测试
+    // 逐条确认过）：拆掉这里 ⇒ Esc 之后按钮还亮着，被抓红；只把 renderApproval 改成「有 trust 才
+    // 赋值」⇒ 一条都不红（复位兜着）；两处一起拆才红（下一条审批会继承上一条的粒度）。
+    // 也就是说：这一处是有判据盯着的，而那半边是无条件的兜底 —— 别只删一边就以为还安全。
+    approvalTrustKind = null;
+    approvalTrustBtn.textContent = '';
+    approvalTrustBtn.hidden = true;
+    approvalScope.textContent = '';
+    approvalScope.hidden = true;
   }
 
   /**
    * 用户在确认条上拍板。先收起再回话：按钮立即失效，避免连点发出两条答复
    * （扩展侧对失效 id 也会静默忽略，两头都不怕重复）。
+   *
+   * `trust`（C16）只在点「永久信任…」时非空 —— 扩展侧会拿这次审批**重算一遍**粒度，
+   * 对不上就不记（比如 dir 档要求目标路径能解析出来）。**记不记得住都不改变这次允许。**
    */
-  function answerApproval(allow) {
+  function answerApproval(allow, trust) {
     if (!approvalId) return;
     var id = approvalId;
     clearApproval();
-    post({ type: 'approval-answer', id: id, allow: !!allow });
+    var msg = { type: 'approval-answer', id: id, allow: !!allow };
+    if (allow && trust) msg.trust = trust;
+    post(msg);
   }
 
   // ---------- C8「继续」条（retry-offer 驱动） ----------
@@ -336,9 +406,10 @@
   }
 
   function openReviewPanel() {
-    // C9：与运行检查器浮层互斥（两个同层满屏浮层同时开着没有视觉仲裁）。
-    // 函数声明会提升，这里直接调没问题；它自带 `!runsPanelOpen` 早退，重复调用无害。
+    // C9/C15：与另外两个同层满屏浮层互斥（同时开着没有视觉仲裁）。
+    // 函数声明会提升，这里直接调没问题；两个都自带早退，重复调用无害。
     closeRunsPanel();
+    closeComparePanel();
     reviewPanelOpen = true;
     reviewPanel.classList.add('open');
     renderReviewList();
@@ -1405,8 +1476,9 @@
   }
 
   function openRunsPanel() {
-    // 与审阅浮层互斥：两个同层（z-index 40）满屏浮层同时开着没有视觉仲裁
+    // 与另外两个同层（z-index 40）满屏浮层互斥：同时开着没有视觉仲裁
     closeReviewPanel();
+    closeComparePanel();
     runsPanelOpen = true;
     runsPanel.classList.add('open');
     post({ type: 'run-panel', open: true }); // 扩展据此把 details 一起发下来
@@ -1418,6 +1490,190 @@
     runsPanelOpen = false;
     runsPanel.classList.remove('open');
     post({ type: 'run-panel', open: false });
+  }
+
+  // ---------- C15 分支对照浮层 ----------
+
+  /**
+   * 对照面板的一次性落点（见 LIVE_SINK 的说明）。
+   *
+   * ⚠️ 绝不能写进 `byId` —— 那是**直播面**的表，assistant-delta / tool-result / forecast 都按 id
+   * 去那里取记录。两条会话的 id 各自带 uuid，撞名不会发生；但把一个「属于别会话的 id」塞进去，
+   * 就等于给迟到帧开了一扇门。
+   *
+   * `reactLive: false` 正是「在 react-live 下也照画」—— 那是这个浮层选全屏形态的**唯一理由**。
+   */
+  function compareSink(container) {
+    return { container: container, registry: new Map(), reactLive: false };
+  }
+
+  function openComparePanel() {
+    // 三个同层（z-index 40）满屏浮层互斥：同时开着没有视觉仲裁
+    closeReviewPanel();
+    closeRunsPanel();
+    compareState = { sides: {}, panes: {}, split: null, crosstalk: null, at: 0, live: false, pick: null };
+    compareTailExpanded = { a: false, b: false };
+    comparePanel.classList.add('open');
+    renderCompare(); // 先画「载入中…」（postMessage 是异步的）
+    post({ type: 'compare-open' });
+  }
+
+  function closeComparePanel() {
+    if (!compareState) return;
+    compareState = null;
+    comparePanel.classList.remove('open');
+  }
+
+  function renderCompare() {
+    if (!compareState) return;
+    comparePanelSub.textContent = compareState.at
+      ? '快照 ' + fmtTime(compareState.at) + (compareState.live ? ' · 取快照时那一轮仍在跑，此后的新消息不会进来' : '')
+      : '';
+    renderCompareVerdict();
+    renderComparePane('a');
+    renderComparePane('b');
+  }
+
+  /**
+   * 判定区两行（分叉点 + 串话）。⚠️ **文案与警示等级都由扩展侧拼好**（判据在 branchCompare.ts），
+   * 这里只排版 —— 两边各写一套判据必然漂移，而这条漂移的代价是「警示有时候不出现」。
+   */
+  function renderCompareVerdict() {
+    compareVerdict.textContent = '';
+    var items = [];
+    if (compareState.split) items.push({ text: compareState.split.line, title: compareState.split.title, warn: false });
+    if (compareState.crosstalk) {
+      items.push({
+        text: compareState.crosstalk.line,
+        title: compareState.crosstalk.title,
+        warn: compareState.crosstalk.level === 'warn',
+      });
+    }
+    compareVerdict.hidden = items.length === 0;
+    for (var i = 0; i < items.length; i++) {
+      var el = document.createElement('div');
+      el.className = 'cmp-verdict-line' + (items[i].warn ? ' warn' : '');
+      el.textContent = items[i].text;
+      el.title = items[i].title || '';
+      compareVerdict.appendChild(el);
+    }
+  }
+
+  /** 重画一栏。`pick === side` 时这一栏整体让给选择器（就地换内容，不用浮层菜单）。 */
+  function renderComparePane(side) {
+    var els = compareEls[side];
+    var box = els.transcript;
+    var keep = box.scrollTop;
+    // ⚠️ 清法**不是** removeAllMessages()：那个刻意只删 .msg / .msg-fold、保留 #messages 里的
+    // 空态提示节点（对照栏没有那个节点），在对照栏里它什么都删不掉。
+    box.textContent = '';
+
+    if (compareState.pick === side) {
+      els.meta.textContent = '选择会话…';
+      renderComparePicker(side, box);
+      box.scrollTop = keep;
+      return;
+    }
+
+    var pane = compareState.panes[side];
+    if (!pane) {
+      var empty = document.createElement('div');
+      empty.className = 'rp-empty';
+      // ⚠️ 三个状态必须分开说，别糊成一句：
+      //   ① 还没收到任何快照（at 为 0）—— postMessage 的这几毫秒，不是「没数据」；
+      //   ② 选中了一条但解不出来（已删 / 已空）；
+      //   ③ 压根还没选。
+      empty.textContent = !compareState.at
+        ? '载入中…'
+        : compareState.sides[side]
+          ? '这条会话已被删除或清空 —— 点上面「选择会话」换一条'
+          : '还没有可对照的会话 —— 点上面「选择会话」挑一条';
+      box.appendChild(empty);
+      els.meta.textContent = '';
+      box.scrollTop = keep;
+      return;
+    }
+
+    var meta = pane.title + ' · 此后 ' + pane.messages.length + ' 条';
+    if (pane.frozen > 0) meta += ' · 冻结 ' + pane.frozen + ' 条';
+    els.meta.textContent = meta;
+    els.meta.title =
+      (pane.dshId ? 'DSH 会话 ' + pane.dshId + '\n' : '') +
+      '最后更新 ' + fmtTime(pane.updatedAt) +
+      (pane.frozenNote ? '\n' + pane.frozenNote : '') +
+      '\n（只读快照；要全文用「导出会话」）';
+
+    // 共同前缀不渲染正文（两侧逐字相同）—— 只留一句说明 + 一条分叉线。
+    var shared = document.createElement('div');
+    shared.className = 'cmp-shared';
+    shared.textContent = pane.sharedNote;
+    box.appendChild(shared);
+    var fork = document.createElement('div');
+    fork.className = 'cmp-fork';
+    fork.textContent = pane.shared > 0 ? '分叉点之后' : '双方各自的全部';
+    box.appendChild(fork);
+
+    renderTranscriptInto(pane.messages, compareTailExpanded[side], compareSink(box), function () {
+      compareTailExpanded[side] = true;
+      renderComparePane(side);
+    });
+    box.scrollTop = keep;
+  }
+
+  /**
+   * 就地换掉这一栏的内容，列一列可选会话。数据源是 webview 侧那个 `sessions`
+   * （由 history-update 维护）—— 扩展侧 `_sendHistory` 的 `active()` 过滤 = 在列且有内容，
+   * 正好就是可对照的集合（一处实现，不另推一份）。
+   */
+  function renderComparePicker(side, box) {
+    var selfId = compareState.sides[side];
+    var otherId = compareState.sides[side === 'a' ? 'b' : 'a'];
+    var list = document.createElement('div');
+    list.className = 'cmp-list';
+    if (!sessions.length) {
+      var empty = document.createElement('div');
+      empty.className = 'rp-empty';
+      empty.textContent = '没有其它会话可选 —— 先「新建对话」，或从历史里挑一条。';
+      box.appendChild(empty);
+      return;
+    }
+    for (var i = 0; i < sessions.length; i++) {
+      var s = sessions[i];
+      var row = document.createElement('div');
+      row.className = 'lc-model-item cmp-item';
+      var name = document.createElement('span');
+      name.className = 'lc-mi-name';
+      name.textContent = s.title || '（未命名）';
+      row.appendChild(name);
+      var tag = document.createElement('span');
+      tag.className = 'cmp-item-here';
+      if (s.id === selfId) tag.textContent = '本侧';
+      else if (s.id === otherId) tag.textContent = '对侧';
+      else tag.textContent = fmtTime(s.updatedAt);
+      row.appendChild(tag);
+      if (s.id === selfId || s.id === otherId) {
+        // ⚠️ 置灰的行**连监听都不挂** —— 「灰了还能点出消息」是比不置灰更坏的一种
+        // （C11/C12 同款，探针里有反控）。
+        row.classList.add('disabled');
+      } else {
+        addComparePick(row, side, s.id);
+      }
+      list.appendChild(row);
+    }
+    box.appendChild(list);
+  }
+
+  function addComparePick(row, side, sessionId) {
+    row.addEventListener('click', function () {
+      // 只上报，不本地改动 —— 等扩展回整份 compare-set（回执）再重画，
+      // 免得本地的乐观更新与扩展的解析结果各说一套。
+      post({ type: 'compare-pick', side: side, sessionId: sessionId });
+    });
+  }
+
+  function toggleComparePanel() {
+    if (compareState) closeComparePanel();
+    else openComparePanel();
   }
 
   /**
@@ -2000,12 +2256,13 @@
   // ---------- DOM 构建 ----------
 
   function makeAssistantShell(id) {
-    var rec = makeBubble(id, 'assistant');
+    var rec = makeBubble(id, 'assistant', LIVE_SINK);
     rec.content.className = 'md';
     return rec;
   }
 
-  function makeBubble(id, role) {
+  /** `sink` 必填（C15）：漏传会当场 TypeError —— 那正是我们要的失败方式，静默画到直播面上才是最坏的。 */
+  function makeBubble(id, role, sink) {
     var wrap = document.createElement('div');
     wrap.className = 'msg msg-' + role;
     var bubble = document.createElement('div');
@@ -2013,10 +2270,10 @@
     var content = document.createElement('div');
     bubble.appendChild(content);
     wrap.appendChild(bubble);
-    messagesEl.appendChild(wrap);
+    sink.container.appendChild(wrap);
 
     var rec = { id: id, role: role, wrap: wrap, bubble: bubble, content: content, text: '', status: 'streaming', caret: null };
-    byId.set(id, rec);
+    sink.registry.set(id, rec);
     return rec;
   }
 
@@ -2127,8 +2384,12 @@
     rec.forecastToggle.hidden = lines.length === 0;
   }
 
-  function addToolMessage(msg) {
-    if (isReactLive()) return;
+  /**
+   * C15：工具卡的**落点化**实现 —— 直播面与对照面板共用这一份。
+   * ⚠️ 它自己**没有** react-live 门规：门规在三个 `add*` 包装器与 `renderMessageInto` 里
+   *    （共 4 处，探针钉着）。这样对照面板（`reactLive: false`）才能在 react-live 下照画。
+   */
+  function renderToolInto(msg, sink) {
     var wrap = document.createElement('div');
     wrap.className = 'msg msg-tool';
     var card = document.createElement('div');
@@ -2166,7 +2427,7 @@
     card.appendChild(output);
 
     wrap.appendChild(card);
-    messagesEl.appendChild(wrap);
+    sink.container.appendChild(wrap);
 
     var rec = {
       id: msg.id,
@@ -2182,18 +2443,23 @@
       status: 'done',
       caret: null,
     };
-    byId.set(msg.id, rec);
+    sink.registry.set(msg.id, rec);
     applyToolState(rec);
     return rec;
   }
 
-  /** 居中灰字说明行（role:'note'，如「已开启全新 DSH 会话…」）。恒 done、不流式。 */
-  function addNoteMessage(msg) {
+  /** 直播面的工具卡入口。门规**一字未改**地留在这里（C15 的落点化只把函数体挪进了 renderToolInto）。 */
+  function addToolMessage(msg) {
     if (isReactLive()) return;
+    return renderToolInto(msg, LIVE_SINK);
+  }
+
+  /** 居中灰字说明行（role:'note'，如「已开启全新 DSH 会话…」）。恒 done、不流式。 */
+  function renderNoteInto(msg, sink) {
     var wrap = document.createElement('div');
     wrap.className = 'msg msg-note';
     wrap.textContent = msg.text; // 纯文本渲染（CSS ::before/::after 加两侧 —）
-    messagesEl.appendChild(wrap);
+    sink.container.appendChild(wrap);
     var rec = {
       id: msg.id,
       role: 'note',
@@ -2204,19 +2470,33 @@
       status: 'done',
       caret: null,
     };
-    byId.set(msg.id, rec);
+    sink.registry.set(msg.id, rec);
     return rec;
   }
 
-  function addMessage(msg) {
-    if (isReactLive()) return; // 真组件画面接管，DOM 消息面整体停用
+  /** 直播面的 note 入口（门规同 addToolMessage）。 */
+  function addNoteMessage(msg) {
+    if (isReactLive()) return;
+    return renderNoteInto(msg, LIVE_SINK);
+  }
+
+  /**
+   * C15：**把一条消息渲染进一个落点** —— 直播面与对照面板的唯一分派处。
+   *
+   * ⚠️ 门规必须在这里也有一份：`renderSnapshot` 重渲染整条转写时走的是 `renderTranscriptInto`，
+   *    **不再经过 `add*` 包装器**。所以全仓一共 4 行门规（三个 `add*` + 这里），
+   *    这是**有意保留的重复** —— 比「把门规藏进 sink 字段」更难写错：漏传 sink 会当场
+   *    TypeError，而漏掉门规会静默把 DOM 画到 react-live 的直播面上。
+   */
+  function renderMessageInto(msg, sink) {
+    if (sink.reactLive && isReactLive()) return;
     if (msg.role === 'tool') {
-      return addToolMessage(msg);
+      return renderToolInto(msg, sink);
     }
     if (msg.role === 'note') {
-      return addNoteMessage(msg);
+      return renderNoteInto(msg, sink);
     }
-    var rec = makeBubble(msg.id, msg.role === 'user' ? 'user' : 'assistant');
+    var rec = makeBubble(msg.id, msg.role === 'user' ? 'user' : 'assistant', sink);
     rec.text = msg.text;
     rec.status = msg.status;
 
@@ -2231,6 +2511,12 @@
       renderMarkdownInto(rec.content, msg.text);
       if (msg.status === 'streaming') setStreaming(rec, true);
     }
+  }
+
+  /** 直播面的通用入口。 */
+  function addMessage(msg) {
+    if (isReactLive()) return; // 真组件画面接管，DOM 消息面整体停用
+    return renderMessageInto(msg, LIVE_SINK);
   }
 
   /** 只清掉消息气泡（与折叠行），保留 #messages 里的空状态提示元素。 */
@@ -2268,7 +2554,15 @@
    */
   var foldSource = [];
 
-  function buildFoldRow(n) {
+  /**
+   * 那一行「更早的 N 条已折叠」。
+   *
+   * C15：点击动作**由调用方给**（`onExpand`）—— 折叠展开态是**每个落点自己的**状态：
+   * 直播面是 `foldExpanded`，对照面板是 `compareTailExpanded.a/b`。写死成
+   * `foldExpanded = true; renderSnapshot(foldSource)` 的话，在对照面板里点这一行会去展开
+   * **直播面**（探针里有反控钉着这条串台）。
+   */
+  function buildFoldRow(n, onExpand) {
     var row = document.createElement('div');
     row.className = 'msg-fold';
     var btn = document.createElement('button');
@@ -2279,23 +2573,35 @@
       '折叠只影响这一屏的渲染量。消息一条没丢，DSH 那边的记忆也没有被改动 —— ' +
       '真正的上下文压缩是 DSH 按它自己的阈值做的，与这里无关。';
     btn.addEventListener('click', function () {
-      foldExpanded = true;
-      renderSnapshot(foldSource);
+      onExpand();
     });
     row.appendChild(btn);
     return row;
+  }
+
+  /**
+   * C15：**把一份转写渲染进一个落点**的**唯一实现**（折叠判据也只此一处）。
+   *
+   * ⚠️ 它**不清记录表、不清容器** —— 那是调用方的事：直播面要 `byId.clear()` +
+   *    `removeAllMessages()`（后者刻意保留 #messages 里的空态提示节点），对照面板直接换一张新表。
+   */
+  function renderTranscriptInto(messages, expanded, sink, onExpand) {
+    // 折的是**头部**：尾部是正在生长的对话，滚动位置与流式气泡都在那一头。
+    var head = !expanded && messages.length > FOLD_KEEP ? messages.length - FOLD_KEEP : 0;
+    if (head > 0) sink.container.appendChild(buildFoldRow(head, onExpand));
+    for (var i = head; i < messages.length; i++) {
+      renderMessageInto(messages[i], sink);
+    }
   }
 
   function renderSnapshot(messages) {
     byId.clear();
     removeAllMessages();
     foldSource = messages;
-    // 折的是**头部**：尾部是正在生长的对话，滚动位置与流式气泡都在那一头。
-    var head = !foldExpanded && messages.length > FOLD_KEEP ? messages.length - FOLD_KEEP : 0;
-    if (head > 0) messagesEl.appendChild(buildFoldRow(head));
-    for (var i = head; i < messages.length; i++) {
-      addMessage(messages[i]);
-    }
+    renderTranscriptInto(messages, foldExpanded, LIVE_SINK, function () {
+      foldExpanded = true;
+      renderSnapshot(foldSource);
+    });
     toggleEmptyHint();
     updateBusy();
     messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -2307,6 +2613,62 @@
   var MAX_CHIP_TEXT = 200000;
   /** 浏览器 File 直接读取时的字节上限，再大就不读了（与扩展侧一致：10KB）。 */
   var MAX_FILE_BYTES = 10 * 1024;
+  /**
+   * C17：图片那一路的上限与类型表 —— **与扩展侧 `src/imageAttach.ts` 有意重复**（webview 加载不了
+   * TS）。漂了会在 `scripts/probe-image-attach.mjs` 的 B4 条上红，那条专门对拍这几个字面量。
+   *
+   * 这里判断「是不是图片」用的是**文件类型 / 扩展名**，而**扩展侧一律按魔数重判** ——
+   * 前端这一层只决定「用哪个 reader 去读」，真正的准入判定只有扩展侧那一份。
+   */
+  var IMAGE_MEDIA_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+  var MAX_IMAGE_BYTES = 3.5 * 1024 * 1024;
+  var MAX_IMAGES_PER_MESSAGE = 4;
+  /** 看着像图片的扩展名（与扩展侧 `IMAGE_EXT_HINTS` 同集合；`file.type` 常常是空串）。 */
+  var IMAGE_EXT_RE = /\.(png|jpe?g|jpe|jfif|gif|webp|bmp|ico|cur|svg|tiff?|avif|heic|heif)$/i;
+
+  /** 人读的字节数。口径与扩展侧 `imageAttach.formatBytes` 一致。 */
+  function formatBytes(n) {
+    if (typeof n !== 'number' || !isFinite(n) || n < 0) return '0 B';
+    if (n < 1024) return n + ' B';
+    var kb = n / 1024;
+    if (kb < 1024) return (kb < 10 ? kb.toFixed(1) : Math.round(kb)) + ' KB';
+    var mb = kb / 1024;
+    return (mb < 10 ? mb.toFixed(1) : Math.round(mb)) + ' MB';
+  }
+
+  /** 这个 File 该走图片那一路吗（类型或扩展名任一命中）。真伪由扩展侧按魔数说了算。 */
+  function looksLikeImage(file) {
+    if (IMAGE_MEDIA_TYPES.indexOf(file.type) >= 0) return true;
+    return IMAGE_EXT_RE.test(file.name || '');
+  }
+
+  /** 待发送里已有几张图片（张数上限是**落盘量**的安全阀，不是模型的要求）。 */
+  function countPendingImages() {
+    var n = 0;
+    for (var i = 0; i < pending.length; i++) {
+      if (pending[i].kind === 'image' && !pending[i].readError) n++;
+    }
+    return n;
+  }
+
+  /** 图片 chip 上的三个小标：图片 / 大小 / 模型看不到。**全部 textContent**（零 innerHTML）。 */
+  function appendImageBadges(chip, a) {
+    var tag = document.createElement('span');
+    tag.className = 'chip-tag';
+    tag.textContent = '图片';
+    chip.appendChild(tag);
+    if (typeof a.bytes === 'number' && a.bytes > 0) {
+      var dim = document.createElement('span');
+      dim.className = 'chip-dim';
+      dim.textContent = formatBytes(a.bytes);
+      chip.appendChild(dim);
+    }
+    var warn = document.createElement('span');
+    warn.className = 'chip-dim';
+    warn.textContent = '模型看不到';
+    warn.title = '当前模型不支持图片输入：图片只落成一个文件，agent 得用命令才碰得到它';
+    chip.appendChild(warn);
+  }
 
   function addPending(src) {
     var item = { key: 'p' + (++pendingSeq), name: src.name };
@@ -2314,6 +2676,11 @@
     if (src.content) item.content = src.content;
     if (src.truncated) item.truncated = true;
     if (src.readError) item.readError = src.readError;
+    // C17：图片那一路的字段。**图片永不带 content** —— 带的是字节的 base64，落盘时被消费掉
+    if (src.kind === 'image') item.kind = 'image';
+    if (src.mediaType) item.mediaType = src.mediaType;
+    if (typeof src.bytes === 'number') item.bytes = src.bytes;
+    if (src.dataBase64) item.dataBase64 = src.dataBase64;
     pending.push(item);
     renderPending();
     updateBusy();
@@ -2361,6 +2728,11 @@
       err.className = 'chip-err';
       err.textContent = p.readError;
       chip.appendChild(err);
+    } else if (p.kind === 'image') {
+      // C17：图片 chip **说它是一张图、说它多大、说模型看不到它**。这里刻意不画缩略图：
+      // 气泡里出现一张图，读起来就是「模型看见过它」—— 那是假的。
+      chip.className = 'chip chip-image';
+      appendImageBadges(chip, p);
     } else if (p.truncated) {
       var tr = document.createElement('span');
       tr.className = 'chip-err';
@@ -2397,6 +2769,10 @@
         err.className = 'chip-err';
         err.textContent = a.readError;
         chip.appendChild(err);
+      } else if (a.kind === 'image') {
+        // C17：与待发送 chip **同一套标**（同一条消息在发出前后长得一样，只是少了移除钮）
+        chip.className = 'chip readonly chip-image';
+        appendImageBadges(chip, a);
       } else if (a.truncated) {
         var tr = document.createElement('span');
         tr.className = 'chip-err';
@@ -2412,6 +2788,49 @@
   function addFilesFromList(fileList) {
     for (var i = 0; i < fileList.length; i++) {
       var file = fileList[i];
+      // C17：图片走自己那条路 —— **用 `readAsDataURL` 而不是 `readAsText`**（后者会把 PNG 读成
+      // 乱码喂给模型），也不走 10KB 那道闸（截图动辄几百 KB，那道闸是给文本附件的）。
+      // 为什么不用 `readAsArrayBuffer` + `btoa`：`readAsDataURL` 白送 base64，省掉
+      // Uint8Array / 分块 fromCharCode 一整类问题（DOM 影子那边也只要补一个真回调，见 D5）。
+      if (looksLikeImage(file)) {
+        if (file.size > MAX_IMAGE_BYTES) {
+          addPending({ name: file.name, kind: 'image', readError: '图片过大(>3.5MB)' });
+          continue;
+        }
+        if (countPendingImages() >= MAX_IMAGES_PER_MESSAGE) {
+          addPending({
+            name: file.name,
+            kind: 'image',
+            readError: '图片最多 ' + MAX_IMAGES_PER_MESSAGE + ' 张',
+          });
+          continue;
+        }
+        // 立即闭包捕获这一个 file，避免异步回调读到循环末态
+        (function (f) {
+          var r = new FileReader();
+          r.onload = function () {
+            var data = String(r.result);
+            var comma = data.indexOf(',');
+            if (comma < 0) {
+              addPending({ name: f.name, kind: 'image', readError: '无法读取' });
+              return;
+            }
+            // 剥掉 `data:image/png;base64,` 前缀：扩展侧只收纯 base64（它会重新嗅探字节）
+            addPending({
+              name: f.name,
+              kind: 'image',
+              mediaType: f.type || '',
+              bytes: f.size,
+              dataBase64: data.slice(comma + 1),
+            });
+          };
+          r.onerror = function () {
+            addPending({ name: f.name, kind: 'image', readError: '无法读取' });
+          };
+          r.readAsDataURL(f);
+        })(file);
+        continue;
+      }
       if (file.size > MAX_FILE_BYTES) {
         addPending({ name: file.name, readError: '文件过大(>10KB)' });
         continue;
@@ -2437,6 +2856,18 @@
     return e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0;
   }
 
+  /**
+   * 粘贴来的文件在 **`clipboardData`** 上，**不在 `dataTransfer` 上** —— 浏览器在 `paste` 事件上
+   * 不给 `dataTransfer`（那是 `drop`/`dragover` 的字段）。
+   *
+   * ⚠️ C17 之前这里问的是 `dropHasFiles(e)`，于是它**恒为假**：粘贴这条路（Ctrl+V 一张截图，
+   * 正是图片附件最常见的那条入口）从来没生效过，而且失效得毫无声响 —— 不会报错，只是什么都不发生。
+   * 是 `probe-webview-render` 的 C17 组把它抓出来的（影子按真浏览器的语义只给 clipboardData）。
+   */
+  function pasteHasFiles(e) {
+    return !!(e.clipboardData && e.clipboardData.files && e.clipboardData.files.length > 0);
+  }
+
   // ---------- 事件 ----------
 
   function send() {
@@ -2451,6 +2882,16 @@
       var a = { name: p.name };
       if (p.path) a.path = p.path;
       if (p.content) a.content = p.content;
+      // C17：`truncated` 今天在这里被丢掉了 —— 扩展侧于是在一条**已经被前端截断过**的附件上
+      // 看到"完好内容"，永远不会补那句「已截断」。顺手修掉（协议里它已上移到 FileRef）。
+      if (p.truncated) a.truncated = true;
+      // C17：图片只发**元数据 + 字节的 base64**，`content` 一个字都不发（扩展侧落盘后丢弃字节）
+      if (p.kind === 'image') {
+        a.kind = 'image';
+        if (p.mediaType) a.mediaType = p.mediaType;
+        if (typeof p.bytes === 'number') a.bytes = p.bytes;
+        if (p.dataBase64) a.dataBase64 = p.dataBase64;
+      }
       attachments.push(a);
     }
     // 不清空、不删 chip：等扩展回执。被拒（附件过大等）时内容原样保留；成功后再统一收尾
@@ -2632,9 +3073,11 @@
     attachBtn.addEventListener('click', function () {
       post({ type: 'pick-files' });
     });
-    // 粘贴文件（Ctrl+V 复制的文件）→ 读为附件
+    // 粘贴文件（Ctrl+V 复制的文件 / 一张截图）→ 读为附件。
+    // ⚠️ 判据必须是 `clipboardData`（见 pasteHasFiles 的注释）—— 这里曾用 dropHasFiles，
+    // 于是整条粘贴路径静默失效。
     inputEl.addEventListener('paste', function (e) {
-      if (dropHasFiles(e)) {
+      if (pasteHasFiles(e)) {
         e.preventDefault();
         addFilesFromList(e.clipboardData.files);
       }
@@ -2671,6 +3114,11 @@
     approvalDenyBtn.addEventListener('click', function () {
       answerApproval(false);
     });
+    // C16：「永久信任…」= 允许 + 记住。粒度取**画这条时**记下的那个值（不是此刻的 DOM），
+    // 所以两条审批之间不会串味
+    approvalTrustBtn.addEventListener('click', function () {
+      answerApproval(true, approvalTrustKind);
+    });
 
     // ---- 2.1 改动审阅：审阅条 / 浮层面板 ----
     reviewViewBtn.addEventListener('click', function () {
@@ -2701,6 +3149,30 @@
     runsPanelClose.addEventListener('click', function () {
       closeRunsPanel();
     });
+
+    // ---- C15 分支对照浮层：入口在 header（不在 composer —— 那是「本轮的读数/动作」的地方）----
+    compareBtn.addEventListener('click', function () {
+      toggleComparePanel();
+    });
+    comparePanelClose.addEventListener('click', function () {
+      closeComparePanel();
+    });
+    compareRefresh.addEventListener('click', function () {
+      // 幂等：再发一次 compare-open = 重新取一份快照（两侧都重读）
+      if (!compareState) return;
+      compareState.pick = null;
+      renderCompare();
+      post({ type: 'compare-open' });
+    });
+    for (var csi = 0; csi < 2; csi++) {
+      (function (side) {
+        compareEls[side].pick.addEventListener('click', function () {
+          if (!compareState) return;
+          compareState.pick = compareState.pick === side ? null : side;
+          renderComparePane(side);
+        });
+      })(csi === 0 ? 'a' : 'b');
+    }
     // Esc 收起浮层：审阅面板优先，否则历史面板。自带 Esc 的输入框（标题/历史搜索/自定义模型）
     // 各自处理并回焦，全局监听不抢（否则会二次触发）。
     document.addEventListener('keydown', function (e) {
@@ -2725,6 +3197,11 @@
       if (runsPanelOpen) {
         // C9：运行检查器浮层 —— 审阅面板之后、历史面板之前（层次顺序与 z-index 一致）
         closeRunsPanel();
+        return;
+      }
+      if (compareState) {
+        // C15：分支对照浮层 —— 三个浮层里最后开的那个，按 z-index 同层的顺序收
+        closeComparePanel();
         return;
       }
       if (isHistoryOpen()) closeHistoryPanel();
@@ -2822,6 +3299,24 @@
         // C6：列表一变，正在显示的命中就可能是过期的（软删/恢复/重命名都会走到这里）→ 立刻重发
         requestSearch(true);
         renderHistory();
+        // C15：对照面板的选择器数据源就是这份列表 → 一变就重画（pick 与 panes 都不受影响，重绘幂等）
+        if (compareState) renderCompare();
+        break;
+
+      case 'compare-set':
+        // C15：⚠️ 浮层已关时**迟到的快照必须丢掉** —— 否则用户关掉面板后它又被画回来
+        // （打开/刷新是异步的，关掉之后那份快照一定还在路上）。
+        if (!compareState) break;
+        compareState.sides = data.sides || {};
+        compareState.panes = data.panes || {};
+        compareState.split = data.split || null;
+        compareState.crosstalk = data.crosstalk || null;
+        compareState.at = data.at || Date.now();
+        compareState.live = !!data.live;
+        // 收到快照 = 这次选择被处理了（被拒也回整份 set）→ 收起选择器，不卡在那一屏
+        compareState.pick = null;
+        compareTailExpanded = { a: false, b: false }; // 新快照复位展开态（同直播面换会话复位）
+        renderCompare();
         break;
 
       case 'search-results':

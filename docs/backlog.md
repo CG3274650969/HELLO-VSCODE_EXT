@@ -24,11 +24,12 @@
 | C11 | 会话级推理档位（reasoningEffort） | P1 | **原判「受限：需 runtime 先支持」已推翻** —— 机制早就在（provider 按请求解析档位、`agent/request` 瀑布的返回值就是请求 config），缺的只是入口。**已实现：自检 25/25 全绿；F5 五项全过**（④ 当场揪出一个真 bug：换会话不重播配置条，已修 `a7e5bab` + 加了结构守卫，复验通过；③ 有盘上留痕 —— 两会话各拿各的档位，且拿到「`reason=change` ⇒ 不重启就改档」的直接证据）（热切 + 真会话级；DSH 侧一行不改、用户配置一行不碰，纯追加一个我们自己的插件块） | [x] |
 | C12 | 项目级 agent profile（工具白名单/默认模型/审批策略） | P1 | **原文「扩展负责写回 runtime 配置」只对了三分之一** —— 模型是 `initialize` 参数（必重连）、审批是扩展内部三个读口（零新机制）、**工具白名单运行时压根没有配置键**（要靠自挂插件调 `tools.restrict`，见正文源码坐标）。**已实现：自检 32/32 + webview 段 8 条全绿**（含端到端反控：盘上 `request/header.header.tools` 里 bash 真的没了）；profile 文件落在工作区 `.hello-chat/profile.json`，**不写用户任何文件**，「只能加严」由 `compileProfile` 一个纯函数守死；**F5 五条 2026-09-19 真机全过**（模型跟着 profile 走、`header.tools` 里 bash/write/edit 真的没了而 read 还在、忙碌时切被拒且盘上不动、「写成想关审批」弹条照旧出现） | [x] |
 | C13 | Windows / 跨环境 shell 与路径收口 | P1 | **原文「必要时自带 bash 或推荐配置」没走到那一步，也不用走** —— 上游到今天确实没有换 shell 的配置键，但**PATH 是活的**（`spawn` 按传入 env 的 PATH 搜索，`dsh-subprocess` 只擦敏感键、`ENV_OVERRIDES` 不含 PATH）⇒ 扩展侧前置一个目录就能换掉 agent 的 bash，**DSH 一行不改**。**已实现：诊断 + 可选钉住 bash（`hello.dsh.bashPath`，`scope: machine`）+ 顶栏一段读数 + 坏时一次性可读告警 + 批准条的 `/mnt/…` 两读法说明**（只显示，**不做路径归一化**）；自检 **62/62 + webview 段 10 条（全套 57/57）+ C1 自检 21/21**，7 条结构守卫做过变异测试**全被抓红**；**F5 六条全过（2026-09-19 用户真机）** —— 真弹窗文案与三个按钮、窄面板下顶栏不被挤、`钉住这个 bash` 写进用户设置后真换成、`/mnt/…` 两读法在真 WSL 一轮里的排版、第三条监听器的重连、与「审批未生效」弹窗互不干扰 | [x] |
-| C14 | 事前 diff 预览（近似实现） | P2 | **原文「wire 无 file 事件 → 拿不到将改动的文件清单」只对了一半** —— 真 hunk 一直在线上（`tool/result.meta.diffs`），是扩展此前一个字没读；缺的只有「事前」那半，靠 `tool/call` 的入参预判（帧先于 dispatch）。**已实现：卡片上一行「预计 → 实际」**（事前按入参算近似 diff + 命中检查，事后换成 DSH 报的 `meta.diffs`，失败/中断当场作废）；自检 27/27 + webview 段 65/65，6 条结构守卫变异测试全被抓红；**F5 六条待跑** | [~] |
-| C15 | 多会话并行 / 分支对照视图 | P2 | 无 | [ ] |
-| C16 | 审批白名单记忆（信任一次/永久） | P2 | 依赖 C1 | [ ] |
-| C17 | 多模态 / 图片附件 | P2 | 取决于模型能力 | [ ] |
+| C14 | 事前 diff 预览（近似实现） | P2 | **原文「wire 无 file 事件 → 拿不到将改动的文件清单」只对了一半** —— 真 hunk 一直在线上（`tool/result.meta.diffs`），是扩展此前一个字没读；缺的只有「事前」那半，靠 `tool/call` 的入参预判（帧先于 dispatch）。**已实现：卡片上一行「预计 → 实际」**（事前按入参算近似 diff + 命中检查，事后换成 DSH 报的 `meta.diffs`，失败/中断当场作废）；自检 27/27 + webview 段 65/65，6 条结构守卫变异测试全被抓红；**F5 未跑**（2026-09-21 用户跳过那条 react-live 回落验证，直接转 C15）—— 六条用例仍在正文里挂着 | [~] |
+| C15 | 多会话并行 / 分支对照视图 | P2 | 无。**已实现：一个只读的全屏浮层把两条会话的转写在分叉点之后并排摆出来，并按数据标注它们是否共享 DSH 记忆**（串话判据**双证据：先看本次运行的映射、再看盘** —— 只看盘会漏报「补丁不可用 / `hello.dsh.command` 覆盖」那两条绝不写盘的路）；自检 **28/28（新）+ webview 段 78/78**，8 条变异测试**全被抓红**（累计 21/21）；**F5 十条 2026-09-22 真机全过**（用户确认，无逐条留痕） | [x] |
+| C16 | 审批白名单记忆（信任一次/永久） | P2 | **已实现：拦停条上多一个「永久信任此命令 / 此目录」**（`<globalStorage>/approval-trust.json`，tmp+rename；匹配**逐字精确 + 所在目录**，一个字符都不归一化；撤销走命令面板 + 转写留痕）。**这一处不碰运行时**：谓词返回 false 时服务端直接放行、根本不弹条 ⇒ hook / `hooks.json` / 派生配置 / 令牌一个字节都没改；被白名单放行的区外写**照样进轮前快照**（放行 ≠ 隐身）。**顺手揪出并修掉一个真 bug：生成的 hook 从来不给 bash 带 `cwd`** ⇒ 键少了一半、「同一条 `rm` 在另一个工作区」会被静默放行。自检 **55/55（新）+ roundtrip 24/24 + webview 89/89**，11 条变异**全被抓红**（累计 32/32）；**F5 八条待跑** | [~] |
+| C17 | 多模态 / 图片附件（**诚实降级**） | P2 | **原文「取决于模型与 runtime 是否支持图片内容块」已问死：今天图片到不了模型**（三层墙，两层不在我们手里：wire 的 `prompt()` 从不调 `admitEncodedImages`、便携运行时没挂附件仓库 ⇒ `read_image` 都不存在、`deepseek-v4-flash` 没声明 `inputModalities`）。**已实现：图片被认出来 + 一条 agent 够得着的落点（`.hello-chat/images/`）+ 一枚说明它是图片的 chip + 提示词里一段明说「你看不到它」的说明**，字节永远不发。顺手修掉**两个真缺陷**：① 截图（>10KB）被报成「文件过大（>10KB）」；② 小图标被 `readFileSync(…,'utf8')` 读成乱码喂进提示词（PDF/ZIP 同罪）；另揪出**第三个真 bug —— 粘贴判据读的是 `e.dataTransfer`**（那条路从来没通过）。自检 **47/47（新）+ webview 97/97**，16 条变异**全被抓红**；**F5 已跑第 2、3 条（真机确认，见正文「F5 实录」）**，余下待跑。真机那次还捎带发现两条：**路径得给 WSL 第二读法**（已修）与 **bash 越界动作完全没护栏**（已立 **C19**） | [~] |
 | C18 | 企业集成：代理 / 远程开发 / 审计日志 | P2 | 无 | [ ] |
+| C19 | bash 越界动作护栏（装包 / 下载 / 提权） | P1 | **2026-09-23 C17 真机现场发现的缺口**：agent 为了「看一眼」一张图，在 WSL 里下了 `get-pip.py`、装了 pip/Pillow/numpy/opencv/onnxruntime/rapidocr、还试了 `sudo`，**一次审批都没弹** —— 而这不是漏判：bash 只按 `matchesAnyPattern` 判，十条默认正则全是**破坏性命令**的模式，`pip install`/`curl`/`sudo` 一个不匹配（C4 的「工作区外」只覆盖 `write`/`edit`）。C4 的已知局限里写着「bash 写进某目录不在内」，**真机露出来的是它的更大一半：在区外装东西、下东西、提权**。**未开工**（补法要先拍板：见正文三条路线） | [ ] |
 
 ---
 
@@ -859,7 +860,7 @@ if (!this._abort || !this._reviewChangesOn()) return;  // 对
   - [scripts/probe-webview-render.mjs](../scripts/probe-webview-render.mjs) **65/65**（原 57 + 新增 8）：落位与「不在顶栏里」/ 点开才出 diff（逐行 kind 与行首 `+`/`-`）/ **`tool-result` 之后那行原地被换成事实**（比节点身份，防重建）/ 不带 diff 时按钮与展开区当场收掉（反控）/ 失败与中断两档 class 与文案、**id 对不上的迟到帧不许改别的卡** / id 找不到什么都不做 / 没发过预报的卡不长那行 / CSS 守卫（`flex-wrap`、两个 `[hidden]` 元素不许有 `display`、label 必须省略号）。C13 那条 `_fsTargetAbs` 守卫**同步改形**：现在断言它**委派**给 `resolveTargetPath`、且体内不再有那个字面量。
   - **变异测试：C14 这 6 条全被抓红**（塞进顶栏里面、`FORECAST_TOOLS` 换成子串判据、删掉 POSIX 早退、拿掉行尾归一化、把 `diffs: []` 判成「读不懂」、拆掉一处 unknown 收尾），加上 C13 那 7 条 = **`probe-webview-render` 累计 13/13**（README 那行说的就是这个累计数）—— 每个变异**先自证插进去了**（字面量不匹配就直接报「这条测试无效」，绝不静默空转绿着骗人；本次第 6 条又踩了一次 CRLF 的坑，正因为有这道自检才没变成假绿）。
   - **搬 `_fsTargetAbs` 的回归**：`probe-approval-roundtrip` 18/18、`probe-approval-shell` 21/21、`probe-sandbox --fs-hook`（真机：`hook/invoked`+`hook/result` 各一条、fs 工具被拦下、`isError` 落到 tool/result）全部照常；另 `probe-run-inspector` 31/31、`probe-turn-state` 13/13、`probe-c8-runtime` 全过、`probe-context-window` 14/14、`probe-shell-diag` 62/62、`probe-compaction-notice` 20/20、`smoke-runtime` 通过。
-- **只能真机 F5 盖住（六条，⚠️ 待跑）**：
+- **只能真机 F5 盖住（六条，⚠️ 2026-09-21 用户跳过未跑）**：
   1. 发一句让 agent 写文件的话 ⇒ 卡片上那行在结果出来**之前**就在（`write` 与 `edit` 两种都要看）。
   2. 近似 diff 与轮尾审阅的 diff 对得上/差异可解释（同一轮多次写就会不同，那是有意的）。
   3. `tool/result` 一到就翻成「实际」并换成 `meta` 那份；**新建文件那条**说的是「新建/没报改动」而不是「没有」。
@@ -867,21 +868,176 @@ if (!this._abort || !this._reviewChangesOn()) return;  // 对
   5. `hello.dsh.command` 整段覆盖（审批不接入）+ 审批关掉两种情况下，那行**照样出现**（与 C1 解耦的正控）。
   6. 路径带 `/mnt/d/…` 时卡片怎么显示，**`meta.diffs` 报的 `path` 落在哪** —— 顺手用事实回答 C13 悬着的那条。
 
-### C15 · 多会话并行 / 分支对照视图
-- **现状**：刚做的 fork 是「切过去 + 同记忆」，没有 A/B 对照。
-- **补法**：并排渲染两条分支转写；明确标注共享记忆的串话风险（现 fork 与源会话共用同一 DSH 会话，回源继续发消息会被彼此看到）。
+### C15 · 多会话并行 / 分支对照视图（2026-09-22 实现，F5 十条真机全过）
+- **原文**：**现状**「刚做的 fork 是『切过去 + 同记忆』，没有 A/B 对照」；**补法**「并排渲染两条分支转写；明确标注共享记忆的串话风险（现 fork 与源会话共用同一 DSH 会话，回源继续发消息会被彼此看到）」。
+- **问题**：C5/C6 的「在新对话中分支」今天只是**切过去 + 同记忆** —— 分完支，源会话就看不到了，用户回答不了「这两条支各自长成什么样了」。而「它们共享同一份 DSH 记忆」这件事**在界面上一个字都没有**：回源会话继续发消息，模型两边都看得见，用户不知道。
+- **三个已拍板的决定（不再讨论）**：① 落点 = **全屏浮层**（同 `#runs-panel` / `#review-panel` 的体例），不做常驻第二栏；② 范围 = **只读对照**（面板里不发消息、不并行跑）；③ 串话 = **只标注**（不给「断开共享」之类的动作，只把风险说出来）。
+- **实测（逐条核过源码，**每一条都决定了设计**）**：
+  - **F1 `_forkSession` 是深拷贝**（`JSON.parse(JSON.stringify(src.messages))`，[chatViewProvider.ts](../src/chatViewProvider.ts)）⇒ 副本与源**逐字相同**，有稳定的共同前缀。
+  - **F2 消息 id 里嵌着产生它的会话 uuid**（`_nextMsgId()` 返回 `` `${this._active.id}#${++this._msgSeq}` ``）⇒ 副本里的 id 仍带**源会话的** uuid，fork 之后的新消息才带 fork 的。于是**共同前缀 = 分叉点**，且**跨代也成立**（F2 从 F 分出来，与源比仍是源那一段）；两条无关会话的前缀恒为 0。
+  - **F3 `_openSession` 打开历史会话时会归一化残留态**（`status:'streaming'` → `interrupted`、`toolState:'running'` → `unknown`，**两个 `if` 不是 else 关系**）⇒ 对照栏**必须走同一条规则**，否则「面板里看到的一条」与「打开那条会话看到的」不一样。而**源会话拷完之后还会被原地归一化、fork 那份不会** ⇒ 会出现「同 id 不同 status」，这也是面板上 `drifted` 那个提示的由来。
+  - **F4 只看盘会漏报真串话**：补丁不可用时 `_ensureDshSession` 的 `existing` 分支**提前 return、从不查盘**，且三条路里只有一条写盘 ⇒ 那种模式下 fork 与源两侧盘上都没有 `dsh`，但 `_dshSessions` 里确实共用同一个 id。所以串话判据**双证据：先看本次运行里的映射、再看盘**（这一条是对「只从盘上算」的**有意加强**）。
+  - **F5 同 id 不同 cwd 不该警示**：DSH 会话日志按 cwd 归属（resume 的条件就是 `stored?.cwd === cwd`）⇒ 判 `unknown`/`cwd-differs`，不是 shared。
+  - **F6 react-live 会把消息面整个藏掉**（`body.react-live #messages { display:none !important }`），但**浮层是 body 直系子元素、照常可见** ⇒ 这是选「全屏浮层」形态的**唯一理由**（C14 刚在这上面栽过）。
+  - **F7 三个 `add*Message` 入口各自第一行都是 `if (isReactLive()) return;`** ⇒ 直接复用它们，面板在 react-live 下**画不出任何东西**。
+  - **F8 渲染走模块单例**（`messagesEl` + `byId`）⇒ 对照栏必须用自己的容器与**一次性记录表**：把「属于别会话的 id」写进 `byId`，等于给迟到帧开一扇门。
+- **D1 · 新纯模块** [src/branchCompare.ts](../src/branchCompare.ts)（**不 import vscode** —— C10b 的教训）：`divergenceOf` / `divergenceLine` / `divergenceTitle` / `sharedPrefixNote` / `crossTalkOf` / `crossTalkLine` / `crossTalkTitle` / `frozenTail` / `pickCounterpart` / `FORK_SUFFIX`。
+  - `divergenceOf` 按 **id 逐条比**（零正文参与），给 `{kind, shared, aAfter, bAfter, drifted}`。`shared === 0` 时**绝不说「分叉点在第 1 条」**，说的是「两侧没有共享消息 —— 不是同一次分支的结果（或源会话的那一段已被清掉）」。`drifted` 是「同 id 但内容不同」的条数，**是提示不是逐字 diff**（比的是 `role/status/toolName/toolInput/toolOutput`）。
+  - `crossTalkOf(a, b, live?)` 的证据优先级**写死一处**（F4）：live 两侧都有 → 用它；否则看盘（同 id 同 cwd → shared；**同 id 不同 cwd → unknown**；其余 → unknown）。**判据全是数据、文案是常量映射**：三句 `unknown` 两两不同，`warn` 只挂在 `shared` 一档。
+  - `frozenTail(s, from)` 深拷贝尾段 + 归一化，**绝不改原对象**（探针里有正面证明：改前 `JSON.stringify` 存一份比）。
+- **D2 · 唯一一处对既有代码的搬动**：F3 那段归一化搬进 [src/sessionStore.ts](../src/sessionStore.ts) 的 `freezeTranscript`（那里才能被探针加载，理由同 `capToolInput`），`_openSession` 改成一行委派。**两个 `if` 保持不是 else 关系**，别顺手「修」。⚠️ 有回归面（打开历史会话那条路），所以搬完**立刻**重跑了四条探针。
+- **D3 · 接线**（[src/chatViewProvider.ts](../src/chatViewProvider.ts)）：`_openCompare` / `_pickCompareSide` / `_resolveCompareSide` / `_comparePane` / `_postCompare` + `case 'compare-open'` / `case 'compare-pick'`。
+  - `_compareSides` **纯内存、不落盘、不新增任何持久化状态**：`StoredSession` 一个字不加，**不给 fork 加 `forkedFrom`** —— 识别只靠消息 id 与标题后缀这两条既有痕迹（`[FORK_SUFFIX]`，`_forkSession` 用它命名分支）。
+  - `_resolveCompareSide` 用 `_store.get` 就够：活动会话与数组里那个对象**是同一引用** ⇒ 直播中它也是最新的。解不出来的（软删 / 空）**就地清掉记录**，绝不留一条指向空气的 id。
+  - **只在打开/换侧/刷新时发快照**（不做每帧推送）⇒ 不需要「面板开着吗」这个闸，也绕开了「两轮之间 `_dshSessions` 变化」的坑；`dispose()` 里什么都不做。
+- **D4 · 协议**（[src/protocol.ts](../src/protocol.ts)）：webview→ext 两条（`compare-open` 幂等 / `compare-pick`）；**故意不加 `compare-close`** —— 扩展对面板开合**无状态**，关了不必通知（与 `run-panel` 的差别就在这儿：那条是为体积闸存在的）。ext→webview 是 `compare-set`，**全字段可选**（旧 webview 忽略不认的 type，同 `forecast` 约定）+ `interface ComparePane`。
+- **D5 · webview**（[media/chat.js](../media/chat.js) / [media/chat.css](../media/chat.css) / [media/chat.html](../media/chat.html)）：
+  - **渲染器落点化**（本项唯一一处有回归风险的重构）：单例换成落点对象 `LIVE_SINK = {container, registry, reactLive}`，拆出 `renderToolInto` / `renderNoteInto` / `renderMessageInto` / `renderTranscriptInto`。**「把一份转写渲染进一个落点」只此一处实现**，直播面与对照栏共用。⚠️ `renderMessageInto` 第一行也是门规 —— 直播面整条重渲染走 `renderTranscriptInto`，**不再经过 `add*` 包装器**，所以全仓一共 4 行门规，这是**有意保留的重复**（漏传 sink 会当场 TypeError，漏掉门规会静默画到直播面上）。折 `buildFoldRow(n, onExpand)` 的点击动作**由调用方给**：折叠态是**每个落点自己的**（直播面 `foldExpanded` / 对照栏 `compareTailExpanded.a|b`）。
+  - 对照栏用**一次性记录表**（`compareSink()` 每次 `new Map()`，绝不写进 `byId`）与 `reactLive:false`（这正是「在 react-live 下也照画」）。`compareState = null` **同时就是「开着吗」**（不另起布尔，两个标志必然漂移）。
+  - **三个状态分开说**：还没收到快照（「载入中…」，postMessage 的这几毫秒不是「没数据」）/ 选中了解不出来（「已被删除或清空」）/ 压根没选（「还没有可对照的会话」）。
+  - **共同前缀不渲染正文**（两侧逐字相同），改成一句说明 + 一条「分叉点之后」的界线。
+  - 选择器**就地换内容**（不用浮层菜单：面板内的滚动容器会裁掉绝对定位层，且「触发钮 + 菜单」的配方仓库里已有三份）。**已选的两行置灰且不挂 click 监听**；点一行只上报，`compare-set` 一到就收起选择器（= 这次选择被处理了的**回执**，被拒也回整份 set）。
+  - 入口 = header `.header-actions` 里的「对照」文字钮（**不放 composer**：那里四条 bar 都是本轮的读数/动作；**恒显示、不按「有没有第二条会话」隐藏** —— 要等有对手才出现的入口等于没有入口，C9 的老调）。Esc 链按层次插一条（审阅 → 运行 → 对照 → 历史）。
+  - CSS：`.cmp-transcript` **必须 flex column**（`.msg` 的 `align-self` 与 `max-width:92%` 都是 **flex 项**属性，块容器下用户消息就不右对齐了），且**不许**抄 `.messages` 的 `max-width:760px` / `margin:0 auto`；`@media (max-width: 520px)` 改竖排；警示色**复用仓库已有的 warning token**，不新造颜色。
+- **已知局限**：判据是消息 id ⇒ **只认拷贝关系**，手工复制粘贴出来的两条相似会话算不出共同前缀（会说「没有共享消息」）—— 这是**有意的**，宁可说不知道也不按正文相似度猜；`drifted` 是提示不是逐字 diff；串话的 `by` 字段会在悬停里说清这次是拿**哪份证据**判的（进程内重连会 `_dshSessions.clear()` ⇒ 退回盘上那份）；同 id 不同 cwd 判 unknown（只有手改过 `sessions.json` 才见得到这一档）；选择器只有标题与时间（`SessionSummary` 里没有条数）；侧栏窄时并排读不了；不另设条数上限（与 `snapshot` 同口径：全量下发、渲染侧折叠）。
+- **本次不做**（写死，防后人重推）：**不从面板发消息、不做并行跑**（`_liveRunning`/`_abort`/`_currentDshId`/`_turnStatus` 的语义一个字不动，「停止 = 杀子进程」照旧 —— C8 的核心，回归面太大）；不做 N 路 / 第三栏；**不做同步滚动**（要 scroll 重入闸，而影子看不到布局 ⇒ 那是「上了没人验」的代码）；不渲染共同前缀；不给 fork 加 `forkedFrom`、不落任何新状态；不在 React ChatView 的动作栏加入口；**不做转写侧的差异着色**（`.diff-line` 是给文件改动的，套到对话上会把「这段文字不同」说成「这行被改了」）；摘要里不放 usage / reasoningEffort（usage 口径只认当前活动会话，照抄会与用量条当场打架）；不动 `byId`/`foldSource`/`foldExpanded` 的单例语义。
+- **自检**：[scripts/probe-branch-compare.mjs](../scripts/probe-branch-compare.mjs)（新，**28/28**，七组）—— A 共同前缀（fork 拷贝 / 源分叉后又长 / 无关会话 / 同一条 / 一侧为空 / **跨代**）、B `drifted`（含反控：id 不同但正文完全相同 ⇒ 不进前缀）、C 冻结只读的**正面证明**（原对象一个字段都没变 + 尾段是副本）+ `aAfter === 尾段长度` 同源、D 串话六态 **+ live 优先的反控**、E 三句 `unknown` 文案两两不同 / 无关会话不许出警示 / 标题写出判据、F `pickCounterpart` 三级回退、G 结构守卫（`freezeTranscript` 在 provider 里恰好 1 处且 `_openSession` 必须委派、`_comparePane` 必须走 `frozenTail`、`compare-set` 的构造点只在 `_postCompare`、`sessionStore`/`ChatMessage`/`StoredSession` 里不许出现 `compare`/`forkedFrom`、`side` 只有 `a|b`、`FORK_SUFFIX` 字面量全仓唯一）。
+  - [scripts/probe-webview-render.mjs](../scripts/probe-webview-render.mjs) **78/78**（原 65 + 新增 13）：开关与幂等（恰好一条 `compare-open`）/ **三个空态分开说** / 两栏各自渲染 + 判定区两行且只有串话那行是警示色（**外加一条 `level:'ok'` 的正面反控**）/ **折叠各自独立**（反控：展开对照栏不许把直播面也展开）/ 选择器行数与置灰行**点了不发消息** / `compare-set` 收起选择器 / **关掉之后迟到的快照不许把面板画回来** / **对照栏不许污染直播面的 `byId`**（给对照栏里的卡发一条同 id 的 `tool-result`，它的 class 与文案一个都不许变）/ 对照渲染前后 `#messages` 子节点数相同 + 冻结过的终态视觉（`unknown`、**不带** `running`、没有 `.caret`）/ 三浮层互斥 / Esc 逐层收 / CSS 与 `chat.html` 的结构守卫（`#compare-panel` 必须是 body 直系且**不在 `#messages` 区间里**、`#compare-btn` 在 `.header-actions` 内）。顺带补上了影子的一处**测试性缺口**：`document.addEventListener` 原本是 no-op，全局键盘链（Esc 那串）**从来没被验过**，现在改成捕获式。
+  - **变异测试：C15 这 8 条全被抓红**（sink 换成 `byId`、折叠接到 `foldExpanded`、置灰行也挂监听、关掉时不丢弃状态、`.cmp-transcript` 改回 `display:block`、不冻结尾段、**调换 live 与盘的证据优先级**、把对照状态写进盘上的 `StoredSession`），加上 C13 那 7 条 + C14 那 6 条 = **`probe-webview-render` 累计 21/21**（README 那行说的就是这个累计数）。每条**先自证插进去了**（字面量不匹配就报「这条测试无效」）。
+    ⚠️ 本次踩到一枚**新坑**，记下来：`probe-branch-compare` 载的是 `out/` 里的**编译产物**，所以「改 `.ts` 源文件」的变异对它是**整份全绿**的 —— 看着像「漏网」，实际是**根本没插进去**。改 `.ts` 的变异必须**重新编译**（且跑完要把产物**再编译回来**）。这正是「先自证」那道闸的价值：没有它，这一次会被记成「探针盖不住」而白白加固错的地方。
+  - **回归**：`probe-session-tools` 64/64、`probe-purge` 20/20、`probe-turn-state` 13/13、`probe-branch-compare` 28/28、`probe-webview-render` 78/78（搬 `freezeTranscript` 与渲染器落点化之后**各跑一遍**，全绿）。
+- **只能真机 F5 盖住（十条，✅ 2026-09-22 用户真机验收全过，无逐条留痕）**：
+  1. 侧栏拉宽 ⇒ 真的并排、各自独立滚动、栏间发丝线在；拉到 ≤520px ⇒ 竖排（阈值只有真机试得出）。
+  2. **在 react-live 画面下打开浮层，两条转写照样可见** —— 本项选这个形态的**唯一理由**，必须正面证明（C14 刚栽过）。
+  3. 真 fork 走一遍：分支 → 源里再发 2 条 → fork 里再发 3 条 → 打开对照，两侧「此后 N 条」与肉眼一致、分叉点行位置对得上。
+  4. 串话三态看**脸色**（不只文案）：真 fork（同 `dsh.id`）⇒ warning 色那行在；两条无关会话 ⇒ 没有警示行；从没连过 DSH 的会话 ⇒ unknown 那行。
+  5. 快照是**每次重取**：发一条后回面板点「刷新」⇒ 数字与内容都动（不是缓存的旧图）。
+  6. 开着面板时那一轮正在跑 ⇒ 面板头说「快照时仍在跑」，且**卡不转圈**、没有闪烁光标。
+  7. 三浮层互斥 + Esc 逐层收（对照 → 运行 → 审阅 → 历史）。
+  8. 重载窗口后：分完支立刻关窗口的那种 fork ⇒ 对照里是「无身份」**不警示**（与「记忆真的断了」一致）；正常落过盘的 ⇒ 仍是 shared。
+  9. header 挤不挤：三个钮 + 标题在 300px 侧栏下标题还剩几个字（`.chat-title` 会 ellipsis 先让）。
+  10. 深/浅两套主题下 `.cmp-*` 与栏里气泡的配色。
 
-### C16 · 审批白名单记忆
-- **现状**：无（依赖 C1）。
-- **补法**：确认条上加「信任这次/永久信任此命令/目录」，持久化策略。
+### C16 · 审批白名单记忆（2026-09-22 实现，F5 八条待跑）
+- **原文**：**现状**「无（依赖 C1）」；**补法**「确认条上加「信任这次/永久信任此命令/目录」，持久化策略」。
+- **问题**：C1 的确认条是**一次性**的 —— 同一条 `rm -rf ./dist` 在一条长会话里会被问十遍，用户只有两个选择：每遍点一次，或者去设置里把 `\brm\b` 整条正则删掉。**后者是拆护栏，不是记住决定**。中间那一档「这条我准了，别再问」今天不存在。
+- **四条已拍板（不再讨论）**：① 落盘 = **扩展存储里一份 JSON**（`<globalStorage>/approval-trust.json`，tmp+rename）；② 匹配 = **逐字精确 + 所在目录**（bash 的键是 `(command, cwd)` 二元组，一个字符都不归一化）；③ 撤销 = **命令面板 QuickPick + 转写留痕**；④ 三个按钮读作 **允许执行 / 永久信任此命令（此目录）/ 拒绝**。
+- **实测（逐条核过源码，每一条都决定了设计）**：
+  - **F1 这道功能不需要碰运行时**：`_askNeedsApproval` 是注入给 `ApprovalServer` 的谓词，返回 false 时 `_handle` **直接 `send(200,{decision:'allow'})`、根本不调 `_askUser`** ⇒ **hook 脚本、`hooks.json`、派生配置、令牌一个字节都不用改**，白名单全落在这一处（F5 面因此极小）。
+  - **F2 放行 ≠ 隐身**：`_handle` 里的顺序是 `_onObserved(ask)` → `_shouldAsk(ask)` ⇒ 被白名单**静默放行**的区外写**照样进 C4 的轮前快照**（探针 ⑲ 用 `observed.length === 2` 钉着）。
+  - **F3 截断会把两条命令变成同一条**：`str(parsed.command, 32*1024)` 是 `slice(0,max)` ⇒ 触顶的命令可能被截成同一个字符串。**宁可少给功能**：命中上限的命令既不提供信任也不参与匹配（判据 `length >= MAX_COMMAND_CHARS`，常量与 `approvalServer` **同一个** —— 两处各写一遍迟早漂）。
+  - **F4 `_pending` 不留 `ApprovalAsk`**（只存 `{settle,timer,toolName}`）⇒ 要建信任就得把 command/cwd/filePath 取回来，所以 provider 侧新开一张 `Map<id, ApprovalAsk>`（同 `_approvalCmds`/`_approvalNotes` 的体例），`_onApprovalAsk` 存、`_onApprovalResolved` 删。**不动 `_onResolved` 的签名**（探针 ⑪⑫ 钉着它）。
+  - **F5 为什么不是「新加一个设置项」**：`hello.chat.*` 全是 `scope: window`，仓库里两处 `config.update(…, Global)` 都只写 `hello.dsh.*` —— 写一个 window 级设置会让扩展**第一次开始改用户的 `settings.json`**（那文件里有明文 key）。所以落盘介质只能是扩展存储里的 JSON。
+  - **F6 `writeEffortState` 就是现成的体例**：净化 → tmp → rename。**不需要 `.bak`**：坏文件退化成「每次都问」，方向是安全的。
+  - **F7 🐞 实测揪出一个真 bug：生成的 hook 从来不给 bash 带 `cwd`**（只有 fs 那条分支带，[dshHooks.ts](../src/dshHooks.ts)）。后果不是「少个字段」而是**键少了一半** —— 白名单里每条 bash 信任都会绑在空工作区上，于是「同一条 `rm` 在另一个工作区」被静默放行（正是 ② 要挡的那件事），而 `offerTrust` 的边界说明还会照着空 cwd 说「本次没有工作区」。**抓它的方式**：`probe-approval-roundtrip` ⑲ 断言 `ask.cwd === 'D:/ws'`，一跑就红。修法是 bash 分支补一行 `cwd` —— C1/C4/C13 都不看 bash 的 cwd（区外写与 POSIX 两读法只走 write/edit），所以这是**纯增量**（改完立刻重跑了五条探针）。
+- **D1 · 新纯模块** [src/approvalTrust.ts](../src/approvalTrust.ts)（**不 import vscode** —— C10b 的教训）：`matchTrust` / `offerTrust` / `isForbiddenTrustDir` / `addTrust` / `removeTrust` / `identityOf` / `describeTrust` / `parseTrustFile` / `readTrustFile` / `writeTrustFile`。
+  - **命中判定**：`command` 档只对 bash（`entry.command === ask.command` **且** `(entry.cwd ?? '') === (ask.cwd ?? '')`），`dir` 档只对 write/edit（`isInsideDir(target, entry.dir)`）。**两个档绝不互相覆盖**。`includes`/`trim`/大小写/前缀包含一律不做 —— 代价是「模型换个写法就再问一次」，这是**有意**选的方向（折叠空白在引号内不成立；前缀包含等于把设置里那条 `\brm\b` 整条作废）。
+  - **能不能提供信任由扩展判**（webview 只画拿到的那份文案）：bash 永远给 `command`（除非触顶）；write/edit 只有在目标路径可解析、且目录**不在硬禁名单**里才给 `dir`。硬禁 = ① 盘根 ② 目录**包含或等于**家目录（一条规则同时挡住 `C:\` 与 `C:\Users`）。
+  - **包含判定只有一份实现**：搬进 [src/changeForecast.ts](../src/changeForecast.ts) 的 `isInsideDir`（`path.relative` 版），provider 的 `_isInside` 改成一行委派 —— `startsWith` 会让 `D:\proj2` 被 `D:\proj` 骗过。
+  - **条目没有 `id`**：撤销与去重都用 `identityOf`（`command\0cwd\0command` / `dir\0dir`）⇒ 文件是人手能读、能手改的（字段就是全部判据）。
+  - **坏文件 = 空表**，逐条校验（丢掉那**一条**而不是整份）：字段类型、kind 白名单、命令/目录非空、目录绝对且不在硬禁名单。⚠️ `{"kind":"bash"}` 这种**缺 command 的条目必须丢掉** —— 否则就是「一条命令都没写却什么都匹配」的后门。
+  - `MAX_TRUST_ENTRIES = 200`，满了**拒绝**（不淘汰最旧的：静默累积权限比报个错更坏）；三条拒绝理由两两不同。
+  - **只写「读回来还在」的东西**（`writeTrustFile` 先过 `normalizeEntries`）⇒ 不变量 `readTrustFile(writeTrustFile(x)) === x` 是**结构上**成立的，不是巧合。
+- **D2 · 接线**（[src/chatViewProvider.ts](../src/chatViewProvider.ts)）：`_askNeedsApproval` 的**第一句** `if (this._isTrusted(ask)) return false;`；`_isTrusted` 每次**现读盘、不缓存**（手改/手删文件即时生效）；`_offerTrust` 随 `approval-request` 下发；`_createTrust(id, kind)` **重算一遍粒度**（webview 传来的 kind 不是可信输入）+ 写盘 + 留痕；`forgetApprovalTrust()` 用 `showQuickPick` 列出/逐条/全部清除（首项「全部清除」）。
+  - **记不记得住都不改变这次允许**：`_answerApproval` 先回话（`this._approval?.answer`）、再记盘，每条失败路径只往留痕里写一句。
+  - **失败一律 fail-closed**：读盘失败/解析坏 ⇒ 返回 false ⇒「每次都问」；坏的降级方向**永远不会是「全放行」**。
+  - `_onApprovalResolved` 里删 `_approvalAsks`（超时/取消/已答都会经过那里）⇒ 不泄漏。
+- **D3 · 协议**（[src/protocol.ts](../src/protocol.ts)）：`approval-request.trust?: {kind,label,scope}`（**可选** —— 老载荷/不可提供时不带 ⇒ 前端不画那个按钮）、`approval-answer.trust?: 'command'|'dir'`（只在 `allow:true` 时有意义）。
+- **D4 · webview**（[media/chat.js](../media/chat.js) / [.html](../media/chat.html) / [.css](../media/chat.css)）：`#approval-trust` 进 `.approval-actions`（`#approval-deny` 之前），`#approval-scope` **另起一行**（整段文本塞进按钮行会把按钮挤走）；两者**初始 hidden**（老载荷下不留空壳）。**文案不在前端拼**（同 C15 的分工线）：`label`/`scope` 全由扩展给，`textContent` 落字。
+  - `renderApproval` 对三个字段**无条件赋值**、`clearApproval` 一起复位 —— **两条互为备份**（见变异测试里那条踩坑记录）。**「允许执行」这个标签不动**（它本来就是「信任这次」），改字只会让既有断言白白重跑。
+  - CSS：`.approval-scope` 走 **`--dsw-alias-state-warn-primary`**（⚠️ 是 `warn` 不是 `warning`：`dsh-live.css` 里只定义了前者，写 `-warning-` 会静默退到 VS Code 兜底色 —— 现有 `.approval-note` 正是这个情况，**本次不顺手改它**）。
+- **已知局限**：**信任是机器级、跨工作区的**（键里带了 cwd，但文件本身不按工作区分仓 —— 同一条命令在另一个工作区不会命中，因为 cwd 不同）；逐字精确 ⇒ 模型换个写法就再问一次（有意）；命令 ≥32KB 的既不能信任也不能命中；`dir` 档只覆盖 `write`/`edit`，**bash 命令写进那个目录不在内**（与 C4 的既有局限同源）；文件损坏/被删 = 退回「每次都问」。
+- **本次不做**（写死，防后人重推）：不按命令首词/前缀记忆（那等于把 `\brm\b` 整条正则作废 —— 那件事今天就能在设置里做，本项刻意不重复它）；不做归一化匹配；**热路径零写盘**（不记 `uses`/`lastUsedAt`）；不做过期/自动清理；不加设置开关（撤销路径够用，再加一个「全局暂停白名单」的键是给以后留的口子）；不给 bash 提供「信任此目录」、不给 write/edit 提供「信任此命令」（按不出来的按钮不该出现在拦停态里）；不改 hook 脚本/派生配置/令牌（F1）；不动 `_onResolved` 签名（F4）；不做图形化管理面板。
+- **自检**：[scripts/probe-approval-trust.mjs](../scripts/probe-approval-trust.mjs)（新，**55/55**，七组）—— A bash 逐字+cwd（空白/大小写/前缀/另一个 cwd/通配五条**反控**）、B dir 档（含兄弟目录 `D:\out2` 那个坑）、C `offerTrust`（触顶/盘根/家目录/未知工具 + 反控）、D `addTrust`（去重/上限/伪造粒度/写→读往返）、E 坏文件解析（**缺 command 的后门**、相对目录、整份丢光 ⇒ `corrupt`）、F 读盘写盘（往返、写前净化、缺失文件**不算坏**、tmp 残渣、父目录不存在 ⇒ 抛）、G 展示文案 + 硬禁判定。
+  - [scripts/probe-approval-roundtrip.mjs](../scripts/probe-approval-roundtrip.mjs) **24/24**（原 18 + 新增 6）：⑲ 用**真白名单文件 + 真 hook 子进程**走完整条回路（命中 ⇒ 条不弹、脚本不表态、`observed` 照旧），⑳ 逐字精确四条（正控 + 表非空≠全放行 + cwd 是键的一半 + 多一个空格照样弹），㉑-㉔ 把「白名单接在 `_askNeedsApproval` 第一句」「判定只有一处（`matchTrust`/`offerTrust`/`isInsideDir`）」「失败一律 false」「先回话再记盘、`_createTrust` 里不许出现 `allow`」钉在源码上。
+  - [scripts/probe-webview-render.mjs](../scripts/probe-webview-render.mjs) **89/89**（原 78 + 新增 11）：带 trust ⇒ 按钮与说明都出来且**逐字**；不带 ⇒ 两个都藏且不留字（反控）；点永久信任 ⇒ 恰好一条 `allow:true` + 粒度原样；连点只发一条；dir 档不被前端改成 command；**Esc 仍是拒绝且不带 trust**；「允许执行」不许静默升级；收起即复位；**已隐藏的按钮按下也不带上一条的粒度**；结构守卫（按钮在 `.approval-actions` 内、说明另起一行、两者初始 hidden、「允许执行」没被改字）；CSS 守卫（`warn` 而不是 `warning`、没写 `display`）。
+  - **变异测试：C16 这 11 条全被抓红**，加上 C13 七条 + C14 六条 + C15 八条 = **`probe-webview-render` 累计 32/32**（README 那行说的就是这个累计数）：① 逐字相等→前缀包含、② 键里去掉 cwd、③ 去掉触顶拒判、④ 硬禁表恒 false、⑤ 解析去掉逐条校验、⑥ kind 不校验就建、⑦ 包含判定换成 `startsWith`、⑧/⑧b 去掉两处上限、⑨ 收起不复位、⑩c **allow 闸松开 + Esc 也传 kind**、⑪c **复位没了 + `renderApproval` 只在有 trust 时赋值**。每条**先自证插进去了**（字面量不匹配就报「这条测试无效」）。
+    - ⚠️ 两条**踩坑记录**：**(a)** ⑩/⑪ **单独改是无效变异** —— `allow &&` 闸与 `clearApproval` 的复位各自兜着对方，单独拆一边**一条都不红**，只有**两处一起**拆才红。**这正是「先自证 + 变异必须能红」那道闸的价值**：不这么查，就会误以为「探针盖住了」，而真相是那两处互为备份。**(b)** 变异驱动的第一版拿「等 900ms 看有没有弹条」当判据，编译并行时 900ms 内连子进程都没起来 ⇒ **假红**。改成**两个真实结局赛跑**（要问 ⇒ hook 挂着等答复；不问 ⇒ 服务端当场放行、hook 自己退出），这也顺带把那条判据从「等一个时间窗」改成了「等一个事实」。
+- **只能真机 F5 盖住（八条，待跑）**：
+  0. ⚠️ **两条前提（2026-09-22 真机踩过）**：**(a)** `write`/`edit` 的目标必须是**写得出绝对路径**的形式 —— POSIX 形态（`/mnt/d/...`，WSL 侧 bash 让模型习惯这么写）会被 `resolveTargetPath` **故意**判成 undefined（宁可判不出来也不乱认：那条路径下 `intended` 与 `actual` 是两个不同的目录）⇒ 条**照样弹**但**永远不会有**目录按钮。想看目录档就用工作区相对路径或 `D:\...`。**(b)** 拦停条挂在 composer 里、react-live 只藏 `#messages` ⇒ **这八条都不需要挪 `media/dsh-live/`**（那是 C14 看工具卡读数才要做的）。
+  1. bash 拦停条上出现「永久信任此命令」+ 边界说明行，**说明里要写出具体的工作区**（那正是 F7 那个 bug 的可见症状）；write/edit 上出现的是「永久信任此目录」。
+  2. 点永久信任 ⇒ 模型重发**同一条**命令不再弹条，且转写里有留痕 —— **一条 note、两段**（`已允许执行：<命令>；已永久信任 命令 <命令>（工作区 <cwd>，<时间>）—— 可在命令面板「AlohaDSH: 查看/清除审批白名单」里撤销`），**不是两条**。反控：点「允许执行」的那一次，同一条命令下次**仍弹**（两个按钮只差一个字段）。
+  3. 同一条命令**在另一个工作区**照样弹条（cwd 是键的一半）；多一个字符的 `rm` 也照样弹（逐字精确）。
+  4. write/edit：信任某目录后，写进它**子目录**不弹条；写进**兄弟目录**仍弹条（用 `D:\f5-out` 与 `D:\f5-out2` 这种**共享前缀**的名字，才真正验到 `path.relative` 与 `startsWith` 的差别）。
+  5. 重载窗口后白名单还在（证明真落盘、不是内存）—— 命令面板能列出来。
+  6. 命令面板撤销一条 ⇒ 下一次立刻又弹条（**不用重连**）。
+  7. 手工删掉 `approval-trust.json` ⇒ 下一次弹条（文件是唯一真相）。
+  8. 深浅两套主题下新按钮与新说明行的配色。
 
-### C17 · 多模态 / 图片附件
-- **现状**：附件只吃文本，包成 `<file>` 文本块。
-- **补法**：取决于模型与 runtime 是否支持图片内容块；支持则协议加 image 附件类型 + 气泡渲染。
+### C17 · 多模态 / 图片附件（诚实降级）（2026-09-23 实现，F5 八条待跑）
+- **原文**：**现状**「附件只吃文本，包成 `<file>` 文本块」；**补法**「取决于模型与 runtime 是否支持图片内容块；支持则协议加 image 附件类型 + 气泡渲染」。
+- **本次探查把「取决于」那一问回答死了：今天图片到不了模型。三层墙，逐条核过源码**：
+  1. **协议层有图片块，但它带的是「已落盘的引用」而不是字节**：`session/prompt` 收的 `ContentBlock[]` 里确实有 `{type:'image', attachment: ImageAttachmentRef}`（`dsh-llm/lib/types/types.d.ts:48-89`），而提交字节那套 `EncodedImageAttachment` → `admitEncodedImages` 只被 **ACP 适配器**（`dsh-acp/lib/index.js:122`）与**命令执行器**（`dsh-commands/lib/index.js:337`）消费；我们这条 `dsh-sdk-jsonrpc-server` 的 `prompt()`（`lib/index.js:109-118`）只做 `createUserMessage({content: params.contentBlocks})`，**从不调 `admitEncodedImages`** ⇒ 没有任何办法把字节提交进去，也就造不出合法的 `ImageAttachmentRef`。
+  2. **运行时没挂附件仓库**：`dsh-attachment-local` 既不在 `dist-runtime/node_modules` 也不在 `dist-runtime/cordis.yml`（只挂了 `llm-deepseek`）⇒ `ctx.attachments` 是 undefined。连带后果：**`read_image` 工具在我们运行时里根本不存在** —— 它由 `tool-fs` 仅当 `attachments` 被挂载时才注册（`dsh-tool-fs/lib/index.js:1191`）。agent 连「试着读一下这张图」的工具都没有。
+  3. **模型是硬墙**：默认 `deepseek-v4-flash` 没声明 `inputModalities` ⇒ 按 `['text']` 处理，一遇图片即 `UNSUPPORTED_CONTENT`；`DEFAULT_MODELS` 两项都没声明（`dsh-llm-deepseek/lib/index.js:786-794`），而上游文档写死了「**DeepSeek 自家 chat-completions 路由是纯文本，且无法配置成别的**」（`docs/user/guide/providers.md:132`）。
+- **用户已拍板：走「诚实降级」**（不再讨论）。即**不假装支持多模态**，而是把「图片今天进不去」做成一件用户看得懂的事，并顺手修掉今天真实存在的缺陷。
+- **今天的实际行为（这才是要修的）**：
+  - 贴一张**截图**（通常 >10KB）⇒ `_readFileAttachment` 因 `MAX_FILE_BYTES = 10*1024` 判 `readError: '文件过大（>10KB），未读取'` ⇒ `_sendUser` **整条拒发**，提示「以下文件无法读取或过大」。**用户完全读不出「其实是因为模型看不见图」**。
+  - 贴一张**小图标**（<10KB）⇒ `fs.readFileSync(p,'utf8')` 把 PNG 读成乱码，包进 `<file>` 块**喂给模型**；同一个缺陷也把 PDF/ZIP 这类小二进制当文本读进去。反面对照：`src/fileSnapshot.ts` 早就有 `BIN_EXT` 与 NUL 嗅探 —— **审阅那条路有二进制意识，附件这条路没有**。
+  - 🐞 **第三个真 bug（本次自检揪出）**：粘贴处理读的是 **`e.dataTransfer`**（`dropHasFiles(e)`），而粘贴事件把文件放在 **`e.clipboardData`** 上 ⇒ **整条粘贴贴图的路从来没通过**，而且是**静默失败**（不报错、什么也不发生）。
+- **要达成的结果**：图片被认出来、有一条 agent 够得着的落点、气泡里有一枚**说明它是图片**的 chip、提示词里有一句**明说模型看不见图、只能用命令/工具碰它**；不支持的东西给**真实原因**而不是「读取失败或过大」。**字节永不发给模型 —— 因为它到不了。**
+- **关键事实（都已核过源码，决定了设计）**：
+  - **F1 降级不改 `dshRuntime.ts` 一个字节**：今天所有内容最后都被拼成一个 `{type:'text'}` 块，说明文字就是那段拼好的文本里的一段。与 C16 同一型 —— 改动全在扩展侧。
+  - **F2 整份 `attachments` 会原样落进 `sessions*.json`**（`userMsg.attachments = attachments`），而正文**没有任何上限** ⇒ **base64 绝不能进 `Attachment`**，否则一次贴图就把会话存储写成几十 MB。图片附件只存**路径 + 元数据**。
+  - **F3 选区附件（1.1）有现成范式**：落临时文件 → 提示词里只放引用 → 清扫。但**不照抄 `@"path"`** —— DSH 的 `@` 语法只管**会话**引用（规范形 `@[label](dsh-session:…)`），`@"D:\x.png"` 没有任何「这是图片」的语义，只会把 agent 引向文本工具去读二进制。
+  - **F4 落点必须在工作区里**（`.hello-chat/images/`，不复制用户的文件）：DSH agent 共享这块盘、用命令读得到 —— 而「agent 能用命令碰它」是这次降级**唯一**的实际价值；放 globalStorage 等于把唯一的价值扔掉（1.1 选区临时目录踩过同一个坑）。该目录被 `fileSnapshot` 的 `IGNORED_DIRS` 整棵忽略。
+  - **F5 缩略图这条路的账算不过来**：`asWebviewUri` 对工作区里的文件**过得了 CSP、过不了 `localResourceRoots`**（只放行 `media/`），放宽之后**拾取来的图片在工作区外，永远覆盖不到** ⇒ 得改成「一律复制进 `.hello-chat/images`」；且 `_post` 发出去的**常常就是落盘的那个对象实例** ⇒ 就地盖 URI 就是往 `sessions.json` 里写会过期的 URI。**本次不做**。
+  - **F6 上游认的图片恰是四种**（`image/png|jpeg|webp|gif`），识别本身用 **sharp**（重原生依赖）⇒ 白名单**复刻那四种**、嗅探自己写、**不做尺寸解析**。**不许复用 `fileSnapshot.BIN_EXT`**：那回答的是另一个问题（「审阅时别按 utf8 预览」），集合里含 ico/bmp/pdf/zip，借过来会放行一批上游根本不认的类型 —— 那是新的谎言，而且它们过不了本模块的嗅探，等于自相矛盾。
+  - **F7 拒发语义保持不变，只把原因分开**：图片过大 / 不是可用图片 / 二进制非文本，文案在 chip 上显示。
+  - **F8 webview 的 DOM 影子**没有 `File`/`Uint8Array`/`ArrayBuffer`/`btoa`/`readAsDataURL`，且现有的 89 条**没有任何一条**碰 paste/drop ⇒ 影子只补两处，**不可能扰动既有 89 条**。用 `readAsDataURL` 而不是 `readAsArrayBuffer` ⇒ 白送 base64，省掉 `btoa`/分块 `fromCharCode` 一整类问题。
+- **D1 · 新纯模块** [src/imageAttach.ts](../src/imageAttach.ts)（**不 import vscode** —— C10b/C15/C16 的教训）：`sniffImageMediaType` / `safeImageFileName` / `imageBytesAllowed` / `imagesWithinCount` / `imageNote` / `noteForAttachment` / `describeImageAttachment` / 三条拒绝文案。
+  - **魔数优先于扩展名**：`.png` 里可能装着文本，`shot.txt` 里可能是张真 PNG。**认不出来 = 不是图片**，绝不放行到「那就按文本读吧」那条路上去（今天最阴的缺陷就是从那儿来的）。扩展名**只用来给落盘文件取名**、以及决定拒绝时的说法（`.svg`/`.ico`/`.bmp` 确实是图片、只是送不进去，说「不是可用的图片（只支持 …）」比说「二进制文件」准确得多）。
+  - **`imageBytesAllowed` 单独成函数**：上限的语义是「最多这么多」，**恰好等于要放行**。这条判据在扩展宿主之外钉住 —— 一个 `>` 写成 `>=` 的笔误，现场表现是「某些截图莫名其妙被拒」，而那种事**没有现场**（用户只会换一张图试试）。
+  - **`safeImageFileName` 把输入当不可信**：剥目录（两种分隔符）→ 去控制字符与 Windows 非法字符 → 去尾部点与空格 → **扩展名由嗅探结果决定**（`image/jpeg` ⇒ `.jpg`）→ 80 字符上限 → Windows 保留名（`CON`/`COM1`…）加前缀 → 与已存在名字撞了就 `-2`/`-3`。踩过一个坑：判「有没有扩展名」必须用 `dot >= 0` 而不是 `> 0` —— 粘贴来的 Blob 名字有时就是 `.png`，落成 `.png.png` 既难看又像隐藏文件（兜底名 `image`）。
+  - **说明文字里绝不出现 `@"`**（见 F3），且**三句必须都在**：「看不到它的内容」（不说这句，模型会对着一个 `.png` 路径一本正经地描述画面）+「**不要试图用工具把它「看」出来**」（真机加上的，见下面「F5 实录」的发现 B）+「不要凭文件名猜测」（否则「看不到」会被理解成「那就按文件名想象一个」）。**同时**必须留一句「只有用户明确要求对这个文件做某件事时，才用命令去动它」—— 收得太紧会把「把这个文件挪到 X」这种正当请求也一起拒掉，那是另一个方向的错。**路径那一行还要给两读法**：盘符形态之外附 WSL 里可执行的那个（`D:\a\b` ⇒ `/mnt/d/a/b`），换算**委派**给 `dshHooks.toWslPath`（`imageAttach.ts` 里一个 `/mnt/` 字面量都没有，有结构守卫钉着），且**只在两读法真的不同时才写**（POSIX 路径原样返回，macOS/Linux 上凭空多一行是噪音，探针有反控）。长度有上限，超了就截路径。
+- **D2 · 协议**（[src/protocol.ts](../src/protocol.ts)）：`FileRef` += `kind?`/`mediaType?`/`bytes?`/`dataBase64?`，`truncated?` 从 `Attachment` **上移**到 `FileRef`（webview 才转得动它）；`Attachment` += `kind?`/`mediaType?`/`bytes?`/`note?`。注释写死那条不变量：**图片附件永不带 `content`；`dataBase64` 是 webview→扩展的单向字段，在 `_resolveAttachments` 里被消费掉，绝不进 `Attachment`**。
+- **D3 · 接线**（[src/chatViewProvider.ts](../src/chatViewProvider.ts)）：
+  - `_readFileAttachment` 重排成五步优先级：**魔数图片 → 扩展名像图片 → 二进制（`binaryExt`/NUL）→ 10KB 闸 → 按文本读**。图片分支**必须先于那道 10KB 闸**（截图几百 KB，排在后面就是永远「文件过大」）。
+  - **拾取的文件（有 `path`）不复制**、原地引用；**只有粘贴/拖拽来的（无 `path`）才落盘**。理由同 C12/C16 的「不写用户任何文件」：不复制是更保守的选择，代价只是原文件被移走后路径失效（那时 agent 本来也读不到）。
+  - `_resolveImageRef`：`Buffer.from(base64)` → **拿解出来的字节重新嗅探一次**（webview 不是可信输入）→ 在**解码后的长度**上再查一次上限 → 建目录 → **先清扫** → 补 `.gitignore` → 写盘。写失败 ⇒ `readError`，不静默丢。
+  - `_runLive` 与 `_buildPrompt`（两个模式）**各插一份、都走同一个 `noteForAttachment`**，两个模式不许说两套话；分支必须排在通用 `<file>` 那行**之前**（图片没有 `content`，掉进那行只会拼出一个空块，而模型会以为「这个文件是空的」而不是「这个文件我看不见」）。
+  - 张数超限**在 `_sendUser` 里兜底复查一次**（webview 侧有一份镜像，两边都被改过才可能漏）。
+- **D4 · webview**（[media/chat.js](../media/chat.js) / [.css](../media/chat.css)）：常量镜像挨着 `MAX_FILE_BYTES` 写（探针有一条**对拍两边的字面量**）；`addFilesFromList` 按图片分岔走 `readAsDataURL`、剥掉 `data:` 前缀；`send()` 转发 `kind/mediaType/bytes/dataBase64`（**图片绝不设 `content`**），并**补上今天漏掉的 `truncated`**；两处 chip 加图片分支（`图片 · shot.png · 1.2MB · 模型看不到`，全部 `textContent`）；CSS `.chip-tag`/`.chip-dim` 只用 `dsh-live.css` 里**真有**的 `--dsw-alias-*`。
+- **D5 · 落点的整洁**：`.hello-chat/images/.gitignore`（内容 `*`）—— **只写在我们完全拥有的子目录里，不写 `.hello-chat/` 顶层**（那里有 C12 的 `profile.json`，是用户可能想提交的配置）。清扫复用 1.1 的 `_sweepStaleFiles(dir, maxAgeMs)`，TTL **7 天**，并在 `activate()` 里补扫一次（否则「只贴过一张图就再没贴过」的用户会一直留着垃圾）。
+- **已知局限**：**模型看不见图片内容**（这是本次的**前提**而不是缺陷，说明文字会明说）；拾取的文件原地引用 ⇒ 原文件被移走/改名后路径失效；4 张 / 单张 3.5MB 是**扩展自己定的**上限（与 DSH 附件仓库的取值同形，但**不是**它的部署默认值 —— 那个值由部署配置解析，`dsh-attachment/lib` 只声明接口）；落盘副本 **7 天后被清扫**（转写里仍留着名字与大小，chip 不会消失）；`read_image` 在我们运行时里不存在 ⇒ 「让 agent 自己看图」这条**今天连试都试不了**。
+- **本次不做**（写死，防后人重推）：**气泡里的缩略图**（三条理由见 F5，任一条都够；而且**它是不诚实的** —— 气泡里出现一张图，读起来就是「模型看见过它」，要缩略图另开 C17b）；**不解析图片尺寸**（没有任何消费者，而自己写 header 解析器就是再写一个解码器，上游用的是 sharp、我们零依赖）；**不把 `bmp`/`ico` 放进白名单**（多认就是新的谎言，见 F6）；**不加设置项**（图片是用户主动贴的，不像 `autoAttachSelection` 每次发送都会触发）；**不在 purge/软删除时删图片文件**（C15 的分叉意味着两条会话可能共用同一个路径，按 mtime 清扫是唯一安全的回收方式）；**不碰 `dshRuntime.ts` 的 `ContentBlock`**、不碰派生配置、不碰运行时挂载表（字节到不了模型这件事在扩展侧解决不了，见 F1）；不给图片做「信任/自动附加」之类的联动、不动 C16 的白名单语义。
+- **自检**：[scripts/probe-image-attach.mjs](../scripts/probe-image-attach.mjs)（新，**47/47**，七组）—— A 识别（四种魔数、JPEG 字节配 `.png` 名仍判 jpeg、文本字节配 `.png` 名判 undefined、`.svg`/`.ico`/`.bmp` 一律拒、`.PNG` 大小写折叠）、B 上限（**恰好等于要放行**、张数、两边镜像字面量对拍）、C 文件名（`../../evil.png`、`a\b.png`、`CON.png`、300 字符名、重名 `-2`、扩展名以嗅探为准）、D 说明文字（路径/字节/MIME/那句「看不到」都在、**不含 `@"`**、有长度上限）、E **落盘反证**（`mkdtempSync` 里起真 `SessionStore`，写一条带图片附件的会话再读回 JSON：有 `kind`/`mediaType`/`bytes`/`note`，**没有 `dataBase64`、没有 `base64,`**）、F 源码结构守卫、G 与既有功能对账。
+  - [scripts/probe-webview-render.mjs](../scripts/probe-webview-render.mjs) **97/97**（原 89 + 新增 8）：粘贴一张图 ⇒ **恰好一条** `user-message` 帧、带 `kind/mediaType/dataBase64` 且**不带 `content`**；超限与超张数 ⇒ chip 上出现 `readError`、`send()` **什么都不发**；快照里带一条图片附件 ⇒ 气泡里画出那枚文字 chip；`truncated: true` 的待发项 ⇒ 帧里也带 `truncated: true`。
+  - ⚠️ **探针影子的两处扩充**：`El.dispatch(type, props)`（把 props 并进事件对象，才带得动 `clipboardData.files`；现有单参调用与 `click()` 不受影响）、`FileReader.readAsDataURL(f)`（**真回调** —— 今天那个 `readAsText` **从不回调**，所以 paste/drag 这条路从来没被跑过）。真实异步下「先读文件再发送」的次序在影子里被压成同步，**真正兜住张数上限的是扩展侧那道复查**。
+  - **变异测试：C17 这 16 条全被抓红**（① 图片分支挪到 10KB 闸之后、② 图片走 `readFileSync(…,'utf8')`、③ 准入改成采信扩展名、④ 上限语义写成 `<=` 的反面 / ④b 上限缩回 10KB、⑤ 把 `dataBase64` 抄进 `Attachment`、⑥ `_runLive` 的图片分支挪到 `<file>` 之后、⑦ 去掉 `send()` 里的 `truncated` 转发、⑧ 图片也用 `readAsText` 读、⑨ 落盘文件名不剥目录、⑩ 说明文字里抹掉「看不到」那句、⑪ 粘贴判据退回 `dropHasFiles`、**⑫ 抹掉「不要试图用工具把它看出来」整段、⑬ 只删「只有用户明确要求…才用命令」那句、⑭ 抹掉 WSL 第二读法、⑮ 自己写一份换算（不再委派 `toWslPath`）**），其中 13 条打在 `probe-image-attach`、3 条打在 `probe-webview-render`（**那个探针的累计数因此从 32 变 35**）。每条**先自证插进去了**。
+    - ⚠️ **两条踩坑记录**：**(a) `.ts` 变异必须 `npm run compile`** —— 探针读的是 `out/`，不编译 = 变异根本没进产物，于是**原样全绿**（第一轮 12 条里漏网 5 条，4 条是这个原因）。驱动里已改成**按文件扩展名自动判定**，不再每条手写。**(b)** 「图片分支先于 10KB 闸」这条的锚点**必须是那条返回图片的分支**（`if (mediaType) {`），不能锚在嗅探那一行：把闸插在「嗅探之后、判分支之前」这种写法锚在 sniff 上会看走眼。而锚点一挪，「这段里得有魔数嗅探」那句断言就得跟着改 —— 嗅探那一行在锚点**上面**，`slice` 进不来（实测自己把自己绊倒一次：**假红**，且恰好只在还原后的复跑里露头）。**(c)** 「`imageAttach` 里不许有 `/mnt/` 字面量」那条结构守卫**第一版忘了剥注释** —— 而 `/mnt/d/…` 正是这条约定要解释的东西，于是它把自己旁边那段解释判成了红。守卫改成先剥注释再找，并加了两条自证（剥完必须变短、且 `export function sniffImageMediaType` 还在 —— 免得哪天剥过头，守卫变成永真）。
+- **F5 实录（2026-09-23，用户真机，一次「贴图 + 问『这是什么东西』」）**：
+  - **第 2 条 ✅ / 第 3 条 ✅（半）**：贴的是一张 **1155 字节**的 PNG（正是「小图标 <10KB」那一档）。说明文字逐字到了模型（`图片附件：image.png（image/png，1.1 KB，共 1155 字节）` + 那句「你看不到」），**模型没有描述画面** —— 它开口就是 `I can't see images`，然后去开工具。**这是整个 C17 要买的那一件事，真机正面证明。** 转写里 agent 自己那句 `ls -la` 还顺带给出了第 3 条的另一半证据：`.hello-chat/images/` 下**同时**躺着 `image.png`（1155 字节）与 `.gitignore`（**2 字节** = `*`）。还差 `git status` 那半没看。
+  - **白捡一条**：落盘副本**存在**这件事本身证明它是**粘贴/拖拽**进来的（拾取的文件是原地引用、不复制）⇒ **今天修掉的 `pasteHasFiles` 那条路（此前从来没通过）在真机上端到端跑通了**，变异 ⑪ 有了真机背书。
+  - **发现 A（已处理）**：我们发出去的路径 agent 的 shell **用不了** —— `ls -la "d:/…/.hello-chat/images/image.png"` 报 `No such file or directory`，直到 `pwd` 打出 `/mnt/d/…` 才对上，白烧一轮。这正是 C13 那次真事故的同一面墙。**已按 C13 的口径补了第二读法**：路径那一行现在写成 `文件路径：D:\…（bash 在 WSL 里时读作 /mnt/d/…）`，换算**委派**给 [dshHooks.ts](../src/dshHooks.ts) 的 `toWslPath`（`imageAttach.ts` 里**一个 `/mnt/` 字面量都没有**，有结构守卫钉着）。⚠️ 这不是 C13「不做路径归一化」的反悔 —— 归一化是*改写*，两读法是*并列*（C13 给批准条做的就是并列）。**只在两读法真的不同时才写**：POSIX 路径换算后原样返回，在 macOS/Linux 上凭空多一行 `/mnt/…` 只是噪音（探针有反控）。
+  - **发现 B（已处理）**：原话里那句「请用命令或工具处理这个文件（复制、**转换**、查看元数据…）」**读起来是一份行动许可** —— agent 为了回答一句「这是什么东西」，在 WSL 里下了 `get-pip.py`、装了 pip/Pillow/numpy/opencv/onnxruntime/rapidocr 一整套 OCR 栈，还试了 `sudo`，白烧十几轮。**全程没有一次审批，而这不算漏判**：bash 只按 `matchesAnyPattern` 判，十条默认正则全是**破坏性命令**的模式，`pip install`/`curl`/`sudo` 一个都不匹配；「工作区外」那条规则只覆盖 `write`/`edit`（见 [chatViewProvider.ts](../src/chatViewProvider.ts) 的 `_askNeedsApproval`）。⇒ **说明文字已收敛**：新增「不要试图用工具把它『看』出来：读二进制、OCR、转格式、装识别工具都不会让你看见画面，只会白烧时间与 token」，并补一句「只有用户明确要求对这个文件做某件事时，才用命令去动它」兜住正当请求；两条新变异（⑫ 抹掉前者、⑬ 删掉后者）都被抓住。**这一条改变了说明文字 ⇒ 第 1、2 条的 F5 证据是针对*旧文字*的**：机制已被证明可用，新句子仍需真机再看一眼。
+- **只能真机 F5 盖住（八条）**：
+  1. 贴一张**截图**（>10KB）⇒ 不再报「文件过大（>10KB）」，chip 上写的是**图片**与它的真实大小，且提示词里那句「模型看不到」确实到了模型（看工具卡/转写里这一轮的实际发送内容）。
+  2. ✅ 贴一张**小图标**（<10KB）⇒ 不再被当文本读进提示词（2026-09-23 真机通过，见上；**但说明文字此后改过，新句子要再看一眼**）。
+  3. 落盘副本在 `<工作区>/.hello-chat/images/` 里**真的存在** ✅（真机 `ls` 已见），`git status` 里**看不见**它（`.gitignore` 生效）—— 后半句待看。
+  4. **拾取**一张工作区外的图片 ⇒ 提示词里给的是**那个原路径**，`.hello-chat/images/` 里**没有**多出副本。
+  5. 超 3.5MB 的图 ⇒ 拒发，理由说的是**图片过大**（不是「读取失败或过大」）；第 5 张图 ⇒ 拒发，理由说的是**张数**。
+  6. 附一个 **PDF/ZIP** ⇒ 拒发，理由说的是**二进制文件**，不是被当文本读进去。
+  7. 只带图片、不带文字的**第一条**消息 ⇒ 会话标题取文件名（现状行为，顺带确认没被改坏）。
+  8. `sessionExport` 导出的 Markdown 里那条图片附件写着**图片**且**没有** base64；`sessions*.json` 里搜 `base64` **一处都没有**。
+  9. 贴一张图 + 只问一句「这是什么」⇒ agent **不再**去装工具/OCR，直接说看不到（旧文字下它会装一整套 OCR 栈，见发现 B）；**反控**：明确说「把这个文件挪到 X」时它**照旧**用命令 —— 收敛过头的症状是正当请求被拒，那同样是错。
+  10. WSL 下它拿**第二个读法**就能直接 `ls` 到那张图（发现 A 的验收）：不再出现 `No such file or directory` 之后靠 `pwd` 自己纠偏的那一轮。
+- **什么条件下 C17 重新开张**（三条缺一不可）：① 上游宣告视觉模型 rollout 完成（`inputModalities` 带上 `image`）**且** ② 运行时挂上附件仓库（`ctx.attachments` 有值、`read_image` 被注册）**且** ③ 我们的 wire 有提交图片字节的方法（或改走 ACP / 命令执行器那条有 `admitEncodedImages` 的路）。**在这三条同时成立之前，「加个 image 附件类型」只会造出一批送不到的字节。**
 
 ### C18 · 企业集成：代理 / 远程开发 / 审计日志
 - **现状**：无。子进程 env 直接继承宿主 `process.env`（[chatViewProvider.ts](../src/chatViewProvider.ts) `_dshEnv`）。
 - **补法**：可配置代理；Remote-SSH / devcontainer / Codespaces 场景验证；可选审计日志（谁在何时跑了什么命令，不含密钥）。
+
+### C19 · bash 越界动作护栏（装包 / 下载 / 提权）
+- **由来**：**2026-09-23 C17 的真机现场**（那次「贴一张图问『这是什么东西』」）。agent 为了让它「变得可读」，在 WSL 里下了 `get-pip.py`、装了 pip/Pillow/numpy/opencv/onnxruntime/rapidocr 一整套 OCR 栈、还试了一次 `sudo`（`sudo -n true` 报「需要交互式认证」），**全程没有一次审批**。
+- **这不是漏判，是缺口**：`_askNeedsApproval`（[chatViewProvider.ts](../src/chatViewProvider.ts)）里 bash 只走 `matchesAnyPattern(this._approvalPatterns(), ask.command)`，而十条默认正则全是**破坏性命令**的模式（`rm`/`mkfs`/`dd`/`git push --force` 那一类）；`pip install` / `curl -o` / `sudo` 一个都不匹配。C4 的「工作区外」那条规则只覆盖 `write`/`edit` —— 因为 bash **压根没有目标路径可解析**。C4 的已知局限里写着「bash 命令写进那个目录不在内」，**真机露出来的是它的更大一半**：不是「写进某个目录」，而是**在区外装东西、下东西、提权**。
+- **性质**：与 C4 同源（用户机器被静默改动），论性质接近 P0；但**补法还没定**，先按 P1 挂着。
+- **三条路线（未拍板）**：
+  1. **扩默认正则**：往十条里加装包（`pip|npm|yarn|pnpm|apt|choco|winget install`…）、下载（`curl|wget` 带 `-o`/`-O`）、提权（`sudo|runas`）三类。**最便宜、零新机制**，而且 C16 的白名单给了「这条我准了别再问」的出口，所以「问」的代价比 C16 之前低得多。**代价**：正则白名单式护栏天生不全（`python -m pip`、`env sudo`、自己下的 `install.sh` 都绕得过去），而且**会误伤自己的开发流**（本仓库天天跑 `npm run compile` / `npm test` —— 规则必须落在 `npm install`/`npm ci` 上，不能落在 `npm` 上）。
+  2. **区外写护栏的镜像**：给 bash 也判一次「它会不会写区外」——但**静态判不出来**（一个 `bash -c` 里可以有任意多步）。要走这条就得改成运行时观测（比如 hook 里看子进程的实际写）或者**目录级沙箱**，而沙箱那条 C4 早就 spike 否决过（bash 侧 fail-closed，见 C4 正文）。
+  3. **fail-closed 白名单**：只有认得的命令放行，其余全问。**最安全也最烦**，且会因为「认不得」把日常命令全变成弹窗。
+- **验收（等补法定下来再细化）**：装包 / 下载 / 提权三类各有一条**正控**（弹条、可拒、拒了真不执行）；同时有三条**反控**（`npm run compile`、`git status`、`ls` 这类日常命令**不许**弹 —— 误伤的代价是把一个能用的工具变成不能用的）。
+- **与 C16 的关系**：C16 的白名单只覆盖 `command`（bash）与 `dir`（write/edit）两档，**bash 这一档正好是 C19 要拦的那一类命令** ⇒ 两条会接在同一个点上，做 C19 时一并看。
 
 ---
 
@@ -890,4 +1046,6 @@ if (!this._abort || !this._reviewChangesOn()) return;  // 对
 - **最小可用商业化 = C1 + C2 + C3**（敢用、装得上、花得起）。C3 的用量部分（C3a）已完成，剩 C3b 的费用/拦截。
 - C1/C4/C12 同源（审批策略），做 C1 时一并设计，别拆散。**C12 的落地形态（2026-09-18）**：审批那一半确实"零新机制"（profile 只是一层 `||`/并集，读口从"读设置"变成"读设置 → `compileProfile`"），但**工具白名单那一半不是同一回事** —— 它跟 C1 没有共用机制，靠的是自挂插件调 `tools.restrict`（见 C12 正文）。「同源」说的是**审批策略这一轴**，别据此以为整张 C12 都挂在 C1 上。
 - ~~C3 与 C10 共用「用量可得性」前置验证，建议合并做一次 spike。~~ 该前置已达（C3a 已把窗口与占用透出），C10 只剩压缩动作本身。
+- **新发现的缺口（2026-09-23 真机）已立为 C19**：**bash 的越界动作今天完全没有护栏。** 起因是 C17 真机那次 —— agent 为了「看一眼」一张图，在 WSL 里下了 `get-pip.py`、装了 pip/Pillow/numpy/opencv/onnxruntime/rapidocr、还试了 `sudo`，**一次审批都没弹**。这不是漏判：`_askNeedsApproval` 里 bash 只按 `matchesAnyPattern` 判，十条默认正则全是**破坏性命令**的模式（`pip install`/`curl`/`sudo` 一个不匹配），而 C4 的「工作区外」那条规则只覆盖 `write`/`edit`。C4 的已知局限里写着「bash 命令写进那个目录不在内」，但当时想的是「写进某目录」，**真机露出来的是「在区外装东西、下东西、提权」** —— 同一句话的更大一半。详见 **C19**。C17 只把说明文字收紧了（不再邀请 agent 去用工具），**护栏本身没动。**
+
 - ~~C11、C14 受 DSH wire 能力限制，属"要等上游"~~ **C11 更正（2026-09-18）**：wire 下不去 ≠ 做不到 —— `cordis.yml` 里挂一个我们自己的插件就能在请求构建期覆盖（见 C11 正文的四条源码坐标）。**别再把「wire 没这个方法」直接读成「这件事做不了」**，先看看 `agent/*` 的瀑布与插件加载器。**C14 也一并更正（2026-09-21）**：这句话说 C14「仍是真受限」是错的 —— wire 里确实没有 file 事件，但 `tool/result.meta.diffs` 一直带着真 hunk（扩展此前没读），而「事前」那半靠 `tool/call` 的入参就够（帧先于 dispatch）。**两次更正说的是同一件事：先去看它到底给了什么，再判「拿不到」。**

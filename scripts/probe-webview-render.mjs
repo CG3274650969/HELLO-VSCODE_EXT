@@ -139,10 +139,16 @@ class El {
     const a = this._listeners.get(type);
     if (a) this._listeners.set(type, a.filter((f) => f !== fn));
   }
-  /** 影子专用（真 DOM 里 click() 也是这么派的）：派发一次事件 */
-  dispatch(type) {
+  /** 影子专用（真 DOM 里 click() 也是这么派的）：派发一次事件。
+   *  C17：可选 `props` 并进事件对象 —— 只有这样才带得动 `clipboardData.files` / `dataTransfer.files`
+   *  （粘贴与拖拽那条路）。不带 props 的老调用（含 `click()`）语义一字未变。 */
+  dispatch(type, props) {
+    const ev = Object.assign(
+      { type: type, target: this, preventDefault() {}, stopPropagation() {} },
+      props || {}
+    );
     const a = this._listeners.get(type) || [];
-    for (const fn of a) fn({ type: type, target: this, preventDefault() {}, stopPropagation() {} });
+    for (const fn of a) fn(ev);
   }
   click() { this.dispatch('click'); }
   querySelectorAll() { return []; }
@@ -190,6 +196,14 @@ const htmlPath = join(repoRoot, 'media', 'chat.html');
 const hiddenIds = seedFromHtml(readFileSync(htmlPath, 'utf8'));
 
 const byId = new Map();
+/**
+ * `document` 上的监听器（C15 起捕获；原来是 `() => {}` 的 no-op）。
+ *
+ * 捕获是为了让**全局键盘链**第一次可测：Esc 逐层收浮层那条链挂在 document 上，
+ * 而 no-op 意味着它从来没被验过 —— 「改了一处顺序、结果 Esc 收错了面板」这种错
+ * 只能靠肉眼在真机上撞见。捕获本身是纯增量的（没有任何代码会去读这个桩）。
+ */
+const docListeners = new Map();
 const document = {
   body: new El('body'),
   head: new El('head'),
@@ -208,10 +222,19 @@ const document = {
   },
   querySelectorAll: () => [],
   querySelector: () => null,
-  addEventListener: () => {},
+  addEventListener: (t, fn) => {
+    if (!docListeners.has(t)) docListeners.set(t, []);
+    docListeners.get(t).push(fn);
+  },
   removeEventListener: () => {},
   execCommand: () => true,
 };
+
+/** 按一下键（默认 target 为 null —— 那些「自带 Esc 的输入框」的分支就不会抢） */
+function pressKey(key, target) {
+  const ev = { key, target: target || null, preventDefault() {}, stopPropagation() {}, repeat: false };
+  for (const fn of docListeners.get('keydown') || []) fn(ev);
+}
 
 const posted = [];
 let messageHandler = null;
@@ -251,7 +274,28 @@ const sandbox = {
   MessageEvent: class { constructor(t, i) { this.type = t; this.data = i && i.data; } },
   URL: { createObjectURL: () => 'blob:probe', revokeObjectURL: () => {} },
   Blob: class { constructor() {} },
-  FileReader: class { readAsText() {} addEventListener() {} },
+  /**
+   * C17：`readAsDataURL` 必须**真的**把结果交回去。今天这个影子里的 `FileReader` 只有
+   * `readAsText`（**而且从不回调**），所以 paste / drop / addFilesFromList 这条路从来没被跑过。
+   *
+   * 假 File 就是普通对象 `{ name, type, size, dataUrl }`；结果从 `dataUrl` 取。
+   * ⚠️ 这里是**同步**回调（真 FileReader 是异步的）。有意的：本探针整体是同步的（没有 await），
+   * 而同步回调让「贴第 5 张图」那条用例测得到前端那道张数闸。**真机上异步顺序会让同时拖进来的
+   * 5 张各自看到「当前 0 张」而全部放行** —— 兜底在扩展侧（`_sendUser` 的那道复查），
+   * 这里测不到它，也不该假装测到了。
+   */
+  FileReader: class {
+    readAsDataURL(f) {
+      if (typeof f.dataUrl === 'string') {
+        this.result = f.dataUrl;
+        if (typeof this.onload === 'function') this.onload({ target: this });
+      } else if (typeof this.onerror === 'function') {
+        this.onerror({ target: this });
+      }
+    }
+    readAsText() {}
+    addEventListener() {}
+  },
   Promise, JSON, Math, Date, Object, Array, String, Number, Boolean, Error, RegExp, Map, Set, Intl,
 };
 sandbox.globalThis = sandbox;
@@ -1234,6 +1278,664 @@ check('C13 结构守卫：路径两读法**只在显示链路上**（判定链�
     !/startsWith\('\/'\)/.test(fsBody),
     '_fsTargetAbs 体内又自己写了一份 POSIX 判据 —— 判据只准有一处（改这个函数就等于改审批行为）'
   );
+});
+
+// ---------- C15 · 分支对照浮层 ----------
+//
+// 真机看到的是「点 header 的『对照』→ 铺满侧栏的两栏转写」。
+// 这里验影子能表达的部分：开关与三浮层互斥、**三种空态的区别**、分叉点那两行的文案、
+// 各自独立的折叠、选择器的置灰与回执，以及两条**不许发生**的事 ——
+// 污染直播面的 `byId`、以及被关掉之后迟到的快照把面板画回来。
+
+const cmpPanel = () => $('compare-panel');
+const cmpOpen = () => cmpPanel().classList.contains('open');
+const cmpPane = (side) => $('compare-transcript-' + side);
+const cmpNodes = (side) => childWithClass(cmpPane(side), 'msg');
+const cmpVerdictLines = () => childWithClass($('compare-verdict'), 'cmp-verdict-line');
+/** 工具卡不是栏的直接子节点（外面还套着 `.msg.msg-tool`），得整棵子树找 */
+const cmpCards = (side) => walk(cmpPane(side)).filter((e) => e.classList.contains('tool-card'));
+
+/** 干净的局面：清空消息面 + 关掉面板（若开着），再给一份历史列表（选择器的数据源） */
+function resetCompare() {
+  send({ type: 'snapshot', sessionId: 's-c15', messages: [] });
+  send({ type: 'mode-set', mode: 'harness' });
+  send({
+    type: 'history-update',
+    sessions: [
+      { id: 'sa', title: '重构登录', updatedAt: 1700000000000 },
+      { id: 'sb', title: '重构登录（分支）', updatedAt: 1700000001000 },
+      { id: 'sc', title: '别的事', updatedAt: 1700000002000 },
+    ],
+    trashed: [],
+    activeId: 'sa',
+  });
+  // 三个浮层都用**各自的关闭钮**收（走真实路径：那条路会连内部标志一起复位）
+  if (cmpOpen()) $('compare-panel-close').click();
+  if ($('review-panel').classList.contains('open')) $('review-panel-close').click();
+  if ($('runs-panel').classList.contains('open')) $('runs-panel-close').click();
+}
+
+/** 一份快照载荷：`over` 覆盖要测的那几处 */
+function compareSet(over = {}) {
+  const pane = (id, title, messages, shared, frozen, extra = {}) =>
+    Object.assign(
+      { id, title, updatedAt: 1700000000000, messages, shared, sharedNote: `共同前缀 ${shared} 条已折叠（两侧同源）`, frozen },
+      extra
+    );
+  return Object.assign(
+    {
+      type: 'compare-set',
+      at: 1700000000000,
+      live: false,
+      sides: { a: 'sa', b: 'sb' },
+      panes: {
+        a: pane('sa', '重构登录', [
+          { id: 'S#1', role: 'user', text: '把注释改一下', status: 'done' },
+          { id: 'S#2', role: 'assistant', text: '改好了', status: 'done' },
+          { id: 'F#3', role: 'assistant', text: '甲支的回答', status: 'done' },
+        ], 2, 0),
+        b: pane('sb', '重构登录（分支）', [
+          { id: 'S#1', role: 'user', text: '把注释改一下', status: 'done' },
+          { id: 'S#2', role: 'assistant', text: '改好了', status: 'done' },
+          { id: 'G#3', role: 'assistant', text: '乙支的回答', status: 'done' },
+        ], 2, 1, { frozenNote: '其中 1 条「仍在跑」的状态已冻结为终态' }),
+      },
+      split: {
+        shared: 2,
+        aAfter: 1,
+        bAfter: 1,
+        kind: 'fork',
+        line: '分叉点在第 2 条 · 此后 左 1 条 / 右 1 条',
+        title: '判据：两条会话的消息 id 逐条比对。',
+      },
+      crosstalk: {
+        line: '两条会话共享同一份 DSH 记忆 —— 在任一边继续发消息，另一边也会看到',
+        title: '判据：盘上保存的 DSH 身份',
+        level: 'warn',
+      },
+    },
+    over
+  );
+}
+
+check('C15 开关：点入口 → 面板开且**恰好一条** compare-open；再点 → 收起', () => {
+  resetCompare();
+  const before = posted.filter((m) => m.type === 'compare-open').length;
+  $('compare-btn').click();
+  ok(cmpOpen(), '点了「对照」面板没开');
+  eq(posted.filter((m) => m.type === 'compare-open').length - before, 1, 'compare-open 应恰好发一条（发多了扩展会把快照重取 N 次）');
+  ok($('compare-verdict').hidden, '前置条件：还没收到快照时判定区就该是 hidden（初值从 chat.html 读）');
+  $('compare-btn').click();
+  ok(!cmpOpen(), '再点一次没收起（同一个钮要能开也能关）');
+});
+
+check('C15 **三个空态分开说**：载入中 / 还没选 / 选了但已删', () => {
+  resetCompare();
+  $('compare-btn').click();
+  // ① 快照还没到（postMessage 是异步的）—— 把这几毫秒画成「没有数据」是在说谎
+  ok(hasText(cmpPane('a'), '载入中'), '快照未到时没说「载入中…」');
+  // ② 一条都没选
+  send(compareSet({ panes: {}, sides: {} }));
+  ok(hasText(cmpPane('a'), '还没有可对照的会话'), '没选会话时那句不对');
+  ok(!hasText(cmpPane('a'), '载入中'), '收到空快照后还挂着「载入中」');
+  // ③ 选了，但解不出来（已进回收站 / 已清空）
+  send(compareSet({ panes: {}, sides: { a: 'sa', b: 'gone' } }));
+  ok(hasText(cmpPane('b'), '已被删除或清空'), '选中却解不出来的那一侧没说清是「已被删除或清空」');
+  ok(hasText(cmpPane('a'), '已被删除或清空'), '前置条件：两侧都解不出来时两栏都该说这句');
+});
+
+check('C15 快照落地：两栏各自渲染、分叉点两行、判定区两行且只有串话那行是警示色', () => {
+  resetCompare();
+  $('compare-btn').click();
+  send(compareSet());
+  eq(cmpNodes('a').length, 3, '左栏的尾段条数不对');
+  eq(cmpNodes('b').length, 3, '右栏的尾段条数不对');
+  ok(hasText(cmpPane('a'), '共同前缀 2 条已折叠'), '左栏没说共同前缀被折叠了');
+  ok(hasText(cmpPane('a'), '分叉点之后'), '左栏没有分叉点那条界线');
+  ok(hasText(cmpPane('a'), '甲支的回答') && hasText(cmpPane('b'), '乙支的回答'), '两栏渲染的内容串了');
+  ok(hasText($('compare-meta-b'), '冻结 1 条'), '有冻结条数时侧栏 meta 没写出来');
+  const lines = cmpVerdictLines();
+  eq(lines.length, 2, '判定区应是两行（分叉点 + 串话）');
+  eq(texts(lines[0]).join(''), '分叉点在第 2 条 · 此后 左 1 条 / 右 1 条', '分叉点那行的文案不是扩展侧给的那句');
+  ok(!lines[0].classList.contains('warn'), '分叉点那行不该是警示色');
+  ok(lines[1].classList.contains('warn'), '共享记忆那行**必须**是警示色（那是本项唯一要喊出来的事）');
+  ok(!$('compare-verdict').hidden, '有判定文案时判定区还是 hidden');
+});
+
+check('C15 **无关会话不许出警示色**（另一档 level 的正面反控）', () => {
+  resetCompare();
+  $('compare-btn').click();
+  send(
+    compareSet({
+      split: { shared: 0, aAfter: 3, bAfter: 3, kind: 'none', line: '两侧没有共享消息 —— 不是同一次分支的结果（或源会话的那一段已被清掉）', title: 't' },
+      crosstalk: { line: '两条会话的 DSH 记忆是分开的 —— 在一边发消息不会影响另一边', title: 't', level: 'ok' },
+    })
+  );
+  const lines = cmpVerdictLines();
+  eq(lines.length, 2, '判定区行数不对');
+  ok(lines.every((l) => !l.classList.contains('warn')), '两条无关会话飘出了警示色 —— 警示很快就没人看了');
+  eq(texts(lines[0]).join(''), '两侧没有共享消息 —— 不是同一次分支的结果（或源会话的那一段已被清掉）', '文案被改写了（判据在扩展侧，前端只排版）');
+});
+
+check('C15 折叠是**各自的**：对照栏展开不许把直播面也展开（反控：两个状态共用一个就会串）', () => {
+  resetCompare();
+  // 直播面先折上：100 条 → 折 40
+  send({ type: 'snapshot', sessionId: 's-c15-live', messages: mkMessages(100, 'L') });
+  eq(foldRows().length, 1, '前置条件：直播面该折起来了');
+  eq(msgNodes().length, FOLD_KEEP, '前置条件：直播面该只留尾部 60 条');
+  // 对照栏给一份超长尾段（80 条 > FOLD_KEEP）
+  $('compare-btn').click();
+  const long = [];
+  for (let i = 1; i <= 80; i++) long.push({ id: `T#${i}`, role: 'assistant', text: `尾 ${i}`, status: 'done' });
+  send(compareSet({ panes: { a: Object.assign(compareSet().panes.a, { messages: long }), b: compareSet().panes.b } }));
+  eq(childWithClass(cmpPane('a'), 'msg-fold').length, 1, '对照栏的超长尾段没折起来');
+  eq(cmpNodes('a').length, FOLD_KEEP, '对照栏折完之后该只留 60 条');
+  // 点对照栏那一行
+  childWithClass(cmpPane('a'), 'msg-fold')[0].children[0].click();
+  eq(cmpNodes('a').length, 80, '点了对照栏的「显示」，它自己没展开');
+  // 反控：直播面必须还是折着的（共用 `foldExpanded` 的话它会被一起展开）
+  eq(foldRows().length, 1, '展开对照栏把**直播面**也展开了 —— 两个落点的折叠态串了');
+  eq(msgNodes().length, FOLD_KEEP, '直播面被对照栏的展开带跑了');
+});
+
+check('C15 选择器：点了「选择会话」列出全部会话，**已选的两行点了不发消息**', () => {
+  resetCompare();
+  $('compare-btn').click();
+  send(compareSet());
+  $('compare-pick-a').click();
+  const list = childWithClass(cmpPane('a'), 'cmp-list')[0];
+  ok(list, '点了「选择会话」没长出列表');
+  eq(list.children.length, 3, '列表条数应等于 sessions（在列且有内容的会话）');
+  const rows = list.children;
+  ok(rows[0].classList.contains('disabled'), '本侧那行没置灰');
+  ok(rows[1].classList.contains('disabled'), '对侧那行没置灰');
+  ok(!rows[2].classList.contains('disabled'), '没选中的那行不该置灰');
+  // ⚠️ 灰了还能点出消息是最坏的一种 —— 置灰的行连监听都不许挂
+  const before = posted.filter((m) => m.type === 'compare-pick').length;
+  rows[0].click();
+  rows[1].click();
+  eq(posted.filter((m) => m.type === 'compare-pick').length - before, 0, '置灰的行还挂着 click —— 点它能改掉已经选定的一侧');
+  rows[2].click();
+  const picks = posted.filter((m) => m.type === 'compare-pick');
+  eq(picks.length - before, 1, '点可选的行走应恰好发一条 compare-pick');
+  eq(picks[picks.length - 1].side, 'a', 'compare-pick 的 side 不对');
+  eq(picks[picks.length - 1].sessionId, 'sc', 'compare-pick 的 sessionId 不对');
+});
+
+check('C15 `compare-set` 一到就收起选择器（回执语义 —— 被拒也回整份 set，不会卡在那一屏）', () => {
+  resetCompare();
+  $('compare-btn').click();
+  send(compareSet());
+  $('compare-pick-a').click();
+  ok(childWithClass(cmpPane('a'), 'cmp-list').length === 1, '前置条件：选择器该开着');
+  send(compareSet());
+  eq(childWithClass(cmpPane('a'), 'cmp-list').length, 0, '收到快照后选择器没收起 —— 用户会以为选择没生效');
+  eq(cmpNodes('a').length, 3, '收起选择器后没把转写画回来');
+});
+
+check('C15 **关掉之后迟到的快照不许把面板画回来**', () => {
+  resetCompare();
+  $('compare-btn').click();
+  $('compare-panel-close').click();
+  ok(!cmpOpen(), '前置条件：应先关上');
+  send(compareSet()); // 关掉的那一刻快照还在路上
+  ok(!cmpOpen(), '迟到的 compare-set 把面板画回来了 —— 用户关不掉它');
+  ok(!hasText(cmpPane('a'), '甲支的回答'), '迟到的快照往已关闭的面板里写了内容');
+  // 再打开必须是干净的「载入中」，而不是上一份快照的残影
+  $('compare-btn').click();
+  ok(hasText(cmpPane('a'), '载入中'), '重开面板时还留着上一次的快照');
+});
+
+check('C15 **对照栏不许污染直播面的 byId**（迟到帧按 id 找不到记录，什么都不能做）', () => {
+  resetCompare();
+  $('compare-btn').click();
+  send(
+    compareSet({
+      panes: {
+        a: Object.assign(compareSet().panes.a, {
+          messages: [
+            { id: 'cmp-t1', role: 'tool', text: '', status: 'done', toolName: 'bash', toolInput: 'ls', toolOutput: 'x', toolState: 'unknown' },
+          ],
+        }),
+        b: compareSet().panes.b,
+      },
+    })
+  );
+  const card = cmpCards('a')[0];
+  ok(card, '对照栏里的工具卡没渲染出来');
+  ok(card.classList.contains('unknown'), '前置条件：那卡该是 unknown 态');
+  // 迟到帧：id 与对照栏里那张卡相同
+  send({ type: 'tool-result', id: 'cmp-t1', toolState: 'ok', output: 'done!' });
+  ok(card.classList.contains('unknown'), '对照栏那张卡的 class 被迟到帧改了 —— 说明它的记录进了直播面的 byId（给迟到帧开了一扇门）');
+  ok(!card.classList.contains('ok'), '对照栏那张卡被翻成了成功 —— 同上');
+  ok(hasText($('compare-transcript-a'), '? 无结果'), '对照栏那张卡的状态字被迟到帧改了');
+});
+
+check('C15 对照渲染**不碰直播面**，且冻结过的状态是终态视觉（不转圈、不闪光标）', () => {
+  resetCompare();
+  send({ type: 'snapshot', sessionId: 's-c15-live', messages: mkMessages(4, 'L') });
+  const liveBefore = messagesEl().children.length;
+  $('compare-btn').click();
+  send(
+    compareSet({
+      panes: {
+        a: Object.assign(compareSet().panes.a, {
+          messages: [
+            { id: 'fz1', role: 'tool', text: '', status: 'done', toolName: 'bash', toolInput: 'ls', toolState: 'unknown' },
+            { id: 'fz2', role: 'assistant', text: '被打断的那句', status: 'interrupted' },
+          ],
+        }),
+        b: compareSet().panes.b,
+      },
+    })
+  );
+  eq(messagesEl().children.length, liveBefore, '渲染对照栏动了 #messages 的子节点 —— 直播面被它碰了');
+  const c = cmpCards('a')[0];
+  ok(c.classList.contains('unknown'), '冻结过的工具卡不是 unknown 态');
+  ok(!c.classList.contains('running'), '冻结过的工具卡还在转圈 —— 那是「还在跑」的视觉，与 unknown 的语义打架');
+  ok(!hasText(cmpPane('a'), '运行中'), '冻结过的工具卡状态字还是「运行中…」');
+  // 打断的助手消息不许有闪烁光标（那是「正在生成」的视觉）
+  const carets = walk(cmpPane('a')).filter((e) => e.classList.contains('caret'));
+  eq(carets.length, 0, '对照栏里有 caret —— 冻结过的一条看起来还在生成');
+});
+
+check('C15 三个浮层互斥（同层 z-40，同时开着没有视觉仲裁）', () => {
+  resetCompare();
+  $('review-view').click(); // 走真实入口：它同时置内部标志与 .open（只加 class 的话，互斥那条判据就只是在验 CSS）
+  $('compare-btn').click();
+  ok(cmpOpen(), '对照没开');
+  ok(!$('review-panel').classList.contains('open'), '开着审阅时点对照，审阅没收 —— 两个满屏浮层会叠在一起');
+  $('compare-btn').click(); // 先关掉，避免它干扰下面这条
+  // 开着对照 → 点运行检查器的「查看」
+  $('compare-btn').click();
+  ok(cmpOpen(), '前置条件：对照该开着');
+  $('runs-view').click();
+  ok(!cmpOpen(), '开着对照时点运行的「查看」，对照没收');
+  ok($('runs-panel').classList.contains('open'), '运行检查器没开');
+  $('runs-panel-close').click();
+});
+
+check('C15 Esc 逐层收：对照开着时 Esc 收对照（且不误关历史面板）', () => {
+  resetCompare();
+  $('compare-btn').click();
+  ok(cmpOpen(), '前置条件：对照该开着');
+  pressKey('Escape');
+  ok(!cmpOpen(), 'Esc 没收掉对照浮层');
+  // 反控：审阅浮层开着时 Esc 该收审阅 —— 顺序是「审阅 → 运行 → 对照 → 历史」
+  $('review-view').click();
+  pressKey('Escape');
+  ok(!$('review-panel').classList.contains('open'), 'C9 起的那条次序被破坏了：Esc 没先收审阅');
+});
+
+check('C15 结构守卫：CSS 与 chat.html 的形状（影子表达不了布局，只验字面）', () => {
+  const css = readFileSync(join(repoRoot, 'media', 'chat.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  const block = (sel) => {
+    for (const m of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      if (m[1].split(',').some((s) => s.trim() === sel)) return m[2];
+    }
+    return undefined;
+  };
+  const tr = block('.cmp-transcript');
+  ok(tr, 'chat.css 里找不到 .cmp-transcript');
+  // `.msg` 的 align-self（用户靠右/助手靠左）与 max-width:92% 都是 **flex 项**属性 ——
+  // 块容器下用户消息就不右对齐了，而影子看不到布局，只能钉住这两条声明。
+  ok(/display:\s*flex/.test(tr), '.cmp-transcript 不是 display:flex —— 栏里的用户消息不会右对齐');
+  ok(/flex-direction:\s*column/.test(tr), '.cmp-transcript 不是 column');
+  ok(!/max-width/.test(tr), '.cmp-transcript 抄了 .messages 的 max-width —— 半宽的栏里内容会被挤成一条');
+  ok(!/margin:\s*0\s+auto/.test(tr), '.cmp-transcript 抄了 .messages 的 margin:0 auto（那是单栏的阅读列）');
+  const body = block('.cmp-body');
+  ok(body && /grid-template-columns:\s*1fr\s+1fr/.test(body), '.cmp-body 不是并排两栏');
+  ok(/@media \(max-width: 520px\)/.test(css), '窄栏改竖排的那条 media query 不见了');
+  const warn = block('.cmp-verdict-line.warn');
+  ok(warn && /warning/.test(warn), '警示那行没走 warning token（复用仓库已有 token，不新造色）');
+
+  // chat.html：面板必须是 body 直系子元素，且**不在 #messages 的区间里** ——
+  // react-live 时 `#messages` 整个 display:none，放进去的浮层会跟着消失（C14 栽过）。
+  const html = readFileSync(join(repoRoot, 'media', 'chat.html'), 'utf8');
+  const msgOpen = html.indexOf('id="messages"');
+  const mainClose = html.indexOf('</main>', msgOpen);
+  const panelAt = html.indexOf('id="compare-panel"');
+  ok(msgOpen > 0 && mainClose > msgOpen && panelAt > 0, 'chat.html 里找不到 #messages / #compare-panel 的区间');
+  ok(panelAt > mainClose, '#compare-panel 落在 #messages 的区间里 —— react-live 时它会跟着一起消失');
+  // 入口钮在 header 的动作区里（不在 composer —— 那里是「本轮的读数/动作」的地方）
+  const actionsAt = html.indexOf('header-actions');
+  const actionsEnd = html.indexOf('</div>', actionsAt);
+  const btnAt = html.indexOf('id="compare-btn"');
+  ok(btnAt > actionsAt && btnAt < actionsEnd, '#compare-btn 不在 .header-actions 里');
+  ok(html.indexOf('id="compare-verdict"') > 0 && /\shidden/.test(html.slice(html.indexOf('id="compare-verdict"') - 60, html.indexOf('id="compare-verdict"') + 60)), '#compare-verdict 的 hidden 初值被去掉了 —— 空判定区会占一块位置');
+});
+
+// ---------- C16 · 审批白名单记忆（「永久信任」） ----------
+//
+// 真机看到的是「拦停条上多一个『永久信任此命令/此目录』按钮 + 一行边界说明」。
+// 这里验影子能表达的部分：**能不能提供信任、提供哪一种、文案怎么写，全是扩展说了算**
+// （webview 只画它拿到的那份，不拼字、不推断），点下去回传的粒度原样，
+// 以及四条**不许发生**的事 —— Esc 被反转成信任、「允许执行」被静默升级成永久信任、
+// 下一条审批继承上一条的粒度、老载荷下留一个没字的空按钮。
+
+/** 一份「扩展允许永久信任」的载荷：`kind` 决定是命令档还是目录档 */
+const trustPayload = (id, kind, over = {}) =>
+  Object.assign(
+    {
+      type: 'approval-request',
+      id,
+      toolName: kind === 'dir' ? 'write' : 'bash',
+      command: kind === 'dir' ? 'write D:\\out\\a.ts' : 'rm -rf ./dist',
+      trust: {
+        kind,
+        label: kind === 'dir' ? '永久信任此目录' : '永久信任此命令',
+        scope:
+          kind === 'dir'
+            ? '这个目录及其子目录都不再问（D:\\out）'
+            : '只对这一条命令生效（在 D:\\proj 里）',
+      },
+    },
+    over
+  );
+
+/** 干净的局面：屏上不挂任何一条审批（走真实的两条消息收，不碰内部函数） */
+function resetApproval() {
+  send({ type: 'approval-request', id: 'c16-reset', toolName: 'bash', command: 'echo reset' });
+  send({ type: 'approval-resolved', id: 'c16-reset' });
+  posted.length = 0;
+}
+
+check('C16 拦停条：带 trust 的载荷 ⇒ 按钮与边界说明都出现，文案逐字是扩展给的那份', () => {
+  resetApproval();
+  send(trustPayload('c16-1', 'command'));
+  eq($('approval-bar').hidden, false, '前置条件不成立：条没弹出来');
+  eq($('approval-trust').hidden, false, '扩展说这次能给永久信任，按钮却没画出来');
+  eq($('approval-trust').textContent, '永久信任此命令', '按钮文字不是扩展给的那份 —— 带判定的文案不许在前端拼');
+  eq($('approval-scope').hidden, false, '给了信任却不说明它覆盖什么 —— 那才是这个按钮真正的分量');
+  eq($('approval-scope').textContent, '只对这一条命令生效（在 D:\\proj 里）', '边界说明被改字了');
+});
+
+check('C16 反控：不带 trust 的老载荷 ⇒ 按钮与说明行一起藏起来，且一个字都不留', () => {
+  resetApproval();
+  send({ type: 'approval-request', id: 'c16-2', toolName: 'bash', command: 'rm -rf ./dist' });
+  eq($('approval-trust').hidden, true, '没有 trust 的载荷也把按钮画出来了');
+  eq($('approval-trust').textContent, '', '藏起来了但文字还在 —— 换了显示方式就会漏出一句不属于这条审批的承诺');
+  eq($('approval-scope').hidden, true, '没有 trust 的载荷也把边界说明画出来了');
+  eq($('approval-scope').textContent, '', '藏起来了但说明还在');
+});
+
+check('C16 点「永久信任」⇒ 恰好一条 approval-answer，allow:true 且粒度原样回传', () => {
+  resetApproval();
+  send(trustPayload('c16-3', 'command'));
+  $('approval-trust').click();
+  eq(posted.length, 1, `点一下该只发一条消息，实际 ${posted.length} 条`);
+  const m = posted[0];
+  eq(m.type, 'approval-answer', '发出去的不是审批答复');
+  eq(m.id, 'c16-3', '回的 id 不对 —— 扩展那边会当失效帧静默丢掉，这个按钮就成了摆设');
+  eq(m.allow, true, '点了永久信任却没允许这次执行');
+  eq(m.trust, 'command', '粒度丢了或串成了别的档');
+  eq($('approval-bar').hidden, true, '拍板后条没收起 —— 下一次审批会先闪出上一次的命令');
+});
+
+check('C16 连点只发一条（收起发生在回话之前）', () => {
+  resetApproval();
+  send(trustPayload('c16-4', 'dir'));
+  $('approval-trust').click();
+  $('approval-trust').click();
+  eq(posted.length, 1, `连点第二下又发了一条（共 ${posted.length} 条）—— 扩展侧会拿到两条答复`);
+});
+
+check('C16 dir 档走同一条路（webview 不擅自把粒度改成 command）', () => {
+  resetApproval();
+  send(trustPayload('c16-5', 'dir'));
+  eq($('approval-trust').textContent, '永久信任此目录', 'dir 档的按钮文字不对');
+  $('approval-trust').click();
+  eq(posted.length, 1, '点一下该只发一条消息');
+  eq(posted[0].trust, 'dir', 'dir 档被前端改成了别的粒度 —— 那就成了「我准的是目录、它记下的是命令」或反过来');
+});
+
+check('C16 Esc 仍然是拒绝：allow:false 且**不带 trust**（把拒绝反转成信任是最坏的一种）', () => {
+  resetApproval();
+  send(trustPayload('c16-6', 'command'));
+  pressKey('Escape');
+  eq(posted.length, 1, `Esc 该只发一条消息，实际 ${posted.length} 条`);
+  eq(posted[0].allow, false, 'Esc 没被当成拒绝');
+  ok(!('trust' in posted[0]), 'Esc 的答复里带上了 trust —— 一次拒绝会被记成永久信任');
+  eq($('approval-trust').hidden, true, 'Esc 之后按钮还亮着');
+});
+
+check('C16 点「允许执行」⇒ 只允许这次，答复里不带 trust（不许静默升级）', () => {
+  resetApproval();
+  send(trustPayload('c16-9', 'command'));
+  $('approval-allow').click();
+  eq(posted.length, 1, '点一下该只发一条消息');
+  eq(posted[0].allow, true, '点了允许执行却没允许');
+  ok(!('trust' in posted[0]), '「允许执行」被静默升级成了永久信任 —— 那是替用户按下了另一个按钮');
+});
+
+check('C16 收起即复位：下一条不带 trust 的审批不许继承上一条的按钮文字与说明', () => {
+  resetApproval();
+  send(trustPayload('c16-7', 'dir'));
+  send({ type: 'approval-resolved', id: 'c16-7' });
+  send({ type: 'approval-request', id: 'c16-7b', toolName: 'bash', command: 'echo hi' });
+  eq($('approval-trust').hidden, true, '下一条（不给信任的）审批把上一条的按钮继承下来了');
+  eq($('approval-trust').textContent, '', '按钮藏起来了却还写着上一条的粒度 —— 一旦显示出来就是错的粒度');
+  eq($('approval-scope').hidden, true, '边界说明也被继承了 —— 它会指着一个与这条命令无关的目录');
+});
+
+check('C16 复位后即使按下那个（已隐藏的）按钮，也不会替扩展记下上一条的粒度', () => {
+  resetApproval();
+  send(trustPayload('c16-8', 'dir'));
+  send({ type: 'approval-resolved', id: 'c16-8' });
+  posted.length = 0;
+  send({ type: 'approval-request', id: 'c16-8b', toolName: 'bash', command: 'echo hi' });
+  // 真实用户点不到（hidden），但 DOM 上点得动 —— 这是 check「kind 有没有被复位」唯一的手段
+  $('approval-trust').click();
+  eq(posted.length, 1, `该只发一条（允许这次），实际 ${posted.length} 条`);
+  eq(posted[0].allow, true, '按钮的处理器不认这条审批了');
+  ok(!('trust' in posted[0]), '按下了上一条遗留的按钮，却把 dir 档记到了这条根本无从信任的命令上');
+});
+
+check('C16 结构守卫：#approval-trust 在按钮行里、#approval-scope 另起一行，两者初始 hidden', () => {
+  const html = readFileSync(htmlPath, 'utf8');
+  const actAt = html.indexOf('class="approval-actions"');
+  const actEnd = html.indexOf('</div>', actAt);
+  const btnAt = html.indexOf('id="approval-trust"');
+  ok(actAt > 0 && actEnd > actAt, 'chat.html 里找不到 .approval-actions 的区间');
+  ok(btnAt > actAt && btnAt < actEnd, '#approval-trust 不在 .approval-actions 里 —— 窄侧栏下它会掉出按钮行');
+  ok(/id="approval-trust"[^>]*\shidden(?=[\s/>])/.test(html), '#approval-trust 没写**初始 hidden** —— 老载荷下会留一个没字的空按钮');
+  const scopeAt = html.indexOf('id="approval-scope"');
+  ok(scopeAt > 0, 'chat.html 里没有 #approval-scope（信任的边界没有落点）');
+  ok(scopeAt < actAt || scopeAt > actEnd, '#approval-scope 挤进了 .approval-actions —— 它是整段文本，塞进按钮行会把按钮挤走');
+  ok(/id="approval-scope"[^>]*\shidden(?=[\s/>])/.test(html), '#approval-scope 没写初始 hidden —— 每次审批都会先闪出一块空说明');
+  // 静态标签只能从源码上验（影子不解析 HTML 里的文本节点）：三个按钮读作
+  // 允许执行 / 永久信任… / 拒绝 —— 「允许执行」本来就是「信任这次」，改字只会让既有断言白白重跑
+  ok(
+    /<button[^>]*id="approval-allow"[^>]*>[^<]*允许执行/.test(html),
+    '「允许执行」的标签被改了 —— 它承载的语义是「信任这次」，不是「总是允许」'
+  );
+});
+
+check('C16 CSS 守卫：.approval-scope 走 warn 那套 token（不是 warning）且没写 display', () => {
+  const css = readFileSync(join(repoRoot, 'media', 'chat.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  const block = (sel) => {
+    for (const m of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      if (m[1].split(',').some((s) => s.trim() === sel)) return m[2];
+    }
+    return undefined;
+  };
+  const scope = block('.approval-scope');
+  ok(scope, 'chat.css 里找不到 .approval-scope');
+  ok(/--dsw-alias-state-warn-primary/.test(scope), '.approval-scope 没走 warn 那套 token —— 它和命令原文就只剩字号不一样');
+  ok(
+    !/state-warning-/.test(scope),
+    '.approval-scope 写了 -warning- 那套 token —— dsh-live.css 里没有它，会静默退到 VS Code 兜底色（.approval-note 正是这个情况）'
+  );
+  ok(!/display:/.test(scope), '.approval-scope 里写了 display —— [hidden] 会失效，没信任可说时也占一块位置');
+});
+
+// ---------- C17 · 图片附件（诚实降级） ----------
+//
+// 真机看到的是：贴一张截图 ⇒ 待发条上是一枚写着「图片 · 1.2 MB · 模型看不到」的 chip，
+// 发出去之后模型收到的是一段说明（不是图，永远不是图 —— 它到不了）。
+//
+// 这里验影子能表达的部分：**字节怎么走（dataBase64，且绝不带 content）、chip 怎么说话、
+// 三道闸（大小 / 张数 / 坏附件不许发）拦不拦得住**，以及一条反控 —— 文本附件照旧走老路。
+
+const fakeImage = (over = {}) =>
+  Object.assign(
+    {
+      name: 'shot.png',
+      type: 'image/png',
+      size: 1258291,
+      dataUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB',
+    },
+    over
+  );
+
+/** 贴文件：走**真实的 paste 监听器**（不是直接调内部函数） */
+function pasteFiles(files) {
+  $('input').dispatch('paste', { clipboardData: { files } });
+}
+
+/** 按 Enter 发送：走**真实的 keydown 监听器** */
+function pressEnter() {
+  $('input').dispatch('keydown', { key: 'Enter', shiftKey: false });
+}
+
+let c17Ack = 0;
+/**
+ * 干净局面。两件事都要做，少一件后面的用例就会**因为错误的原因通过**：
+ * - 逐个点掉待发 chip（✕ 是真实的移除路径）；
+ * - 收一条扩展回执 —— `sending` 只有在回执里才会归位，而 `send()` 开头就是
+ *   `if (inputEl.disabled || sending) return`：不归位的话下一条用例按 Enter 什么都不会发生，
+ *   于是「有坏附件却发出去了」这类断言会**假绿**。
+ */
+function resetAttach() {
+  for (let i = 0; i < 40 && $('attach-list').children.length > 0; i++) {
+    const chip = $('attach-list').children[0];
+    const x = chip.children.filter((c) => c.classList.contains('chip-x'))[0];
+    if (!x) break;
+    x.click();
+  }
+  send({
+    type: 'user-message',
+    message: { id: 'c17-ack-' + ++c17Ack, role: 'user', text: '', status: 'done' },
+  });
+  $('input').value = '';
+  posted.length = 0;
+}
+
+check('C17 粘一张图 ⇒ 一条 user-message，带字节，**绝不带 content**', () => {
+  resetAttach();
+  pasteFiles([fakeImage()]);
+  eq($('attach-bar').hidden, false, '贴了图但待发条没出现');
+  $('input').value = '看看这张图';
+  pressEnter();
+  eq(posted.length, 1, `该只发一条消息，实际 ${posted.length} 条`);
+  const m = posted[0];
+  eq(m.type, 'user-message');
+  eq(m.attachments.length, 1, '附件数不对');
+  const a = m.attachments[0];
+  eq(a.kind, 'image', 'kind 没传上去 —— 扩展侧只能靠 dataBase64 猜');
+  eq(a.mediaType, 'image/png', 'mediaType 没传（扩展侧会重新嗅探，但 chip 要用它）');
+  eq(a.bytes, 1258291, 'bytes 没传 —— chip 上的大小就没得显示');
+  ok(typeof a.dataBase64 === 'string' && a.dataBase64.length > 0, '没把字节传上去，扩展侧无从落盘');
+  ok(!/^data:/.test(a.dataBase64), 'base64 里带着 `data:` 前缀 —— 扩展侧解出来会多一段垃圾');
+  eq(a.content, undefined, '图片附件带上了 content —— 那是把二进制当文本递给了模型');
+});
+
+check('C17 chip 上写的是「图片 + 真实大小 + 模型看不到」', () => {
+  resetAttach();
+  pasteFiles([fakeImage()]);
+  const chip = $('attach-list').children[0];
+  ok(chip.classList.contains('chip-image'), '没打上 .chip-image');
+  ok(hasText(chip, 'shot.png'), '没写文件名');
+  ok(hasText(chip, '图片'), '没写「图片」');
+  ok(hasText(chip, '1.2 MB'), '没写真实大小');
+  ok(hasText(chip, '模型看不到'), '没写「模型看不到」—— 那这枚 chip 就在暗示模型看见过它');
+  eq(walk(chip).filter((e) => e.tagName === 'IMG').length, 0, '画了 <img>');
+});
+
+check('C17 超 3.5MB ⇒ chip 上说「图片过大」，且 send() 什么都不发', () => {
+  resetAttach();
+  pasteFiles([fakeImage({ name: 'huge.png', size: 4 * 1024 * 1024 })]);
+  const chip = $('attach-list').children[0];
+  ok(hasText(chip, '图片过大'), `没说清是图片过大：${texts(chip).join('|')}`);
+  $('input').value = '发';
+  pressEnter();
+  eq(posted.length, 0, '有坏附件却发出去了');
+});
+
+check('C17 第 5 张图 ⇒ 拒的是**张数**，不是大小', () => {
+  resetAttach();
+  for (let i = 0; i < 4; i++) pasteFiles([fakeImage({ name: `a${i}.png` })]);
+  eq($('attach-list').children.length, 4, '前 4 张该都进来（上限是 4）');
+  pasteFiles([fakeImage({ name: 'a5.png' })]);
+  const last = $('attach-list').children[4];
+  ok(last, '第 5 张连 chip 都没有 —— 那用户根本不知道自己贴的那张去哪了');
+  ok(hasText(last, '图片最多 4 张'), `第 5 张的说法不对：${texts(last).join('|')}`);
+});
+
+check('C17 反控：文本附件照旧走 content 那一路（图片分支不许把老的带坏）', () => {
+  resetAttach();
+  send({ type: 'files-picked', attachments: [{ name: 'a.txt', path: 'D:\\p\\a.txt', content: 'hello' }] });
+  const chip = $('attach-list').children[0];
+  ok(!chip.classList.contains('chip-image'), '文本附件被打上了图片标');
+  $('input').value = 'q';
+  pressEnter();
+  const a = posted[0].attachments[0];
+  eq(a.content, 'hello', '文本内容没发出去');
+  eq(a.dataBase64, undefined, '文本附件带上了 dataBase64');
+  eq(a.kind, undefined, '文本附件被贴上了 kind');
+});
+
+check('C17 待发项的 truncated 要转发（今天它在这里被丢掉）', () => {
+  resetAttach();
+  send({
+    type: 'files-picked',
+    attachments: [{ name: 'big.txt', content: 'x'.repeat(10), truncated: true }],
+  });
+  ok(hasText($('attach-list').children[0], '已截断'), 'chip 上没提示已截断');
+  $('input').value = 'q';
+  pressEnter();
+  eq(posted[0].attachments[0].truncated, true, 'truncated 又被丢了 —— 扩展侧只会看到一段"完好"的内容');
+});
+
+check('C17 气泡里的图片附件画成文字 chip（不是图）', () => {
+  send({
+    type: 'snapshot',
+    messages: [
+      {
+        id: 'c17-m1',
+        role: 'user',
+        text: '',
+        status: 'done',
+        attachments: [
+          { name: 'shot.png', path: 'D:\\p\\shot.png', kind: 'image', mediaType: 'image/png', bytes: 1258291 },
+        ],
+      },
+    ],
+  });
+  const nodes = msgNodes();
+  const node = nodes[nodes.length - 1];
+  const chip = walk(node).filter((e) => e.classList.contains('chip-image'))[0];
+  ok(chip, '气泡里没画出图片 chip');
+  ok(hasText(chip, 'shot.png') && hasText(chip, '1.2 MB') && hasText(chip, '模型看不到'), `chip 文案不对：${texts(chip).join('|')}`);
+  eq(walk(node).filter((e) => e.tagName === 'IMG').length, 0, '气泡里出现了 <img> —— 读起来就是「模型看见过这张图」');
+  send({ type: 'snapshot', messages: [] });
+});
+
+check('C17 CSS 守卫：图片 chip 那两枚小标走的是 dsh-live.css 里真有的 token', () => {
+  const css = readFileSync(join(repoRoot, 'media', 'chat.css'), 'utf8');
+  const live = readFileSync(join(repoRoot, 'media', 'dsh-live', 'dsh-live.css'), 'utf8');
+  for (const cls of ['.chip-tag', '.chip-dim']) {
+    ok(css.includes(cls), `chat.css 里找不到 ${cls}`);
+  }
+  const dim = css.slice(css.indexOf('.chip-dim'));
+  const scope = dim.slice(0, dim.indexOf('}'));
+  ok(/--dsw-alias-label-secondary/.test(scope), '.chip-dim 没走 label-secondary');
+  ok(
+    live.includes('--dsw-alias-label-secondary'),
+    'dsh-live.css 里没有 --dsw-alias-label-secondary —— 那它会静默退到 VS Code 兜底色'
+  );
+  // 同 C16 那条：chip 上是 [hidden] 管的显隐，一条 display 就能把它整条废掉
+  ok(!/display:/.test(scope), '.chip-dim 里写了 display');
 });
 
 console.log('');

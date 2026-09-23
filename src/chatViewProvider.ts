@@ -6,6 +6,7 @@ import { randomBytes } from 'crypto';
 import {
   Attachment,
   ChatMessage,
+  ComparePane,
   DshConnState,
   ExtToWebview,
   FileRef,
@@ -59,8 +60,22 @@ import {
   isForecastTool,
   parseToolArgs,
   resolveTargetPath,
+  isInsideDir,
   ForecastIO,
 } from './changeForecast';
+import {
+  addTrust,
+  describeTrust,
+  matchTrust,
+  offerTrust,
+  readTrustFile,
+  removeTrust,
+  TrustEntry,
+  TrustOffer,
+  TrustQuery,
+  TRUST_FILE_NAME,
+  writeTrustFile,
+} from './approvalTrust';
 import {
   EFFORT_VALUES,
   EffortPluginMount,
@@ -70,10 +85,28 @@ import {
   writeEffortPluginFiles,
   writeEffortState,
 } from './effortPlugin';
+// C17：图片附件的判据全在纯模块里（能在扩展宿主之外加载 → 探针验得了）。
+import {
+  binaryFileError,
+  imageExtHint,
+  IMAGE_DIR_REL,
+  imageBytesAllowed,
+  imageNote,
+  imageTooLargeError,
+  imagesWithinCount,
+  noteForAttachment,
+  notAnImageError,
+  safeImageFileName,
+  sniffImageMediaType,
+  tooManyImagesError,
+} from './imageAttach';
+// 二进制判定只有一份源：附件这条路问的是与审阅同一个问题（「这文件能不能当文本读」）
+import { binaryExt, hasNulByte } from './fileSnapshot';
 import { isAbortError, streamMockReply } from './mockAssistant';
 import {
   capToolInput,
   dshStillReferenced,
+  freezeTranscript,
   LoadReport,
   RETENTION_DAY_MS,
   SessionStore,
@@ -81,6 +114,18 @@ import {
   titleFromText,
 } from './sessionStore';
 import { removeDshSessionDir } from './dshPaths';
+import {
+  crossTalkLine,
+  crossTalkOf,
+  crossTalkTitle,
+  divergenceLine,
+  divergenceOf,
+  divergenceTitle,
+  FORK_SUFFIX,
+  frozenTail,
+  pickCounterpart,
+  sharedPrefixNote,
+} from './branchCompare';
 import { searchSessions } from './sessionSearch';
 import { sessionToJson, sessionToMarkdown, suggestedFileName } from './sessionExport';
 import {
@@ -133,6 +178,11 @@ import { writeToolPolicyPluginFiles, type ToolPolicyMount } from './toolPolicyPl
 /** 附件内容上限：超过这个字节数的文件不读；超过这个字符数的内容截断。 */
 const MAX_FILE_BYTES = 10 * 1024; // 单文件最多 10KB
 const MAX_CONTENT_CHARS = 200 * 1024;
+
+/** C17：落盘图片的存活期。**7 天**（选区临时文件只留 6 小时 —— 那个只在当轮有意义，图片会被
+ *  人回过头来引用）。转写里仍留着文件名与大小，所以 chip 不会消失，只是「用命令打开它」这条路
+ *  过期了。之所以敢按时间删：C15 的分叉意味着两条会话可能引用同一个路径，按引用回收做不到。 */
+const IMAGE_TTL_MS = 7 * 24 * 3600 * 1000;
 
 /** globalState 里记住上次用的模式 */
 const MODE_KEY = 'hello.chat.mode';
@@ -467,6 +517,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** C13：挂起审批的路径两读法说明（id → note）。**与 `_approvalCmds` 分开存** ——
    *  它只在 POSIX 形态的 write/edit 上才有，而 `_approvalCmds` 每条都必须有（留痕要用） */
   private readonly _approvalNotes = new Map<string, string>();
+  /** C16：挂起审批的**原样载荷**（id → ask）。`ApprovalServer._pending` 只留结算器，
+   *  而建「永久信任」需要命令原文/目标路径 ⇒ 这里补一份，`_onApprovalResolved` 里删。 */
+  private readonly _approvalAsks = new Map<string, ApprovalAsk>();
+  /** C16：这一答记没记住（id → 说明）。走下一条同样的通道并进留痕，不另推一条 note */
+  private readonly _approvalTrustNotes = new Map<string, string>();
+  /** C16：白名单读不下去的告警是否已弹过（每次 activation 最多一句） */
+  private _trustWarned = false;
   /** 审批相关告警是否已弹过（每次 activation 最多烦用户一次） */
   private _approvalWarned = false;
   /**
@@ -575,6 +632,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private readonly _runs = new RunInspector();
   /** 运行浮层是否开着。开着才把 `details` 随 `runs` 一起下发（体积控制） */
   private _runsPanelOpen = false;
+
+  /**
+   * C15：对照浮层选中的两侧（UI 会话 id）。**纯内存、不落盘** —— 重开面板回到默认对。
+   *
+   * ⚠️ 与 `_runsPanelOpen` 的差别：对照**没有推送**（只读快照，只在打开/换侧/刷新时发），
+   * 所以不需要「开着吗」这个闸，webview 关了面板也不必告诉扩展。见 protocol.ts 的 `compare-open`。
+   */
+  private _compareSides: { a?: string; b?: string } = {};
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -819,12 +884,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case 'approval-answer':
         // C1：确认条上的允许/拒绝；对已失效的 id 静默忽略（超时/已答过）
-        this._approval?.answer(msg.id, msg.allow);
+        // C16：带 trust 时先记白名单 —— **记不记得住都不改变这次允许**（见 _createTrust）
+        this._answerApproval(msg.id, msg.allow, msg.trust);
         break;
       case 'run-panel':
         // C9：浮层开着才把详情随读数一起发（关掉时不必回发 —— 前端自己就把面板收了）
         this._runsPanelOpen = msg.open;
         if (msg.open) this._postRuns();
+        break;
+      case 'compare-open':
+        // C15：打开或刷新（幂等）。没有 compare-close —— 扩展对面板开合无状态（见 protocol.ts）
+        this._openCompare();
+        break;
+      case 'compare-pick':
+        this._pickCompareSide(msg.side, msg.sessionId);
         break;
       case 'clear':
         this.startNewSession();
@@ -963,6 +1036,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const names = badAttachments.map((a) => `「${a.name}」`).join('、');
       vscode.window.showWarningMessage(`以下文件无法读取或过大，已取消发送：${names}`);
       this._post({ type: 'user-message-rejected', reason: `${names} 读取失败或过大，请移除后重发` });
+      return;
+    }
+
+    // C17：图片张数上限的**兜底复查**。webview 侧有一份镜像（贴第 5 张时当场就拦了），这一条是
+    // 防两边都被改漏 —— 少一道，用户拖 50 张截图进来就是往工作区写一百多 MB。
+    const images = attachments.filter((a) => a.kind === 'image');
+    if (images.length > 0 && !imagesWithinCount(images.length)) {
+      const reason = tooManyImagesError(images.length);
+      vscode.window.showWarningMessage(`已取消发送：${reason}`);
+      this._post({ type: 'user-message-rejected', reason });
       return;
     }
 
@@ -1117,6 +1200,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           } else {
             parts.push(this._selectionExcerpt(a));
           }
+          continue;
+        }
+        if (a.kind === 'image') {
+          // C17：图片**永远不发字节**（它到不了模型），发的是那段说明（路径 + 「你看不到它」）。
+          // 它必须排在下面 `<file>` 那行**之前**：图片没有 content，掉进那行只会拼出一个空块，
+          // 而模型会以为「这个文件是空的」而不是「这个文件我看不见」。
+          parts.push(noteForAttachment(a));
           continue;
         }
         const loc = a.path ? ` path="${a.path}"` : '';
@@ -2185,6 +2275,120 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
   }
 
+  // ---------- C15 分支对照（只读浮层） ----------
+
+  /**
+   * 打开 / 刷新对照浮层：定两侧 → 发一份快照。**幂等**（点「刷新」也走这条）。
+   *
+   * 先 `_sendHistory()` 再 `_postCompare()`：前端的会话选择器数据源就是历史列表那一份
+   * （`_sendHistory` 的 `active()` 过滤 = 在列且有内容，正好就是可对照的集合 —— 一处实现），
+   * 先发免得选择器短暂显示上一份。
+   */
+  private _openCompare(): void {
+    if (this._compareSides.a === undefined) this._compareSides.a = this._active.id;
+    if (this._compareSides.b === undefined) {
+      const other = pickCounterpart(
+        this._active,
+        this._store.active().filter((s) => s.id !== this._active.id)
+      );
+      if (other) this._compareSides.b = other.id;
+    }
+    this._sendHistory();
+    this._postCompare();
+  }
+
+  /** 换某一侧。两侧不允许是同一条（前端已置灰，这里兜底迟到/陈旧的点击）。 */
+  private _pickCompareSide(side: 'a' | 'b', id: string): void {
+    if (id === (side === 'a' ? this._compareSides.b : this._compareSides.a)) return;
+    this._compareSides[side] = id;
+    this._postCompare();
+  }
+
+  /**
+   * 解析一侧：`_store.get` 就够 —— 活动会话在首次说话时已被 `add(this._active)`，与数组里
+   * 那个对象**是同一个引用**，所以直播中它也是最新的（不是盘上一次快照）。
+   *
+   * 解不出来的（空会话 / 已进回收站）返回 undefined，调用方会**就地清掉记录** ——
+   * 面板要能回到「还没选」，绝不能留着一条指向空气的 id。
+   */
+  private _resolveCompareSide(id?: string): StoredSession | undefined {
+    if (!id) return undefined;
+    const s = this._store.get(id);
+    if (!s || s.deletedAt !== undefined || s.messages.length === 0) return undefined;
+    return s;
+  }
+
+  /**
+   * 一条侧的载荷：**只有分叉点之后的尾段**（共同前缀两侧逐字相同，不发也不渲染）。
+   *
+   * `shared` / `drifted` 都是**这一对**的属性（由 `divergenceOf` 算出后传进来）——
+   * 别在这一侧里重新推一遍，那是第二个判据。
+   */
+  private _comparePane(s: StoredSession, shared: number, drifted: number): ComparePane {
+    const { messages, frozen } = frozenTail(s, shared);
+    return {
+      id: s.id,
+      title: s.title,
+      messages,
+      shared,
+      sharedNote: sharedPrefixNote(shared, drifted),
+      frozen,
+      frozenNote: frozen > 0 ? `其中 ${frozen} 条「仍在跑」的状态已冻结为终态` : undefined,
+      dshId: s.dsh?.id,
+      updatedAt: s.updatedAt,
+    };
+  }
+
+  /**
+   * 下发一份对照快照。判定（分叉点 + 串话）全在 `branchCompare` 里算，**文案也由它拼好**
+   * —— webview 只排版。
+   *
+   * `live` 只读 `_dshSessions` 这个纯缓存（串话判据的第一证据，理由见 branchCompare 头注释）；
+   * `_abort` / `_liveRunning` 仅用于「快照时仍在跑」那句话，不参与任何判定。
+   */
+  private _postCompare(): void {
+    const a = this._resolveCompareSide(this._compareSides.a);
+    const b = this._resolveCompareSide(this._compareSides.b);
+    if (!a) this._compareSides.a = undefined;
+    if (!b) this._compareSides.b = undefined;
+
+    if (!a || !b) {
+      // 一侧解不出来（空会话 / 已进回收站）：只回「选中的是谁」，`panes` 留空。
+      // 前端据此把那一侧画成「这条会话已被删除或清空」，而不是整块面板一起变空。
+      this._post({ type: 'compare-set', at: Date.now(), sides: { ...this._compareSides }, panes: {} });
+      return;
+    }
+
+    const d = divergenceOf(a, b);
+    const c = crossTalkOf(a, b, {
+      a: this._dshSessions.get(a.id),
+      b: this._dshSessions.get(b.id),
+    });
+    this._post({
+      type: 'compare-set',
+      at: Date.now(),
+      sides: { a: a.id, b: b.id },
+      live: !!(this._abort || this._liveRunning),
+      panes: {
+        a: this._comparePane(a, d.shared, d.drifted),
+        b: this._comparePane(b, d.shared, d.drifted),
+      },
+      split: {
+        shared: d.shared,
+        aAfter: d.aAfter,
+        bAfter: d.bAfter,
+        kind: d.kind,
+        line: divergenceLine(d),
+        title: divergenceTitle(d),
+      },
+      crosstalk: {
+        line: crossTalkLine(c),
+        title: crossTalkTitle(c),
+        level: c.kind === 'shared' ? 'warn' : 'ok',
+      },
+    });
+  }
+
   /**
    * tool/call 与 tool/result 对齐用的键：优先 callId。
    *
@@ -2431,14 +2635,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return resolveTargetPath(ask.filePath, this._sessionWorkspaceRoot(ask));
   }
 
-  /** target 是否落在 root 之内（含 root 自身）。win32 下 path.relative 已做大小写归一。
-   *  **绝不用 startsWith 比前缀**：`C:\proj2` 会被 `C:\proj` 骗过。 */
+  /** target 是否落在 root 之内（含 root 自身）。
+   *  C16 起**委派**给 `changeForecast.isInsideDir`：审批白名单的目录档用的是同一条包含判定，
+   *  两处各写一份迟早会漂成「这边算区外、那边算已信任」。规则一个字没改（多了一条
+   *  「target 为空 → false」的兜底，本类的调用点都先判过非空，等于没变）。 */
   private _isInside(target: string, root: string): boolean {
-    if (!root) return false;
-    const rel = path.relative(path.resolve(root), path.resolve(target));
-    if (!rel) return true; // 就是根本身
-    if (path.isAbsolute(rel)) return false; // 不同盘符 → relative 返回绝对路径
-    return rel !== '..' && !rel.startsWith('..' + path.sep);
+    return isInsideDir(target, root);
   }
 
   /** 平台临时区内的路径（DSH 沙箱也刻意放行那里；temp churn 不该进审阅，也不该弹条）。 */
@@ -2459,8 +2661,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /**
    * 审批策略（注入给 ApprovalServer 的谓词，每次现读）。
    * bash 走 C1 的正则清单；write/edit 走 C4 的越界判定；其余工具不表态。
+   * C16：白名单先说话 —— 命中就是「用户已经准过这一条」，直接放行、连条都不弹。
    */
   private _askNeedsApproval(ask: ApprovalAsk): boolean {
+    if (this._isTrusted(ask)) return false;
     if (ask.toolName === 'bash') {
       return matchesAnyPattern(this._approvalPatterns(), ask.command);
     }
@@ -2948,6 +3152,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _onApprovalAsk(ask: ApprovalAsk): void {
     const label = this._approvalLabel(ask);
     this._approvalCmds.set(ask.id, label);
+    // C16：留一份原样载荷（结算时删）——建「永久信任」要用它取命令原文/目标路径
+    this._approvalAsks.set(ask.id, ask);
     // C13：POSIX 形态的路径多给一段两读法说明（只显示，不改写，也不给按钮）
     const pathNote = this._approvalPathNote(ask);
     if (pathNote) this._approvalNotes.set(ask.id, pathNote);
@@ -2958,6 +3164,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       toolName: ask.toolName,
       command: label,
       pathNote,
+      // C16：「能不能永久信任」由扩展判定（命令过长 / 路径解析不出来 / 盘根 / 家目录都算不能），
+      // 不能就不带这个字段 —— 前端照着画，自己不做判断
+      trust: this._offerTrust(ask),
     });
     // 视图折叠着就看不到确认条，只能干等到超时 → 主动把它亮出来（失败也不影响流程）
     vscode.commands.executeCommand('hello.chatView.focus').then(undefined, () => {});
@@ -2968,8 +3177,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _onApprovalResolved(id: string, outcome: ApprovalOutcome): void {
     const command = this._approvalCmds.get(id);
     this._approvalCmds.delete(id);
+    this._approvalAsks.delete(id);
     const pathNote = this._approvalNotes.get(id);
     this._approvalNotes.delete(id);
+    const trustNote = this._approvalTrustNotes.get(id);
+    this._approvalTrustNotes.delete(id);
     this._post({ type: 'approval-resolved', id, outcome });
     if (!command) return;
     const label =
@@ -2982,7 +3194,151 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             : '审批已取消（本轮停止或切换），未执行';
     // C13：留痕里带上那句「按 DSH 的解析方式会落到 X」—— 事后再看转写时，这是唯一能解释
     // 「我明明写的是 /mnt/d/x，为什么盘上多了一个 D:\mnt\d\x」的地方
-    this._pushNote(`${label}：${oneLine(command, 120)}${pathNote ? `（${oneLine(pathNote, 160)}）` : ''}`);
+    // C16：这条信任记没记住也写在同一行里 —— 「点过永久信任」这件事**必须留痕**，
+    // 否则事后没人知道那条命令是从哪一刻起不再受拦的
+    this._pushNote(
+      `${label}：${oneLine(command, 120)}${pathNote ? `（${oneLine(pathNote, 160)}）` : ''}` +
+        `${trustNote ? `；${oneLine(trustNote, 200)}` : ''}`
+    );
+  }
+
+  // ---------- C16 审批白名单记忆（「永久信任」） ----------
+
+  /**
+   * 白名单文件：扩展 globalStorage 顶层，与 `sessions.json` 并列。
+   *
+   * **为什么不放进 VS Code 设置**（这是本次一个已拍板的决定）：设置那条路会让扩展开始
+   * 改写用户的 `settings.json`（那个文件里可能有明文 API key），而且 `array` 只能存字符串，
+   * 带不了「在哪个工作区、什么时候给的」。放文件里还能让用户直接看、直接删。
+   */
+  private _trustFilePath(): string {
+    return path.join(this._storageDir, TRUST_FILE_NAME);
+  }
+
+  /**
+   * 现在盘上的白名单。**每次现读、不缓存** —— 于是手改/手删那个文件即时生效
+   * （F5 有一条就是「删掉文件，下一次又弹条」），也省掉一处会与盘上不一致的内存态。
+   */
+  private _trustEntries(): TrustEntry[] {
+    const file = this._trustFilePath();
+    const { entries, corrupt } = readTrustFile(file);
+    // 文件在、内容非空、却一条都解不出来 ⇒ 多半是手改坏了。**只提示一次**，且只影响提示：
+    // 判定这时早就退回「每次都问」了（fail closed），不会因为读不懂就放行任何东西。
+    if (corrupt && !this._trustWarned) {
+      this._trustWarned = true;
+      console.warn('[approval] 白名单文件解析不出任何条目，按「没有信任」处理：', file);
+      void vscode.window.showWarningMessage(
+        '审批白名单文件无法解析，已按「没有任何信任」处理：每条仍会照常询问，不会有命令被静默放行。'
+      );
+    }
+    return entries;
+  }
+
+  /** 一次审批里参与白名单判定的那几样（**路径在这里解析**，纯模块不认识 `ApprovalAsk`） */
+  private _trustQuery(ask: ApprovalAsk): TrustQuery {
+    return {
+      toolName: ask.toolName,
+      command: ask.command,
+      cwd: ask.cwd,
+      targetAbs: this._fsTargetAbs(ask),
+    };
+  }
+
+  /**
+   * C16 的**单一咽喉**：这条审批是否已经被「永久信任」过。命中 ⇒ 不弹条、静默放行
+   * （`ApprovalServer` 直接回 allow，`_onAsk` 根本不会被调用）。
+   *
+   * ⚠️ 这条路**只许少给功能，不许拦住调用**：任何判不出来的情况一律当「没信任」（照常弹条）。
+   * 白名单是为了少打断人，不是为了多拦人 —— 反过来兜底会把一次读盘异常变成「所有 rm 都被拒」。
+   */
+  private _isTrusted(ask: ApprovalAsk): boolean {
+    try {
+      return matchTrust(this._trustEntries(), this._trustQuery(ask)) !== undefined;
+    } catch (err) {
+      console.log('[approval] trust match failed:', (err as Error)?.message ?? err);
+      return false;
+    }
+  }
+
+  /** 这条审批能提供哪种「永久信任」（不能就 undefined ⇒ 前端不画那个按钮） */
+  private _offerTrust(ask: ApprovalAsk): TrustOffer | undefined {
+    try {
+      return offerTrust(this._trustQuery(ask));
+    } catch (err) {
+      console.log('[approval] trust offer failed:', (err as Error)?.message ?? err);
+      return undefined;
+    }
+  }
+
+  /**
+   * 用户在确认条上点了「永久信任…」。**记不记得住都不改变这次允许** —— 点击的语义是允许，
+   * 白名单只是附加动作，所以这里的每一条失败路径都只往留痕里写一句，绝不改判。
+   *
+   * 粒度要**重算一遍**（`addTrust` 内部就是对 `offerTrust` 的复算）：webview 传来的东西
+   * 不是可信输入，一个被改过的 `approval-answer` 不能凭空造出「信任整个目录」。
+   */
+  private _createTrust(id: string, kind: 'command' | 'dir'): void {
+    const ask = this._approvalAsks.get(id);
+    if (!ask) return; // 迟到的点击（已经超时/取消/答过）—— 静默忽略
+    const r = addTrust(this._trustEntries(), this._trustQuery(ask), kind, Date.now());
+    if (!r.ok) {
+      this._approvalTrustNotes.set(id, `未能记住（${r.reason}）`);
+      return;
+    }
+    try {
+      writeTrustFile(this._trustFilePath(), r.entries);
+    } catch (err) {
+      // 写盘失败（目录没了/盘满）同样不影响这次放行
+      this._approvalTrustNotes.set(id, `未能记到盘上（${(err as Error)?.message ?? err}）`);
+      return;
+    }
+    this._approvalTrustNotes.set(
+      id,
+      `已永久信任 ${describeTrust(r.entry)} —— 可在命令面板「AlohaDSH: 查看/清除审批白名单」里撤销`
+    );
+  }
+
+  /** 确认条上的一答（C16 起可能附带「永久信任」）。 */
+  private _answerApproval(id: string, allow: boolean, trust?: 'command' | 'dir'): void {
+    if (allow && (trust === 'command' || trust === 'dir')) this._createTrust(id, trust);
+    this._approval?.answer(id, allow);
+  }
+
+  /**
+   * 命令面板入口：列出白名单、逐条或全部清除。零依赖（`showQuickPick` 是 VS Code 自带的）。
+   *
+   * 落点选这里而不是「确认条上常驻一个入口」：确认条是**拦停态**，塞管理入口会分心；
+   * 而信任是「点一下给出去的权限」，撤销路径也不能只藏在文件里。
+   */
+  async forgetApprovalTrust(): Promise<void> {
+    const entries = this._trustEntries();
+    if (!entries.length) {
+      void vscode.window.showInformationMessage(
+        '审批白名单是空的 —— 目前没有任何「永久信任」，每条都会照常询问。'
+      );
+      return;
+    }
+    type Item = vscode.QuickPickItem & { target?: TrustEntry | 'all' };
+    const items: Item[] = [
+      { label: '$(trash) 全部清除', description: `共 ${entries.length} 条`, target: 'all' },
+      ...entries.map((e) => ({ label: describeTrust(e), target: e as TrustEntry })),
+    ];
+    const picked = await vscode.window.showQuickPick(items, {
+      title: `审批白名单（${entries.length} 条）`,
+      placeHolder: '选中一条即撤销它 —— 撤销后它的下一次会重新询问',
+    });
+    const target = picked?.target;
+    if (!target) return;
+    const next = target === 'all' ? [] : removeTrust(entries, target);
+    try {
+      writeTrustFile(this._trustFilePath(), next);
+    } catch (err) {
+      void vscode.window.showErrorMessage(`写审批白名单失败：${(err as Error)?.message ?? err}`);
+      return;
+    }
+    void vscode.window.showInformationMessage(
+      target === 'all' ? `已清除全部 ${entries.length} 条信任` : `已撤销：${describeTrust(target)}`
+    );
   }
 
   /** 审批相关告警：控制台始终留痕，用户侧每次 activation 只弹一次（不刷屏）。 */
@@ -3605,6 +3961,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const out: Attachment[] = [];
     for (const r of refs) {
       const name = r.name || (r.path ? path.basename(r.path) : '（未命名文件）');
+      // C17：图片走自己那条路（落盘 / 原地引用），**永不进下面按 utf8 读内容的分支**。
+      // 判据用 `kind` 或 `dataBase64` 任一：老 webview 不带 kind，但带了字节就一定是图片。
+      if (r.kind === 'image' || typeof r.dataBase64 === 'string') {
+        out.push(this._resolveImageRef(r, name));
+        continue;
+      }
       let att: Attachment;
       if (r.path && r.content === undefined) {
         att = this._readFileAttachment(r.path);
@@ -3621,19 +3983,162 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           att.readError = '没有可用的文件内容';
         }
       }
+      // C17：webview 自己截过的那一段（`MAX_CHIP_TEXT`）标记要透传上来 —— 否则扩展侧看到的是
+      // 一段"完好"的内容，永远不会说「已截断」（今天真实存在的一个缺陷）。
+      if (r.truncated) att.truncated = true;
       if (r.selection) att.selection = true; // 选区标记透传：组包时落成 @临时文件 chip（气泡干净）
       out.push(att);
     }
     return out;
   }
 
-  /** 按路径读文件为附件：超大的不读、超长的截断、异常给 readError。 */
+  /** 图片落盘目录。**优先工作区**（DSH agent 与工作区同盘、用命令直接读得到），无工作区才退
+   *  扩展存储目录 —— 理由与 `_writeSelectionTmp` 一模一样，见那里的注释（agent 曾为读到
+   *  C:\ 下的临时文件而把它复制进工作区，制造出幽灵改动）。 */
+  private _imageDir(): string {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    return root ? path.join(root, ...IMAGE_DIR_REL.split('/')) : path.join(this._storageDir, 'images');
+  }
+
+  /** 只在我们**完全拥有**的子目录里放一枚 `.gitignore`（内容 `*`），**绝不碰 `.hello-chat/`
+   *  顶层** —— 那里有 C12 的 `profile.json`，是用户可能真想提交进仓库的配置。
+   *  已存在就不动（用户自己改过的优先）。写不进去（只读盘/权限）不影响贴图本身。
+   *  这是防手滑：快照本来就忽略 `.hello-chat`，它不会出现在 2.1 审阅里。 */
+  private _ensureImageGitignore(dir: string): void {
+    try {
+      const p = path.join(dir, '.gitignore');
+      if (fs.existsSync(p)) return;
+      fs.writeFileSync(p, '*\n', 'utf8');
+    } catch {
+      /* 忽略 */
+    }
+  }
+
+  /**
+   * C17：把一条图片引用变成附件。**两种输入形态，待遇不同**：
+   *
+   * - **有 `path`**（系统选择器拾取来的）：**原地引用，不复制**。不写用户没要求的文件是更保守的
+   *   选择（同 C12「不写用户任何文件」）。代价只是原文件被移走/改名后路径失效 —— 那时 agent
+   *   本来也读不到它。
+   * - **只有 `dataBase64`**（粘贴/拖拽来的）：**必须落盘**，否则 agent 够不着 —— 而「agent 能用
+   *   命令碰它」正是这次降级唯一的实际价值。
+   *
+   * ⚠️ **不信任 webview**：拿解出来的字节**重新嗅探**一遍、在**解码后**的长度上重新查上限。
+   * 它报的 `mediaType`/`bytes` 只当展示用。
+   */
+  private _resolveImageRef(r: FileRef, name: string): Attachment {
+    if (r.path && !r.dataBase64) {
+      return this._readFileAttachment(r.path);
+    }
+    const buf = Buffer.from(r.dataBase64 ?? '', 'base64');
+    if (buf.length === 0) {
+      return { name, kind: 'image', readError: '图片内容为空或无法解码' };
+    }
+    const mediaType = sniffImageMediaType(buf);
+    if (!mediaType) {
+      return { name, kind: 'image', readError: notAnImageError() };
+    }
+    if (!imageBytesAllowed(buf.length)) {
+      return { name, kind: 'image', mediaType, bytes: buf.length, readError: imageTooLargeError() };
+    }
+    try {
+      const dir = this._imageDir();
+      fs.mkdirSync(dir, { recursive: true });
+      // 顺序有意：先扫（可能顺手删掉过期的 .gitignore），再补 .gitignore，最后才写图 ——
+      // 反过来的话，那一次「扫掉了 .gitignore」的落盘就会写出一张不被忽略的图。
+      this._sweepStaleFiles(dir, IMAGE_TTL_MS);
+      this._ensureImageGitignore(dir);
+      const fileName = safeImageFileName(name, mediaType, this._existingNames(dir));
+      const target = path.join(dir, fileName);
+      fs.writeFileSync(target, buf);
+      return {
+        name: fileName,
+        path: target,
+        kind: 'image',
+        mediaType,
+        bytes: buf.length,
+        note: imageNote({ name: fileName, path: target, bytes: buf.length, mediaType }),
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { name, kind: 'image', mediaType, bytes: buf.length, readError: `图片落盘失败：${message}` };
+    }
+  }
+
+  /** 目录里已存在的文件名（撞名加序号用）。读不出来当空目录。 */
+  private _existingNames(dir: string): string[] {
+    try {
+      return fs.readdirSync(dir);
+    } catch {
+      return [];
+    }
+  }
+
+  /** C17：激活时补扫一次图片目录。
+   *
+   *  光靠「下次落盘时顺带扫」不够：**只贴过一张图、之后再没贴过的用户**永远等不到下一次落盘，
+   *  那张图就永远躺在工作区里。启动是一次确定性的事件，放这里刚好补上。 */
+  public sweepImageAttachments(): void {
+    this._sweepStaleFiles(this._imageDir(), IMAGE_TTL_MS);
+  }
+
+  /** 只读文件头若干字节（够魔数嗅探与 NUL 判断）。读不出来就当空 —— 后面一律按「不是图片」判。 */
+  private _readHead(filePath: string, bytes: number): Uint8Array {
+    try {
+      const fd = fs.openSync(filePath, 'r');
+      try {
+        const buf = Buffer.alloc(bytes);
+        const n = fs.readSync(fd, buf, 0, bytes, 0);
+        return buf.subarray(0, n);
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      return new Uint8Array(0);
+    }
+  }
+
+  /**
+   * 按路径读文件为附件。C17 把「图片」与「二进制」两条路从「一律按 utf8 读」里拆了出来，
+   * 判据按这个**优先级**走（顺序本身就是判据，`probe-image-attach` 里有结构守卫钉着）：
+   *
+   * 1. **魔数命中四种图片之一** ⇒ 图片路。**内容一个字都不读进正文** —— 发给模型的是一段
+   *    `imageNote` 说明（路径 + 「你看不到它」）。今天这条路会把小图标读成乱码喂给模型。
+   * 2. **扩展名看着像图片但魔数不是** ⇒ 「不是可用的图片」。**绝不掉进按文本读** —— 用户以为
+   *    自己贴的是图，读到一堆代码只会莫名其妙。
+   * 3. **扩展名在二进制表里 / 头 8KB 有 NUL** ⇒ 「二进制文件，模型读不了」（PDF/ZIP/EXE 都算）。
+   * 4. **超过 10KB** ⇒ 照旧不读。⚠️ 这一条**必须排在图片之后**：截图动辄几百 KB，落在这道闸
+   *    后面就永远是「文件过大（>10KB）」—— 对图片那句话既不对（上限不是 10KB）也没用
+   *    （换一张小图照样进不了模型）。
+   * 5. 剩下的才是文本：照旧读、超长截断。
+   */
   private _readFileAttachment(filePath: string): Attachment {
     const name = path.basename(filePath);
     try {
       const st = fs.statSync(filePath);
       if (!st.isFile()) {
         return { name, path: filePath, readError: '不是文件' };
+      }
+      const head = this._readHead(filePath, 8192);
+      const mediaType = sniffImageMediaType(head);
+      if (mediaType) {
+        if (!imageBytesAllowed(st.size)) {
+          return { name, path: filePath, kind: 'image', mediaType, bytes: st.size, readError: imageTooLargeError() };
+        }
+        return {
+          name,
+          path: filePath,
+          kind: 'image',
+          mediaType,
+          bytes: st.size,
+          note: imageNote({ name, path: filePath, bytes: st.size, mediaType }),
+        };
+      }
+      if (imageExtHint(name)) {
+        return { name, path: filePath, readError: notAnImageError() };
+      }
+      if (binaryExt(name) || hasNulByte(head)) {
+        return { name, path: filePath, readError: binaryFileError() };
       }
       if (st.size > MAX_FILE_BYTES) {
         return { name, path: filePath, readError: `文件过大（>${MAX_FILE_BYTES / 1024}KB），未读取` };
@@ -3690,6 +4195,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const parts: string[] = [];
     if (text) parts.push(text);
     for (const a of attachments) {
+      if (a.kind === 'image') {
+        // C17：与 `_runLive` **同一句话**（同一个 `noteForAttachment`）—— 两个模式不许说两套。
+        parts.push(noteForAttachment(a));
+        continue;
+      }
       const loc = a.path ? ` path="${a.path}"` : '';
       const err = a.readError ? ` error="${a.readError}"` : '';
       const body = a.readError ? '' : (a.content ?? '');
@@ -3738,17 +4248,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._resetTurnUsage(); // C3a：本轮读数属于切走的那个会话
     this._persistActiveSession();
 
-    // 新打开的会话不会再续跑任何流：残留的 streaming 一律落成 interrupted
-    for (const m of target.messages) {
-      if (m.status === 'streaming') {
-        m.status = 'interrupted';
-      }
-      if (m.role === 'tool' && m.toolState === 'running') {
-        // 落盘的 running = 那条 result 从没到过（进程被杀 / 窗口关掉），跑没跑完**不可知**。
-        // 判成失败是谎报：会让人去重试一个可能已经生效的命令（同 _finishTurn 那条注释）
-        m.toolState = 'unknown';
-      }
-    }
+    // 新打开的会话不会再续跑任何流：残留的 streaming 一律落成 interrupted（规则见 freezeTranscript，
+    // C15 起分量共用 —— 分支对照面板里的每一侧也要与「真打开这条会话」逐字一致）
+    freezeTranscript(target.messages);
     target.updatedAt = Date.now();
     this._store.replace(target);
     this._store.persist();
@@ -3780,7 +4282,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const firstUser = messages.find((m) => m.role === 'user');
     const fork = this._store.create(
       src.title
-        ? src.title + '（分支）'
+        ? src.title + FORK_SUFFIX
         : firstUser
           ? titleFromText(firstUser.text)
           : ''
@@ -4200,7 +4702,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         ? path.join(root, '.hello-chat', 'selection-attach')
         : path.join(this._storageDir, 'selection-attach');
       fs.mkdirSync(dir, { recursive: true });
-      this._sweepSelectionTmp(dir); // 顺带清掉过期文件，防堆积
+      this._sweepStaleFiles(dir); // 顺带清掉过期文件，防堆积
       const target = path.join(dir, `${a.name}·选区`);
       fs.writeFileSync(target, a.content ?? '', 'utf8');
       return target;
@@ -4209,9 +4711,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** 清掉 selection-attach 目录里超过存活期的临时文件（agent 通常只在当轮读它；留多轮窗口防
-   *  会话续聊引用失效）。目录不存在 / 单文件删除失败都静默忽略。 */
-  private _sweepSelectionTmp(dir: string, maxAgeMs = 6 * 3600 * 1000): void {
+  /** 清掉落盘目录里超过存活期的文件。两处用：1.1 的 `selection-attach`（默认 6 小时 —— agent
+   *  通常只在当轮读它，留多轮窗口防会话续聊引用失效）与 C17 的 `images`（7 天，见 `IMAGE_TTL_MS`）。
+   *
+   *  ⚠️ 它是**按 mtime** 扫的，不看会话引用 —— 这是有意的：C15 的分叉意味着两条会话可能引用
+   *  同一个路径，按引用回收要么误删要么永远不删。目录不存在 / 单文件删除失败都静默忽略。 */
+  private _sweepStaleFiles(dir: string, maxAgeMs = 6 * 3600 * 1000): void {
     try {
       const now = Date.now();
       for (const f of fs.readdirSync(dir)) {
