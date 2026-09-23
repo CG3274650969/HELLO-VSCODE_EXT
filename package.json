@@ -4,6 +4,11 @@
   "description": "把 DeepSeek Harness（DSH）接进 VS Code 侧边栏：流式对话、选区自动附带、每轮文件改动审阅、破坏性命令执行前审批。",
   "version": "0.0.1",
   "publisher": "starmerx-local",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CG3274650969/HELLO-VSCODE_EXT.git"
+  },
   "icon": "media/logo.png",
   "engines": {
     "vscode": "^1.90.0"
@@ -73,7 +78,7 @@
         "hello.dsh.nodePath": {
           "type": "string",
           "default": "",
-          "markdownDescription": "启动 DSH JSON-RPC runtime 用的 node 可执行文件。**开发者路径**：需要本地 DSH 检出，配 `entry` / `config` / `runCwd`。若已设 `hello.dsh.runtimeDir`，这一项不生效。（留空会走提示引导，见 README「DSH 直播配置」。）",
+          "markdownDescription": "启动 DSH JSON-RPC runtime 用的 node 可执行文件。**开发者路径**：需要本地 DSH 检出，配 `entry` / `config` / `runCwd`。若已设 `hello.dsh.runtimeDir`，这一项不生效。（留空会走提示引导，见手册 `docs/manual.zh-CN.md` 第 4 节「配置扩展」。）",
           "scope": "machine"
         },
         "hello.dsh.loader": {
