@@ -10,7 +10,7 @@ logs/
 .claude/
 
 # DSH 编译产物：media/dsh-live/ 来自 DSH 仓库构建（内含 @deepseek-ai 组件实现）。
-# 公开仓不含此目录——clone 后需按 README 从 DSH 仓库重建（否则回退 VS Code 观感、无 react-live）。
+# 公开仓不含此目录——clone 后需按 docs/manual.zh-CN.md 从 DSH 仓库重建（否则回退 VS Code 观感、无 react-live）。
 media/dsh-live/
 
 # 便携运行时产出（scripts/build-runtime.mjs；含 node.exe + 上百个包，体积大且可重建）

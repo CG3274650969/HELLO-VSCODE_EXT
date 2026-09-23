@@ -4,6 +4,11 @@
   "description": "把 DeepSeek Harness（DSH）接进 VS Code 侧边栏：流式对话、选区自动附带、每轮文件改动审阅、破坏性命令执行前审批。",
   "version": "0.0.1",
   "publisher": "starmerx-local",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CG3274650969/HELLO-VSCODE_EXT.git"
+  },
   "icon": "media/logo.png",
   "engines": {
     "vscode": "^1.90.0"
