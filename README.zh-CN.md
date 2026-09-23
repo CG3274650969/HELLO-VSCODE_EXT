@@ -42,13 +42,9 @@
 ## 文档（手册）
 
 这一页只回答两件事：它是什么，以及五分钟怎么跑起来。其余全部正文 —— 从零安装 0–5、
-设置速查（含会话历史）、运行可靠性（中断与续跑）、运行检查器、真 DSH 组件画面
-（react-live）、项目结构、开发与安全提示 —— 都在
-**[docs/manual.zh-CN.md](docs/manual.zh-CN.md)**。
-
-> 差距提示：**上下文窗口与压缩**（C10）、**项目级 agent profile**（C12）、
-> **Windows：agent 拿到哪个 bash**（C13）这三节目前只写在英文手册
-> [docs/manual.md](docs/manual.md) 里，中文尚未翻译。
+设置速查（含会话历史、Windows 上 agent 拿到哪个 bash）、运行可靠性（中断与续跑）、
+运行检查器、上下文窗口与压缩、项目级 agent profile、真 DSH 组件画面（react-live）、
+项目结构、开发与安全提示 —— 都在 **[docs/manual.zh-CN.md](docs/manual.zh-CN.md)**。
 
 ## 状态
 
