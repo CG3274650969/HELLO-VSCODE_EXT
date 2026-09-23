@@ -96,6 +96,15 @@ export interface DshEventData {
   provider?: string;
   model?: string;
   contextWindow?: number;
+  /**
+   * C20：`request/header` 的载荷 —— 这一次请求**真的发出去的**那一份头部
+   * （`dsh-agent-loop` 的 `canonicalHeader`），含 `config` 与 **`tools`**。
+   *
+   * 我们只读 `tools`：`read_image` 在不在里面就是「图片通路开没开」的判定（理由见
+   * `imageAttach.imageRouteFromHeader`）。类型**故意不收窄**成具体形状：它是上游的结构，
+   * 认不出来的元素由纯模块丢掉（fail-closed），在这里写死一个 interface 只会制造第二份会漂的真相。
+   */
+  header?: unknown;
   /** tool/call 的载荷 */
   callId?: string;
   name?: string;

@@ -10,7 +10,9 @@
  * - **Markdown = 给人看的转写**。它是**忠实转储、不做转义**：正文里以 `#` 开头的一行会被
  *   渲染成标题。这是有意的（转义会把代码片段改得面目全非），代价写在文档里。
  */
-import { formatBytes } from './imageAttach';
+// C20：导出那一行摘要的**末标**从图片通路那张表取（`imageRouteTag`）—— 与 chip 同一个家，
+// 免得这里再硬编一句、将来漂了没人发现（`describeImageAttachment` 就是这么烂掉的，已删）。
+import { formatBytes, imageRouteFrom, imageRouteTag, type ImageRoute } from './imageAttach';
 import type { Attachment, ChatMessage } from './protocol';
 import type { StoredSession } from './sessionStore';
 
@@ -82,13 +84,15 @@ function titleLine(title: string): string {
   return cut + '…';
 }
 
-function attachmentLine(a: Attachment): string {
+function attachmentLine(a: Attachment, route: ImageRoute): string {
   const flags: string[] = [];
   if (a.kind === 'image') {
     // C17：点明「图片」并带上大小。**理由不只是好看**：附件正文（`content`）本来就不进导出，
-    // 于是图片附件与普通附件在这里长得一模一样 —— 而图片是唯一一类**模型根本没看见内容**的
+    // 于是图片附件与普通附件在这里长得一模一样 —— 而图片是唯一一类**模型没拿到字节**的
     // 附件，读导出的人有权知道这一条。
-    flags.push(typeof a.bytes === 'number' ? `图片 ${formatBytes(a.bytes)}` : '图片');
+    // C20：末标跟着**图片通路**走（与 chip 同一张表 —— 这两个字只许从 `imageRouteTag` 出去）。
+    const size = typeof a.bytes === 'number' ? `图片 ${formatBytes(a.bytes)}` : '图片';
+    flags.push(`${size} · ${imageRouteTag(route)}`);
   }
   if (a.selection) {
     flags.push('编辑器选区');
@@ -133,7 +137,7 @@ function toolStateLabel(m: ChatMessage): string {
   }
 }
 
-function renderMessage(m: ChatMessage): string {
+function renderMessage(m: ChatMessage, route: ImageRoute): string {
   switch (m.role) {
     case 'note':
       return `> ℹ️ ${m.text ?? ''}`;
@@ -146,7 +150,7 @@ function renderMessage(m: ChatMessage): string {
       }
       // 允许「只有附件、正文为空」的消息 → 附件列表就是这条的全部内容
       if (m.attachments?.length) {
-        parts.push('附件：\n' + m.attachments.map(attachmentLine).join('\n'));
+        parts.push('附件：\n' + m.attachments.map((a) => attachmentLine(a, route)).join('\n'));
       }
       return parts.join('\n\n') + statusNote(m);
     }
@@ -197,7 +201,10 @@ function usageLine(s: StoredSession): string | undefined {
  * 元信息用**列表**而不是引用块：引用块里想换行得靠行尾两个空格，那是不可见字符、
  * 被任何编辑器/格式化工具一碰就没了，渲染出的是一坨连在一起的文字。
  */
-export function sessionToMarkdown(s: StoredSession): string {
+export function sessionToMarkdown(s: StoredSession, imageRead?: boolean): string {
+  // C20：末标跟着**图片通路**走。判定只有一个来源（会话上记的那个 flag），缺值一律按「关」——
+  // 导出可能在运行时早就不在、也没有 `request/header` 留痕的会话上跑，fail-closed 才不会瞎断言。
+  const route = imageRouteFrom(imageRead ?? s.imageRead);
   const meta: string[] = [
     `- **会话 ID**：\`${s.id}\``,
     `- **创建**：${fmtTime(s.createdAt)}`,
@@ -215,7 +222,7 @@ export function sessionToMarkdown(s: StoredSession): string {
   }
 
   const head = [`# ${titleLine(s.title)}`, meta.join('\n')].join('\n\n');
-  const body = s.messages.map(renderMessage).join('\n\n---\n\n');
+  const body = s.messages.map((m) => renderMessage(m, route)).join('\n\n---\n\n');
   return body ? `${head}\n\n---\n\n${body}\n` : `${head}\n`;
 }
 

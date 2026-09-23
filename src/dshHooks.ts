@@ -17,6 +17,7 @@ import * as path from 'path';
 import { spawn } from 'child_process';
 import type { EffortPluginMount } from './effortPlugin';
 import type { ToolPolicyMount } from './toolPolicyPlugin';
+import type { ImagePromptMount } from './imagePromptPlugin';
 
 /** 生成结果：三个文件的绝对路径 + 实际下发的 hook 命令（自检也用它） */
 export interface ApprovalHookFiles {
@@ -172,6 +173,9 @@ export interface DerivedConfigOptions {
   effort?: EffortPluginMount;
   /** C12：工具白名单插件块；undefined = 不追加（同上） */
   toolPolicy?: ToolPolicyMount;
+  /** C17b：图片说明插件块（系统提示词里的那个小节）。undefined = 不追加 —— 调用方只在
+   *  **插件文件真的写成功**时才传它（config 指向一个不存在的模块 = 插件加载失败 = DSH 起不来） */
+  imagePrompt?: ImagePromptMount;
 }
 
 export interface DerivedConfigResult {
@@ -185,6 +189,9 @@ export interface DerivedConfigResult {
   effortMounted: boolean;
   /** C12：工具白名单块没落上的原因（根不是块状序列）。同 `effortWarning`，独立一条不让两件事共用一句提示 */
   toolPolicyWarning?: string;
+  /** C17b：图片说明块没落上的原因。独立一条 —— 这条没落上的后果是「模型不知道自己看不见图」，
+   *  正是 C17 那次 OCR 事故要防的事，提示话术不能与别的功能混 */
+  imagePromptWarning?: string;
 }
 
 /**
@@ -238,11 +245,22 @@ export function writeDerivedConfig(opts: DerivedConfigOptions): DerivedConfigRes
       toolPolicyWarning = '基础 cordis.yml 的根不是块状列表，工具白名单块无法追加（工具开关不生效，其余一切照旧）';
     }
   }
+  // C17b：图片说明块排在最后。同上"挂不上只 warning 不 throw"那条纪律 ——
+  // 而且它的**后果**比前两个都重：这个块没挂上，模型就不知道自己看不见图，
+  // 于是会去"想办法看见"（2026-09-23 那次自建 OCR 栈的事故）。所以它必须有独立的一条告警。
+  let imagePromptWarning: string | undefined;
+  if (opts.imagePrompt) {
+    if (blockRoot) {
+      appended += imagePromptBlock(opts.imagePrompt);
+    } else {
+      imagePromptWarning = '基础 cordis.yml 的根不是块状列表，图片说明块无法追加（模型不会被告知「它看不见图片」，其余一切照旧）';
+    }
+  }
   const configDir = path.join(opts.storageDir, 'dsh-config');
   fs.mkdirSync(configDir, { recursive: true });
   const cordisPath = path.join(configDir, 'cordis.yml');
   fs.writeFileSync(cordisPath, text + appended, 'utf8');
-  return { cordisPath, warning, effortWarning, effortMounted, toolPolicyWarning };
+  return { cordisPath, warning, effortWarning, effortMounted, toolPolicyWarning, imagePromptWarning };
 }
 
 /**
@@ -786,6 +804,23 @@ function toolPolicyBlock(mount: ToolPolicyMount): string {
     '  config:\n' +
     '    deny:\n' +
     deny
+  );
+}
+
+/**
+ * C17b 图片说明块：同样只增不改，`name:` 同样是指向本机文件的 `file:///…` URL。
+ *
+ * ⚠️ 调用方**必须先把插件文件写成功**再把 mount 传进来：这块一挂上，派生配置就指向那个
+ * 模块路径，而插件的 `import()` 失败会让**整个 DSH 进程起不来**（比"功能不生效"重得多）。
+ */
+function imagePromptBlock(mount: ImagePromptMount): string {
+  return (
+    '\n' +
+    '# --- AlohaDSH 图片说明（C17b）自动追加：由扩展生成，请勿手工编辑 ---\n' +
+    '- id: hello-chat-image-prompt\n' +
+    '  name: ' + yamlLiteral(mount.pluginUrl) + '\n' +
+    '  config:\n' +
+    '    statePath: ' + yamlLiteral(mount.statePath) + '\n'
   );
 }
 

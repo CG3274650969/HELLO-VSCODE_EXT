@@ -15,6 +15,32 @@
  * - 所以这里做的是**诚实降级**：图片被认出来、落成一个 agent 用命令够得到的文件、气泡里有一枚
  *   说明它是图片的 chip、提示词里有一段**明说看不到**的文字。字节永远不发 —— 因为它到不了。
  *
+ * ## 「通路开没开」是一个判定，不是一句写死的话（C20，2026-09-23）
+ *
+ * 上面那句「明说看不到」在两个世界里的**说法必须不同**，而这件事在 C17b 之后变得要紧：
+ * 为了让 chip 那句话在 C17 的世界与多模态的世界里都为真，C17b 把它写成了「取用方式」
+ * （**模型需自行读取**）—— 代价是**它再也不能跟着世界变**。而「agent 自己把画面读进上下文」
+ * 这条路**不由我们决定**：运行时一挂上附件仓库，`read_image` 就会注册（`dsh-tool-fs` 把它注册在
+ * `ctx.inject(['attachments'], …)` 里），那一刻模型真能看见画面。
+ *
+ * 所以这一版把它做成**一个判定、三处跟随**：
+ *   · 判定 = `read_image` 在不在这一轮的 `request/header.header.tools` 里（扩展侧读，见
+ *     `chatViewProvider` 的 `request/header` 那个 case；**今天实测不在** ⇒ 关）。
+ *   · 三处 = chip、导出那一行、系统提示词那段，全部从下面这张 `IMAGE_ROUTE_TAGS` /
+ *     `imagePromptText` 派生（webview 加载不了 TS，chip 是**镜像**，有探针两边对拍）。
+ *   · **缺省一律按「关」**（fail-closed）：没有证据就是今天的行为，绝不替运行时吹牛。
+ *
+ * ## 那段文字住哪儿（C17b，2026-09-23 之后的形态）
+ *
+ * **不再拼进用户消息正文**，改由系统提示词承载（`imagePromptText` + `imagePromptPlugin.ts`）。
+ * 起因是用户的一句话：「我不希望聊天气泡里有这些」。原来那条路是有意选的，但**说给模型听的话
+ * 被 DSH 自己的转写面原样显示在用户气泡里**（转写是"所见即所发"），用户每贴一张图就要在自己的
+ * 话下面读一遍机器告示。这条没有渲染层的解法 —— 要去掉只能不写进消息。
+ *
+ * 于是分工变成：**这个模块负责「说什么」**（纯函数、有探针钉着），
+ * `imagePromptPlugin` 负责「把话说给模型听」（一个小节，按会话现读）。
+ * 消息正文里从此**一个字节都不提图片**，模型看到的是一个正常的用户气泡。
+ *
  * 四条实现约定（每条都有探针钉着）：
  *
  * 1. **魔数优先于扩展名**：`.png` 里装的可能是一段文本，`shot.txt` 里可能是张真 PNG。
@@ -23,7 +49,8 @@
  *    `readFileSync(…, 'utf8')` 读成乱码喂进提示词）。
  * 3. **说明文字里绝不出现 `@"`**：DSH 的 `@` 语法只管**会话**引用（规范形
  *    `@[label](dsh-session:…)`），`@"D:\x.png"` 没有任何「这是图片」的语义，只会把 agent
- *    引向文本工具去读二进制。要发的是一段明说的说明。
+ *    引向文本工具去读二进制。要发的是一段明说的说明。（C17b 换了投递通道，**这条理由一字不改**
+ *    —— 它管的是文字本身，不是它搭哪趟车。）
  * 4. **路径给两读法**：盘符形态之外另附 WSL 里可执行的那个（`/mnt/d/…`），换算只借
  *    `dshHooks.toWslPath` 那一份。真机上 agent 拿 `d:\…` 去 `ls` 是「找不到文件」，白烧一轮。
  */
@@ -31,6 +58,9 @@
 // 只借一个**纯函数**：`D:\a\b` → `/mnt/d/a/b`。`dshHooks` 不 import vscode（`shellDiag`/`contextWindow`
 // 早就从它那儿借过东西），所以本模块「不 import vscode」这条不变量不受影响。
 import { toWslPath } from './dshHooks';
+// 只借**类型**（`import type` 编译期就抹掉）：`imagesInMessages` 要认「消息里的附件」这个形状，
+// 而运行时一个字节都不需要 —— 本模块「能在扩展宿主之外被探针直接载入」那条不变量靠的就是它。
+import type { ChatMessage } from './protocol';
 
 /** 上游认的图片类型，**恰这四种** —— 复刻自 `dsh-attachment` 的 `ImageMediaType` /
  *  `attachment-local/src/index.ts` 的准入集合。
@@ -57,8 +87,21 @@ export const MAX_IMAGES_PER_MESSAGE = 4;
  *  该目录被 `fileSnapshot` 的 IGNORED_DIRS 整棵忽略，永远不会被当成 agent 的改动出现在审阅里。 */
 export const IMAGE_DIR_REL = '.hello-chat/images';
 
-/** 说明文字的字符上限。路径本身可能很长，但一段说明不该无限长 —— 超了就截路径。 */
-export const MAX_IMAGE_NOTE_CHARS = 2000;
+/**
+ * 系统提示词里**最多列几张图**（只留最新的，更早的写一行「已省略」）。
+ *
+ * 为什么要封顶：这一节是**每一轮都进系统提示词**的（C17b 之后），所以最坏情况必须可预期 ——
+ * 12 行 ≈ 1.5 KB ≈ 500 token，**不随会话变长而涨**。代价是超出的那些图的路径模型就看不到了
+ * （消息里已经没有说明），所以省略行必须点出目录让它自己 `ls`。
+ */
+export const MAX_IMAGES_IN_PROMPT = 12;
+
+/** 整块的字符硬顶（防病态长路径）。与上面的张数上限**两道都可能在真机上先撞到**，不是二选一。 */
+export const MAX_IMAGE_PROMPT_CHARS = 4000;
+
+/** 单行的字符硬顶。病态长路径（探针里那条 5000 字符）就是靠它挡在句子层面，而不是把整块截断 ——
+ *  截断整块会把后面那四句约束一起切掉，而那四句正是这个功能的全部意义。 */
+export const MAX_IMAGE_LINE_CHARS = 400;
 
 /** 落盘文件名的字符上限（不含扩展名）。 */
 const FILE_BASE_MAX_CHARS = 80;
@@ -204,8 +247,8 @@ export function imagesWithinCount(count: number): boolean {
   return Number.isFinite(count) && count >= 0 && count <= MAX_IMAGES_PER_MESSAGE;
 }
 
-/** 一条图片附件的元数据（`imageNote` 需要的全部输入）。 */
-export interface ImageNoteInput {
+/** 一条图片附件的元数据（`imagePromptText` 需要的全部输入）。 */
+export interface ImageMeta {
   name: string;
   path: string;
   bytes: number;
@@ -213,7 +256,7 @@ export interface ImageNoteInput {
 }
 
 /**
- * 路径那一行，**带 WSL 第二读法**。
+ * 路径的**WSL 第二读法**那一小段（没有第二读法时返回空串）。
  *
  * 2026-09-23 真机：给出去的是 `d:\…`，而 agent 的 bash 在 WSL 里 —— 它的第一条命令
  * `ls -la "d:/…"` 就是 `No such file or directory`，直到 `pwd` 打出 `/mnt/d/…` 才找对，白烧一轮。
@@ -225,17 +268,118 @@ export interface ImageNoteInput {
  * 只在**两读法真的不同**时才写第二读法：非盘符路径（POSIX、UNC、相对路径）换算后原样返回，
  * 在 macOS/Linux 上凭空多出一行 `/mnt/…` 只会是噪音。
  */
-function pathLine(p: string): string {
+function wslSuffix(p: string): string {
   const alt = toWslPath(p);
-  return alt === p ? `文件路径：${p}` : `文件路径：${p}（bash 在 WSL 里时读作 ${alt}）`;
+  return alt === p ? '' : `（bash 在 WSL 里时读作 ${alt}）`;
+}
+
+/** 一行一张图：`- shot.png · image/png · 1.2 MB · D:\…\shot.png（WSL 读法）`。
+ *  单行有硬顶 —— 病态长路径在这里被截，而不是让整块被截（那会切掉后面那四句约束）。 */
+function imageLine(a: ImageMeta): string {
+  let line = `- ${a.name} · ${a.mediaType} · ${formatBytes(a.bytes)} · ${a.path}${wslSuffix(a.path)}`;
+  if (line.length > MAX_IMAGE_LINE_CHARS) {
+    line = line.slice(0, MAX_IMAGE_LINE_CHARS) + '…（路径过长，已截断）';
+  }
+  return line;
 }
 
 /**
- * 发给模型的**那段说明文字**。这是本次降级的落点：agent 拿到的不是图片，是「这儿有个图片文件、
- * 你看不见它、请用工具处理它」。
+ * C20：图片通路的两档 —— **`readable` 只有一个来源**：运行时把 `read_image` 注册出来了
+ * （⟺ 挂上了附件仓库）。别处不许再出现第二份判断（见文件头那段）。
+ */
+export type ImageRoute = 'blind' | 'readable';
+
+/**
+ * C20：**两句话的唯一定义处**。chip（`media/chat.js` 里是**镜像字面量**，有探针两边对拍）、
+ * 导出那一行（[sessionExport.ts](./sessionExport.ts) 直接 import 本表）、以及系统提示词那段的口径
+ * （`imagePromptText` 的两个变体）都从它派生 —— 一个判据只有一个家。
  *
- * 三句话是**必须**的，各有探针钉着：
- * - 「看不到它的内容」—— 不说这句，模型会对着一个 `.png` 路径一本正经地描述画面（它见过太多
+ * 措辞是**刻意**的，两句说的是**不同的主语**，别再拿其中一个去对另一个取证：
+ * · `blind`——「图片输入未接通」。说的是**这份配置**的事实（运行时没挂附件仓库 ⇒ `read_image`
+ *   根本不存在）。**绝不写「模型看不到」**：那是把部署的事实说成模型的属性，而模型完全可能是
+ *   多模态的 —— C17 那条 chip 的老毛病就是它。
+ * · `readable`——「模型需自行读取」。说的是**取用方式**：图片字节照样不随消息发送，画面得 agent
+ *   自己用 `read_image` 读进来。这一档里运行时会不会答应，由它自己的能力闸说了算
+ *   （`assertImageCapableRoute`），所以这句话**不承诺任何能力**，只指出正确的动作。
+ */
+export const IMAGE_ROUTE_TAGS: Record<ImageRoute, { tag: string; title: string }> = {
+  blind: {
+    tag: '图片输入未接通',
+    // ⚠️ 这张表里**一个「模型看不到」都不许有**（两档都不许，有探针钉着）：那句话把**部署**的事实
+    // 说成了**模型**的属性，而模型完全可能是多模态的 —— C17 那条 chip 的老毛病就是它。这里说的
+    // 是「这份配置里没有通路」以及它的**后果**（画面到不了模型），理由摆在前面。
+    title: '图片不随消息发送、只落成一个文件：这份配置里没有图片输入通路（运行时没挂附件仓库，read_image 工具不存在），画面也就到不了模型那里',
+  },
+  readable: {
+    tag: '模型需自行读取',
+    title: '图片不随消息发送、只落成一个文件：模型要看画面得自己用 read_image 读它',
+  },
+};
+
+/** C20：`boolean` → 档位。**fail-closed**：只有**确证为真**才算开，其余（缺省 / 读不到 / 老会话）一律「关」。 */
+export function imageRouteFrom(readable: boolean | undefined): ImageRoute {
+  return readable === true ? 'readable' : 'blind';
+}
+
+/** C20：chip / 导出那一行用的标签。**这四个字只许从这里出去**（探针有「仅此一处」的结构守卫）。 */
+export function imageRouteTag(route: ImageRoute): string {
+  return IMAGE_ROUTE_TAGS[route].tag;
+}
+
+/**
+ * C20：判定所依据的那个工具名。**`read_image` 是上游 `dsh-tool-fs` 注册的**，注册点在
+ * `ctx.inject(['attachments'], …)` **内部**（`dsh-tool-fs/lib/index.js:1191` 注释、`:1204` 调用）
+ * ⇒ 「它在」⟺「运行时挂上了附件仓库」。所以这个名字不是我们的约定，是**上游的事实**；
+ * 上游哪天改名，这里就该跟着改（探针的变异测试会提醒：改错名 ⇒ 判定恒为「关」）。
+ */
+export const READ_IMAGE_TOOL = 'read_image';
+
+/**
+ * C20：从 `request/header` 的 header 里读出**这一轮的工具名表**（`canonicalHeader` 直出工具定义）。
+ *
+ * 元素形态兼容字符串与 `{name}` 两种 —— webview 那一侧没法验证，所以这里按「认得多少算多少」：
+ * 认不出来的元素**丢掉而不是编一个名字**，整表读不出来就返回空数组（调用方 fail-closed 按「关」）。
+ */
+export function toolNamesInHeader(header: unknown): string[] {
+  const tools = (header as { tools?: unknown } | undefined)?.tools;
+  if (!Array.isArray(tools)) return [];
+  const out: string[] = [];
+  for (const t of tools) {
+    const name = typeof t === 'string' ? t : (t as { name?: unknown } | undefined)?.name;
+    if (typeof name === 'string' && name) out.push(name);
+  }
+  return out;
+}
+
+/**
+ * C20：**唯一的判定入口** —— `read_image` 在不在这一轮的工具表里。
+ *
+ * 为什么判定要落在**工具表**上、而不是插件侧问 `ctx.get('attachments')`：
+ * · 工具表是**这一轮请求真的发出去**的样子，它看得见 C12 项目级 profile 的 `tools.deny`
+ *   （deny 掉 `read_image` ⇒ 判定正确地变「关」）；插件侧那份会造出第二份会漂的真相，且看不见 deny 表。
+ * · 它还不用新开通道：`request/header` 帧本来就在扩展的实时流里（`src/runInspector.ts:490` 点名列过它）。
+ *
+ * ⚠️ **它只回答「通路开没开」，不回答「模型认不认图片」**：后者是运行时自己的
+ * `assertImageCapableRoute` 在调用那一刻判的，文案干净且模型看得见 ⇒ 不复制、不猜。
+ */
+export function imageRouteFromHeader(header: unknown): ImageRoute {
+  return toolNamesInHeader(header).includes(READ_IMAGE_TOOL) ? 'readable' : 'blind';
+}
+
+/**
+ * 写进**系统提示词**的那一段（C17b 之后的家）。这是本次降级的落点：agent 拿到的不是图片，
+ * 是「这儿有这些图片文件、你看不见它们、请用工具处理它们」。
+ *
+ * 空数组 ⇒ **返回空串**，插件那边照原样交上去，`renderPrompt` 会把空小节整个丢掉
+ * （`dsh-system-prompt/lib/index.js:66`）—— 也就是说**没有图片的会话，这一节一个字节都不存在**。
+ *
+ * **两个变体由 `route` 选**（C20）：`blind` 那版是下面这四句；`readable` 那版把
+ * 「你看不到 / 不要试图用工具把它『看』出来」换成**指路**（用 `read_image` 读）—— 那两句在那一半
+ * 世界里是假话，而第二句更坏：它禁掉的正是唯一正确的动作。两句共同的尾巴（不要凭文件名猜、
+ * 用户点名才动它）两边都在。措辞与归属的全套理由见 `IMAGE_ROUTE_TAGS` 上面那段。
+ *
+ * 下面四句话是 `blind` 那版**必须**有的，各有探针钉着：
+ * - 「看不到它们的内容」—— 不说这句，模型会对着一个 `.png` 路径一本正经地描述画面（它见过太多
  *   图文对话了，赌它会承认自己看不见是不现实的）。
  * - 「不要试图用工具把它『看』出来」—— **这句是 2026-09-23 真机加上的**：原话里那句
  *   「请用命令或工具处理这个文件（复制、**转换**、查看元数据…）」读起来就是一份行动许可，
@@ -248,54 +392,84 @@ function pathLine(p: string): string {
  *
  * **绝不出现 `@"`**：见文件头第 3 条约定。
  */
-export function imageNote(a: ImageNoteInput): string {
-  const head = `图片附件：${a.name}（${a.mediaType}，${formatBytes(a.bytes)}，共 ${a.bytes} 字节）`;
-  const where = pathLine(a.path);
+export function imagePromptText(images: ImageMeta[], route: ImageRoute = 'blind'): string {
+  const all = Array.isArray(images) ? images : [];
+  if (all.length === 0) return '';
+  // 两个变体（C20）。**共同的落点**：图片字节都不随消息走，上面这些只是**盘上的文件路径** ——
+  // 这句话在两个世界里都为真，所以两句的抬头也共用它。
+  const head = '用户在本会话附过这些图片（图片字节不随消息发送，下面只是它们在盘上的位置）：';
   const warn =
-    '注意：当前模型不支持图片输入 —— 你看不到这张图的画面内容，上面只是一个文件路径。' +
-    '不要试图用工具把它「看」出来：读二进制、OCR、转格式、装识别工具都不会让你看见画面，' +
-    '只会白烧时间与 token。直接告诉用户你看不到这张图就行。' +
-    '只有用户明确要求对这个文件做某件事（复制、移动、交给别人）时，才用命令去动它。' +
-    '不要凭文件名猜测或描述画面。';
-  let out = `${head}\n${where}\n${warn}`;
-  if (out.length > MAX_IMAGE_NOTE_CHARS) {
-    out = out.slice(0, MAX_IMAGE_NOTE_CHARS) + '…（说明过长，已截断）';
+    route === 'readable'
+      ? // C20「开」的那一半：**指路，不承诺**。运行时能不能答应由它自己的能力闸说
+        // （`assertImageCapableRoute` 会回一句干净的「模型没声明图片输入」），所以这里只指出
+        // 正确的动作 + 撞门之后怎么办。⚠️ 「不要试图用工具把它『看』出来」那句**必须不在**
+        // —— 在这一半世界里它禁掉的正是唯一正确的动作。
+        '注意：这些图可以用 `read_image` 工具读（用上面给的路径）。' +
+        '如果你的路由不支持图片输入，read_image 会明确告诉你，那就照实说你读不了。' +
+        '不要凭文件名猜测或描述画面。' +
+        '只有用户明确要求对这些文件做某件事（复制、移动、交给别人）时，才用命令去动它。'
+      : // 「关」的那一半（今天）：一个字节不动 —— 它是 2026-09-23 真机事故换来的那几句
+        // （见下面的注释），而且真机验证过模型照着它说了「I can't see images」。
+        // ⚠️ C20 只把**归因**改准了（「这次部署没开通」而不是「这个模型不支持」）：
+        // 判定来自 `read_image` 在不在，那是**部署**的事实，不是模型的属性。
+        '注意：这次部署没有开通图片输入 —— 你看不到这些图的画面内容，上面只是文件路径。' +
+        '不要试图用工具把它「看」出来：读二进制、OCR、转格式、装识别工具都不会让你看见画面，' +
+        '只会白烧时间与 token。直接告诉用户你看不到这些图就行。' +
+        '只有用户明确要求对这些文件做某件事（复制、移动、交给别人）时，才用命令去动它。' +
+        '不要凭文件名猜测或描述画面。';
+
+  // 两道闸一起驱动这一个循环：张数（>12 只留最新的）与字符数（病态长路径撞硬顶）。
+  // 省略的条数是**两者共同的账**，说给模型听时不必分因 —— 它只要知道「还有更早的」。
+  let kept = all.slice(-MAX_IMAGES_IN_PROMPT);
+  let omitted = all.length - kept.length;
+  const render = (): string => {
+    const lines = kept.map(imageLine).join('\n');
+    const more = omitted > 0
+      ? `\n（更早的 ${omitted} 张已省略 —— 用户粘贴来的图在工作区的 ${IMAGE_DIR_REL}/ 里）`
+      : '';
+    return `${head}\n${lines}${more}\n${warn}`;
+  };
+  let out = render();
+  while (out.length > MAX_IMAGE_PROMPT_CHARS && kept.length > 1) {
+    kept = kept.slice(1);
+    omitted = all.length - kept.length;
+    out = render();
   }
   return out;
 }
 
-/** 从一条附件形状的对象里拿到**要发给它的那段说明**。
+/**
+ * 一个会话的消息里**所有**图片附件的元数据（按时间顺序，最旧的在前）。
  *
- *  优先用扩展侧已经存好的 `note`（落盘时就写好了）；缺了（老会话里的数据、手写的测试对象）
- *  就现算 —— **绝不返回空串**：宁可只说「这儿有个图片文件」，也不能让模型面对一个它一无所知的
- *  `.png` 路径开始编。live 与 chat 两个模式都走这一个函数，不许各说各的话。 */
-export function noteForAttachment(a: {
-  name: string;
-  path?: string;
-  bytes?: number;
-  mediaType?: string;
-  note?: string;
-}): string {
-  if (a.note) return a.note;
-  if (a.path && typeof a.bytes === 'number' && isImageMediaType(a.mediaType)) {
-    return imageNote({ name: a.name, path: a.path, bytes: a.bytes, mediaType: a.mediaType });
+ * **表是 store 的纯函数**：C17b 每次发送都从会话消息重算整张表，所以「本会话附过哪些图」
+ * 这件事没有第二份真相，也就不会与历史漂移 —— 与 `_writeEffortState` 同一条设计。
+ *
+ * 只收**真的落了盘**的图片：`path` 必须非空且没有 `readError`。被拒的图（超限 / 不是可用图片）
+ * 在 `_sendUser` 那一步就整条拒发了，本来也进不了历史；这里的过滤是防御性的。
+ *
+ * 这个函数住在纯模块里，是为了让探针能在扩展宿主之外直接打它（C10b 的教训）。
+ */
+export function imagesInMessages(messages: readonly ChatMessage[]): ImageMeta[] {
+  const out: ImageMeta[] = [];
+  for (const m of messages) {
+    for (const a of m.attachments ?? []) {
+      if (a.kind !== 'image' || a.readError || !a.path) continue;
+      if (!isImageMediaType(a.mediaType)) continue;
+      out.push({
+        name: a.name,
+        path: a.path,
+        bytes: typeof a.bytes === 'number' ? a.bytes : 0,
+        mediaType: a.mediaType,
+      });
+    }
   }
-  return describeImageAttachment(a);
+  return out;
 }
 
-/** 导出/展示用的一行摘要（如 `图片 · shot.png · 1.2 MB · 模型看不到`）。
- *  ⚠️ 与 webview 的 chip 文案**同一口径但有各自实现**：webview 加载不了 TS，那边是镜像。 */
-export function describeImageAttachment(a: {
-  name: string;
-  mediaType?: string;
-  bytes?: number;
-}): string {
-  const bits = ['图片'];
-  if (a.name) bits.push(a.name);
-  if (typeof a.bytes === 'number') bits.push(formatBytes(a.bytes));
-  bits.push('模型看不到');
-  return bits.join(' · ');
-}
+// ⚠️ **C20 删掉了 `describeImageAttachment`**：它写着「导出/展示用的一行摘要」，但 C17b 之后
+// 一个消费者都没有（chip 在 webview 里是另一份镜像、导出行在 `sessionExport` 里自己拼），
+// 于是它成了一段**没人读却看着权威**的旧文案 —— 上一轮改措辞时它就没人跟着改。
+// 现在「那一行摘要」只有两个家：`IMAGE_ROUTE_TAGS`（标签）与各处的排版代码，判据由探针钉住。
 
 // ---------- 三条拒绝文案（分开说，是本次要修的缺陷之一） ----------
 

@@ -73,10 +73,10 @@ export interface Attachment extends FileRef {
   /** 读取失败原因（存在则 content 为空）。**图片的失败原因走它**：超限 / 不是可用图片 /
    *  二进制非文本，三条各有各的话（今天它们全都说成「文件过大（>10KB）」或干脆说成乱码）。 */
   readError?: string;
-  /** C17：图片附件**发给模型的那段说明文字**（路径 + 「当前模型不支持图片输入、你看不到它」）。
-   *  组包时优先用它；缺省则由 `imageAttach.imageNote` 现算 —— 两个模式（live / chat）都读这里，
-   *  不许各说各的话。 */
-  note?: string;
+  // C17b：这里曾经有过一个 `note?: string`（图片附件「发给模型的那段说明文字」）。
+  // 那段说明已经搬进**系统提示词**（见 `imageAttach.imagePromptText` / `imagePromptPlugin.ts`）——
+  // 它不再随消息走，所以附件上也没有可缓存的东西了。字段整个退役：
+  // 老会话存储里遗留的 `note` 是无人读的死数据（不迁移、不清理）。
 }
 
 /** 一条对话消息。id 由扩展签发，全局唯一（带会话前缀），webview 只消费。
@@ -233,6 +233,9 @@ export type ExtToWebview =
       /** C9：视图重建（重挂 webview / 切会话）时把运行读数恢复出来。
        *  纯内存、不落盘 → 窗口重载后是缺省，条上显示「本轮尚无」（旧 webview 收不到字段 = 条隐藏，不炸）。 */
       runs?: RunReadout;
+      /** C20：图片通路这一档（chip 末标按它渲染）。**缺省即「关」** —— 老 webview 收不到字段
+       *  就渲染成「图片输入未接通」，与今天的实际状态一致；将来通路开了，新 webview 才认这一档。 */
+      imageRead?: boolean;
     }
   /** C3a：用量读数变化（每个 usage 样本一次 + 轮尾定稿一次），webview 整条重绘 */
   | { type: 'usage'; usage: UsageReadout }
