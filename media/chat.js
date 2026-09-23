@@ -2651,7 +2651,30 @@
     return n;
   }
 
-  /** 图片 chip 上的三个小标：图片 / 大小 / 模型看不到。**全部 textContent**（零 innerHTML）。 */
+  /**
+   * C20：图片通路的**两档措辞** —— **与扩展侧 `src/imageAttach.ts` 的 `IMAGE_ROUTE_TAGS` 有意重复**
+   * （webview 加载不了 TS）。漂了会在 `scripts/probe-webview-render.mjs` 上红，那条专门对拍这几个字面量。
+   *
+   * 措辞本身**只在扩展侧解释一次**（见 `IMAGE_ROUTE_TAGS` 上面那段）：`blind` 说的是「这份配置」
+   * 的事实、`readable` 说的是「取用方式」。⚠️ **两边绝不许写「模型看不到」** —— 那是把部署的事实
+   * 说成模型的属性（C17 那条 chip 的老毛病）。判据（`read_image` 在不在工具表里）也在扩展侧，
+   * 这里只**跟着 `snapshot.imageRead` 走**，自己不做任何判断。
+   */
+  var IMAGE_ROUTE_TAGS = {
+    blind: {
+      tag: '图片输入未接通',
+      title: '图片不随消息发送、只落成一个文件：这份配置里没有图片输入通路（运行时没挂附件仓库，read_image 工具不存在），画面也就到不了模型那里'
+    },
+    readable: {
+      tag: '模型需自行读取',
+      title: '图片不随消息发送、只落成一个文件：模型要看画面得自己用 read_image 读它'
+    }
+  };
+  /** 当前档位。**缺省 `blind`（fail-closed）**：`snapshot` 没带 `imageRead` 就是「关」，
+   *  与扩展侧「没有证据 = 今天的行为」同一条纪律（老扩展 + 新 webview 的组合也照此）。 */
+  var imageRoute = 'blind';
+
+  /** 图片 chip 上的三个小标：图片 / 大小 / 通路判定。**全部 textContent**（零 innerHTML）。 */
   function appendImageBadges(chip, a) {
     var tag = document.createElement('span');
     tag.className = 'chip-tag';
@@ -2665,8 +2688,9 @@
     }
     var warn = document.createElement('span');
     warn.className = 'chip-dim';
-    warn.textContent = '模型看不到';
-    warn.title = '当前模型不支持图片输入：图片只落成一个文件，agent 得用命令才碰得到它';
+    // 末标**只从那张表取**，这里不许再出现字面量（探针有「仅此一处」的结构守卫）
+    warn.textContent = IMAGE_ROUTE_TAGS[imageRoute].tag;
+    warn.title = IMAGE_ROUTE_TAGS[imageRoute].title;
     chip.appendChild(warn);
   }
 
@@ -2729,7 +2753,7 @@
       err.textContent = p.readError;
       chip.appendChild(err);
     } else if (p.kind === 'image') {
-      // C17：图片 chip **说它是一张图、说它多大、说模型看不到它**。这里刻意不画缩略图：
+      // C17：图片 chip **说它是一张图、说它多大、说画面得模型自己读**。这里刻意不画缩略图：
       // 气泡里出现一张图，读起来就是「模型看见过它」—— 那是假的。
       chip.className = 'chip chip-image';
       appendImageBadges(chip, p);
@@ -3244,6 +3268,9 @@
           currentTitle = data.sessionTitle || '';
           refreshTitleDisplay();
         }
+        // C20：图片通路的档位**必须在 renderSnapshot 之前落定** —— chip 的末标是渲染期读的
+        // （`appendImageBadges`），晚一步就会用上一档把这一屏画完。缺字段 / false 一律「关」。
+        imageRoute = data.imageRead === true ? 'readable' : 'blind';
         renderSnapshot(data.messages);
         // C6：切会话/删掉活动会话都会送来 snapshot，而此时查询词还是老样子 —— 结果集却变了
         // （活动会话的正文/存在与否都不同）。不重发的话 renderHistory() 会把命中集整片冲掉，

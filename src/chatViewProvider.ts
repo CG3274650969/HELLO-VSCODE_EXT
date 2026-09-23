@@ -91,15 +91,25 @@ import {
   imageExtHint,
   IMAGE_DIR_REL,
   imageBytesAllowed,
-  imageNote,
+  // C20：图片通路的**唯一判定**（`read_image` 在不在这一轮的工具表里）→ 三处跟随（chip / 导出 / 提示词）
+  imageRouteFromHeader,
+  imagesInMessages,
+  imagePromptText,
+  ImageMeta,
+  ImageRoute,
   imageTooLargeError,
   imagesWithinCount,
-  noteForAttachment,
   notAnImageError,
   safeImageFileName,
   sniffImageMediaType,
   tooManyImagesError,
 } from './imageAttach';
+// C17b：那段说明的家从用户消息搬到了系统提示词（气泡保持干净）——插件与状态表在这里。
+import {
+  ImagePromptMount,
+  writeImagePromptPluginFiles,
+  writeImagePromptState,
+} from './imagePromptPlugin';
 // 二进制判定只有一份源：附件这条路问的是与审阅同一个问题（「这文件能不能当文本读」）
 import { binaryExt, hasNulByte } from './fileSnapshot';
 import { isAbortError, streamMockReply } from './mockAssistant';
@@ -586,6 +596,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * `undefined` = 本 activation 还没读过 —— 读一次就记住，避免每次广播都去读一遍底本。
    */
   private _thinkingDisabled?: boolean;
+
+  // ---------- C17b 图片说明状态 ----------
+
+  /** 图片说明表（`<storageDir>/dsh-plugins/image-prompt-state.json`）；空 = 还没生成过 */
+  private _imagePromptStatePath?: string;
+  /** 图片说明块**真的挂在当前派生配置里吗**。挂不上时"模型不知道自己看不见图片"这件事
+   *  就没人告诉它 —— 那正是 C17 要防的事故（agent 自建 OCR 栈），所以必须能说实话。
+   *  ⚠️ 与 `_effortMounted` 同理：不能用 `_overlayConfigPath` 代替。 */
+  private _imagePromptMounted = false;
+  /** C17b：图片说明相关告警是否已弹过。**独立旗标**，理由同 `_storageWarned` */
+  private _imagePromptWarned = false;
+
+  // ---------- C20 图片通路判定 ----------
+
+  /**
+   * 判定在**流里**翻过（`request/header` 那个 case 里）。为什么要记一笔而不是当场重画：
+   * 那一刻正在生成回复，重发快照会把正在写的气泡拆掉。轮尾（`_afterTurn`）补发一次，
+   * 那一拍滞后是**已知局限**（写在 backlog 的 C20 里：chip / 导出 / 提示词三处同时翻，所以不自相矛盾）。
+   */
+  private _imageReadFlipped = false;
 
   // ---------- C12 项目级 agent profile 状态 ----------
 
@@ -1177,6 +1207,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // C11：这一步**才**可能拿到 dsh.id（新会话在此之前没有身份、表里也无从写起）。
       // 放在闸后、发请求前 —— 表里少了这一行，这一轮就会静默沿用上一次的档位（或跟随配置）。
       this._writeEffortState();
+      // C17b：同理，而且**每一轮都写**（不是「第一次用到才写」）。本轮那句话已经在
+      // `_sendUser` 里入列了（:1086，早于 `_runLive`），所以本轮的图一定在内。
+      // 位置也承重：它在 `_connectLive()`（起进程）之前 —— 新起的运行时第一步请求就读得到。
+      this._writeImagePromptState();
+      // 挂块状态此时已经定下来（`_refreshDerivedConfig` 在连接时就跑完了），所以这里问是准的：
+      // 本轮真有图片却到不了模型时说出来（挂上了就立刻返回，零开销）
+      this._checkImagePromptDelivery();
 
       // 2) 组 contentBlocks：正文在前，附件按 <file> 包裹（与 mock 观感一致）
       const parts: string[] = [];
@@ -1203,10 +1240,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           continue;
         }
         if (a.kind === 'image') {
-          // C17：图片**永远不发字节**（它到不了模型），发的是那段说明（路径 + 「你看不到它」）。
-          // 它必须排在下面 `<file>` 那行**之前**：图片没有 content，掉进那行只会拼出一个空块，
+          // C17：图片**永远不发字节**（它到不了模型）。C17b：那段说明（路径 + 「你看不到它」）
+          // 也**不再进消息**了 —— 它搬进系统提示词（见 `_writeImagePromptState`），
+          // 消息里一个字节都不提图片，用户气泡里就只剩自己写的那句话。
+          // ⚠️ `continue` 必须留着：图片没有 content，掉进下面 `<file>` 那行只会拼出一个空块，
           // 而模型会以为「这个文件是空的」而不是「这个文件我看不见」。
-          parts.push(noteForAttachment(a));
           continue;
         }
         const loc = a.path ? ` path="${a.path}"` : '';
@@ -2006,6 +2044,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         return;
       }
+      case 'request/header': {
+        // C20：**图片通路的唯一判定**。`read_image` 在不在这一轮的工具表里 ⟺ 运行时挂没挂附件仓库
+        // （注册点在 `ctx.inject(['attachments'], …)` 内部），判定与理由全套见 imageAttach.ts 文件头。
+        //
+        // 为什么读这条帧而不是问插件：工具表是**这一轮请求真的发出去**的样子，它看得见 C12 项目级
+        // profile 的 `tools.deny`；而且这条帧本来就在实时流里，不用新开通道。
+        //
+        // 值必须**记在会话上并落盘**（C10b 的教训照抄）：`request/header` 只在开头 / 变化 / 恢复
+        // 写一条、中途不重发 —— 只记在内存里的话，重开窗口后老会话的 chip 会退回「关」。
+        const readable = imageRouteFromHeader(d.header) === 'readable';
+        if (this._active.imageRead !== readable) {
+          // ⚠️ **不在流里重画**：这一刻正在生成回复，重发快照会把正在写的气泡拆掉。
+          // 记一笔，轮尾（`_afterTurn`）补发一次 —— 那一拍滞后是已知局限，写在 backlog 的 C20 里。
+          this._imageReadFlipped = true;
+          this._active.imageRead = readable;
+        }
+        return;
+      }
       case 'compaction/summary':
       case 'compaction/end': {
         // C10：DSH 把一段旧事件折叠成摘要（或折不动失败了）。**这两个 case 是"记忆被改动了"
@@ -2795,9 +2851,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /**
    * 重写派生配置，并把「下发改用它」这件事定下来（幂等，**永不抛**）。
    *
-   * 输入只有两个，且互相独立：
+   * 输入各自独立（都是"挂不挂"的开关）：
    *   · `_approvalFiles?.hooksPath` —— 审批就绪时追加 hooks 块（C1 的既有行为，一字不改）
    *   · `_compactionOverride()`    —— 调低了阈值时改底本里 compaction-basic 那两行
+   *   · `_effortNeeded()`          —— C11 档位块
+   *   · profile 的 `toolDeny`      —— C12 工具策略块
+   *   · C17b 图片说明块            —— **无条件**（见下面的账）
    *
    * **为什么它必须跟审批解耦**：C10 的这条旋钮跟审批没有任何关系，用户完全可以关掉审批只用它。
    * 旧结构里「派生的时机」挂在审批就绪上，所以那里必须多出一个独立入口 —— 就是本函数
@@ -2811,16 +2870,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const wantEffort = this._effortNeeded();
     // C12：工具白名单只在本项目激活的 profile 真的禁了工具时才需要挂块
     const toolDeny = this._effectiveProfile().toolDeny;
-    if (!hooksPath && !compaction && !wantEffort && toolDeny.length === 0) {
-      // 四样都不需要 → 不派生。留着旧的派生文件只会是一份会过期的副本。
-      this._overlayConfigPath = undefined;
-      this._effortMounted = false;
-      return;
-    }
+    // C17b 的账（如实记在这里）：图片说明块是**无条件**挂的 —— 没有哪个开关能代表"以后会不会
+    // 贴图" —— 于是这里曾经那条「四样都不需要 → 不派生」的早退**再也不会触发**，
+    // 派生配置从此永远写。代价很小（默认开着的 C1 审批本来就几乎总会写），换来的是这块
+    // 不需要 C11 那套「第一次用到才挂块」的热路径重连逻辑（`_effortBlockIsLive`）。
     const baseConfigPath = this._baseConfigPathAbs();
     if (!baseConfigPath) {
       this._overlayConfigPath = undefined;
       this._effortMounted = false;
+      this._imagePromptMounted = false;
+      // 这一支正是「派生配置根本不会被用上」—— 图片说明到不了模型，得说出来（挂块那段到不了这里）
+      this._checkImagePromptDelivery();
       return;
     }
     let effort: EffortPluginMount | undefined;
@@ -2851,6 +2911,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._profileWarn(err instanceof Error ? err.message : String(err));
       }
     }
+    // C17b：图片说明块。**无条件挂**（没有别的开关能代表"以后会不会贴图"），因此
+    // 「先写插件文件、写成功才挂块」这条顺序在这里比哪一处都重要：块一挂上，派生配置就指向
+    // 那个模块路径，而插件 `import()` 失败会让**整个 DSH 进程起不来** —— 那不是"功能不生效"。
+    let imagePrompt: ImagePromptMount | undefined;
+    try {
+      const files = writeImagePromptPluginFiles({ storageDir: this._storageDir });
+      this._imagePromptStatePath = files.statePath;
+      // 表先落地：插件一加载、第一步请求就会读它，顺序反了会白跑一步（同档位表）
+      this._writeImagePromptState();
+      imagePrompt = { pluginUrl: files.pluginUrl, statePath: files.statePath };
+    } catch (err) {
+      this._imagePromptWarn(err instanceof Error ? err.message : String(err));
+    }
     try {
       const r = writeDerivedConfig({
         storageDir: this._storageDir,
@@ -2859,19 +2932,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         compaction,
         effort,
         toolPolicy,
+        imagePrompt,
       });
       // 比例没落上（底本里没有那个插件块等）时仍然要用这份文件 —— hooks 块在里面
       if (r.warning) this._compactionWarn(r.warning);
       if (r.effortWarning) this._effortWarn(r.effortWarning);
       if (r.toolPolicyWarning) this._profileWarn(r.toolPolicyWarning);
+      if (r.imagePromptWarning) this._imagePromptWarn(r.imagePromptWarning);
       this._overlayConfigPath = r.cordisPath;
       this._effortMounted = r.effortMounted;
+      this._imagePromptMounted = r.imagePromptWarning === undefined;
     } catch (err) {
       // 只剩「底本读不出来」会走到这。降级到「不用派生配置」，绝不阻断连接 —— 与 _ensureApproval 同一条纪律。
       this._overlayConfigPath = undefined;
       this._effortMounted = false;
+      this._imagePromptMounted = false;
       if (compaction) this._compactionWarn(err instanceof Error ? err.message : String(err));
     }
+    // 判决点放在**所有出口之后** —— 它读的就是上面刚定下来的那两个字段（顺序反了就是误报，见该方法）
+    this._checkImagePromptDelivery();
   }
 
   // ---------- C11：会话级推理档位 ----------
@@ -2940,6 +3019,130 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (this._effortWarned) return;
     this._effortWarned = true;
     void vscode.window.showWarningMessage(`推理档位设置未生效：${text}`);
+  }
+
+  // ---------- C17b：图片说明（住在系统提示词里，不住在消息里） ----------
+
+  /**
+   * 全量重建图片说明表并落盘。**表是 store 的纯函数** —— 每次都从所有会话重新渲染，
+   * 所以没有增量维护、没有引用计数、也不需要「删哪个键」的逻辑：会话硬删之后下一次写入
+   * 它自然就不在了（`_purgeOne` 末尾那次重写就是让这件事立刻发生）。
+   *
+   * 键是**DSH 会话 id**（与 C11 的档位表同一个键）：
+   *   · `_dshSessions` 优先 —— 它是权威内存表，`_ensureDshSession` 里**无条件**写（:1509）。
+   *     只认 `s.dsh?.id` 会漏：no-patch（开发者路径 / `hello.dsh.command`）与 cwd 不符那两支
+   *     **绝不把 id 写盘**（:1500-1507），在那两条路上一个键都写不出来、说明整段静默消失。
+   *   · `s.dsh?.id` 兜底 —— 重载窗口后内存表是空的，这时只有落盘的那个 id 认得出来。
+   *
+   * 遍历**所有**会话（两个库）的理由与档位表逐字相同：一个 DSH 进程服务多个会话、切会话不重启，
+   * 表里漏一个，切过去那一轮就没有说明。
+   *
+   * 同一个 dsh id 可能被多条 UI 会话共用（分叉共享源 id）。说明取**并集**：
+   * 只读活跃那条会让分叉侧把源会话没有的图说给模型、或反过来丢图。
+   * 并集里活跃会话排**最后** —— 上限是按张数丢最旧的，本轮刚贴的图绝不能被挤掉。
+   */
+  private _writeImagePromptState(): void {
+    const statePath = this._imagePromptStatePath;
+    if (!statePath) return;
+    const table = this._imagePromptTable();
+    try {
+      writeImagePromptState(statePath, table);
+    } catch (err) {
+      this._imagePromptWarn(`图片说明表写入失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** 上面那张表的算法。与落盘分开，因为「说明到不了模型」那条判决要用它 —— 却不能问在写的时候。 */
+  private _imagePromptTable(): Record<string, string> {
+    const activeId = this._active.id;
+    const owners: { session: StoredSession; dshId: string }[] = [];
+    for (const store of Object.values(this._stores)) {
+      for (const s of store.all()) {
+        const dshId = this._dshSessions.get(s.id) ?? s.dsh?.id;
+        if (dshId) owners.push({ session: s, dshId });
+      }
+    }
+    const ordered = [
+      ...owners.filter((o) => o.session.id !== activeId),
+      ...owners.filter((o) => o.session.id === activeId),
+    ];
+    // dshId → 图片（按 path 去重，保序：先出现的先算「旧」）
+    const byId = new Map<string, Map<string, ImageMeta>>();
+    for (const o of ordered) {
+      for (const img of imagesInMessages(o.session.messages)) {
+        let bucket = byId.get(o.dshId);
+        if (!bucket) {
+          bucket = new Map<string, ImageMeta>();
+          byId.set(o.dshId, bucket);
+        }
+        if (!bucket.has(img.path)) bucket.set(img.path, img);
+      }
+    }
+    const table: Record<string, string> = {};
+    for (const [dshId, bucket] of byId) {
+      const text = imagePromptText([...bucket.values()], this._imageRouteOfDshId(dshId));
+      if (text) table[dshId] = text;
+    }
+    return table;
+  }
+
+  /**
+   * C20：**图片通路的两档**（chip / 导出 / 上面那张提示词表三处共用的唯一读数）。
+   *
+   * 判定本身在 `request/header` 那个 case 里做（`imageRouteFromHeader`），这里只回答
+   * 「**这条会话**现在算哪一档」，两条规矩：
+   *
+   * 1. **同一个 dsh id 取「或」**：「有没有 `read_image`」是**那个运行时进程**的属性，而一个进程
+   *    服务多个 UI 会话（分叉共享源 id，`_dshSessions` 里看得见）。任一条见过它 ⇒ 整组都是「开」——
+   *    否则分叉出去的那条会安静地说回旧话，而三处说同一句话正是这次改动的全部意义。
+   * 2. **缺省「关」（fail-closed）**：没证据就是今天的行为（运行时没挂附件仓库）。绝不替运行时吹牛。
+   *
+   * 读盘上的 `imageRead` 而不是只看内存：重开窗口后实时流里那条 `request/header` 早就流过去了
+   * （C10b 的教训 —— 它不重发）。
+   */
+  private _imageRoute(session: StoredSession | undefined): ImageRoute {
+    if (!session) return 'blind';
+    if (session.imageRead === true) return 'readable';
+    const dshId = this._dshSessions.get(session.id) ?? session.dsh?.id;
+    return dshId ? this._imageRouteOfDshId(dshId, session.id) : 'blind';
+  }
+
+  /** `_imageRoute` 的表那一半：按 **dsh id** 问（遍历两个库，理由同 `_imagePromptTable`）。 */
+  private _imageRouteOfDshId(dshId: string, exceptSessionId?: string): ImageRoute {
+    for (const store of Object.values(this._stores)) {
+      for (const s of store.all()) {
+        if (s.imageRead !== true || s.id === exceptSessionId) continue;
+        if ((this._dshSessions.get(s.id) ?? s.dsh?.id) === dshId) return 'readable';
+      }
+    }
+    return 'blind';
+  }
+
+  /**
+   * 「本轮**确实有**图片、说明却到不了模型」的**唯一判决点**。
+   * （到不了的两条路：`hello.dsh.command` 整段覆盖启动命令 / 底本配置找不到 ⇒ 派生配置没被用上；
+   * 或底本根不是块状列表 ⇒ 块追加不进去。两者都是 C17 那场事故的入口，必须说出来。）
+   *
+   * ⚠️ **它不能住进 `_writeImagePromptState`**（那正是初版踩的坑，2026-09-23 真机抓到的）：
+   * 那个函数在 `_refreshDerivedConfig` 里跑在**挂块之前**（表要先落地，插件一加载就要读它），
+   * 那一刻 `_overlayConfigPath`/`_imagePromptMounted` 还是**上一轮的旧值** —— 首次连接时它们是空的，
+   * 于是「刚挂上」被误判成「没挂上」。而且这不只是误报：`_imagePromptWarn` 只弹一条，
+   * 假警报会把额度烧掉，**此后真的失效再也不出声**（最坏的失效形状）。
+   *
+   * 挂上时**立刻返回、不扫会话** —— 正常路径零开销；只有真到不了时才多扫一次。
+   */
+  private _checkImagePromptDelivery(): void {
+    if (this._overlayConfigPath && this._imagePromptMounted) return;
+    if (Object.keys(this._imagePromptTable()).length === 0) return;
+    this._imagePromptWarn('派生配置里没有挂上图片说明插件，模型不会被告知「它看不见这些图片」');
+  }
+
+  /** 图片说明告警：控制台始终留痕、用户侧每次 activation 只弹一条（体例同 `_effortWarn`）。 */
+  private _imagePromptWarn(text: string): void {
+    console.warn('[image-prompt]', text);
+    if (this._imagePromptWarned) return;
+    this._imagePromptWarned = true;
+    void vscode.window.showWarningMessage(`图片说明未能进入系统提示词：${text}`);
   }
 
   /**
@@ -4051,14 +4254,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const fileName = safeImageFileName(name, mediaType, this._existingNames(dir));
       const target = path.join(dir, fileName);
       fs.writeFileSync(target, buf);
-      return {
-        name: fileName,
-        path: target,
-        kind: 'image',
-        mediaType,
-        bytes: buf.length,
-        note: imageNote({ name: fileName, path: target, bytes: buf.length, mediaType }),
-      };
+      return { name: fileName, path: target, kind: 'image', mediaType, bytes: buf.length };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return { name, kind: 'image', mediaType, bytes: buf.length, readError: `图片落盘失败：${message}` };
@@ -4102,8 +4298,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * 按路径读文件为附件。C17 把「图片」与「二进制」两条路从「一律按 utf8 读」里拆了出来，
    * 判据按这个**优先级**走（顺序本身就是判据，`probe-image-attach` 里有结构守卫钉着）：
    *
-   * 1. **魔数命中四种图片之一** ⇒ 图片路。**内容一个字都不读进正文** —— 发给模型的是一段
-   *    `imageNote` 说明（路径 + 「你看不到它」）。今天这条路会把小图标读成乱码喂给模型。
+   * 1. **魔数命中四种图片之一** ⇒ 图片路。**内容一个字都不读进正文** —— 消息里一个字节都不提
+   *    图片，模型知道「本会话附过哪些图」是靠系统提示词那一小块（`_writeImagePromptState`）。
+   *    今天这条路会把小图标读成乱码喂给模型。
    * 2. **扩展名看着像图片但魔数不是** ⇒ 「不是可用的图片」。**绝不掉进按文本读** —— 用户以为
    *    自己贴的是图，读到一堆代码只会莫名其妙。
    * 3. **扩展名在二进制表里 / 头 8KB 有 NUL** ⇒ 「二进制文件，模型读不了」（PDF/ZIP/EXE 都算）。
@@ -4125,14 +4322,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (!imageBytesAllowed(st.size)) {
           return { name, path: filePath, kind: 'image', mediaType, bytes: st.size, readError: imageTooLargeError() };
         }
-        return {
-          name,
-          path: filePath,
-          kind: 'image',
-          mediaType,
-          bytes: st.size,
-          note: imageNote({ name, path: filePath, bytes: st.size, mediaType }),
-        };
+        return { name, path: filePath, kind: 'image', mediaType, bytes: st.size };
       }
       if (imageExtHint(name)) {
         return { name, path: filePath, readError: notAnImageError() };
@@ -4196,8 +4386,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (text) parts.push(text);
     for (const a of attachments) {
       if (a.kind === 'image') {
-        // C17：与 `_runLive` **同一句话**（同一个 `noteForAttachment`）—— 两个模式不许说两套。
-        parts.push(noteForAttachment(a));
+        // C17b：与 `_runLive` **同一件事** —— 图片不进正文（那段说明改走系统提示词，
+        // 而 chat 模式本来就没有系统提示词那一侧，所以这里连说明都不产生：一个字节都不发）。
+        // ⚠️ `continue` 必须留着，理由同 `_runLive`：掉进 `<file>` 只会拼出一个空块。
         continue;
       }
       const loc = a.path ? ` path="${a.path}"` : '';
@@ -4297,6 +4488,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // 底本的 max，用户只会看到"分了个支，怎么变笨了"。继承的是**会话字段**，没设过就仍不设
     // （= 跟随配置），不替用户做一个他没做过的选择。
     fork.reasoningEffort = src.reasoningEffort;
+    // C20：图片通路的判定**同样继承**（同 usage / 档位的理由，且更硬）——「有没有 `read_image`」
+    // 是**那个运行时进程**的属性，分支复用同一个 DSH 会话 ⇒ 它必然同档。不继承的话，
+    // 分出去的那条会把 chip 说回旧话，直到它自己发一轮为止。
+    fork.imageRead = src.imageRead;
 
     this._dropReview(true); // 切会话 → 清掉上一会话的审阅（同 _openSession 惯例）
     this._resetTurnUsage(); // C3a：本轮读数属于切走的那个会话
@@ -4485,6 +4680,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     this._dshSessions.delete(id);
+    // C17b：会话从存储里消失之后，图片说明表也要立刻少掉它那一份 —— 否则「已经删掉的会话」
+    // 还会在表里留一段说明（那是死数据，而且下一次写入还带着它）。整份重写，所以这一步
+    // 不需要知道刚才删的是谁。放在这个早返回**之前**：日志留不留是一回事，表必须准。
+    this._writeImagePromptState();
     if (!dsh || this._dshStillReferenced(dsh, id)) {
       return;
     }
@@ -4545,7 +4744,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    const text = fmt.ext === 'md' ? sessionToMarkdown(frozen) : sessionToJson(frozen);
+    // C20：导出那一行的末标跟着**图片通路**走 —— 走 `_imageRoute`（同一个 dsh id 组取或），
+    // 而不是 `frozen.imageRead`：分叉那条自己的 flag 可能是空的，同一个运行时的判定却已经有了。
+    const text =
+      fmt.ext === 'md'
+        ? sessionToMarkdown(frozen, this._imageRoute(target) === 'readable')
+        : sessionToJson(frozen);
     try {
       // 用 workspace.fs 而不是 fs.writeFileSync：只读路径、远端盘符交给 VS Code 报错，别自己炸
       await vscode.workspace.fs.writeFile(picked, Buffer.from(text, 'utf8'));
@@ -4628,6 +4832,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._active.updatedAt = Date.now();
     this._store.replace(this._active);
     this._store.persist();
+    // C20：本轮判定翻过档（`request/header` 那个 case 记的）⇒ 补发一次快照，让**已经画出来的**
+    // chip 跟着翻。放在这里而不是当场：流里重画会把正在写的气泡拆掉；此刻没有流在跑，安全。
+    // 只翻一次、翻完就清 —— 常态路径一个字节都不多发。
+    if (this._imageReadFlipped) {
+      this._imageReadFlipped = false;
+      this._postSnapshot();
+    }
   }
 
   // ---------- 1.1 发送自动附选区 ----------
@@ -5064,6 +5275,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // C9：同理。运行记录是**纯内存**的，所以重载窗口后这里是空的 ——
       // 切会话则能立刻恢复该会话这一轮的记录（它还在环里），这是要点。
       runs: this._runsReadout(),
+      // C20：图片通路的两档 → webview 里 chip 的末标（`media/chat.js` 是镜像字面量，有探针对拍）。
+      // 值来自会话上落盘的那个 flag（`request/header` 判定后写的），缺省即「关」。
+      imageRead: this._imageRoute(this._active) === 'readable',
     });
     // C8：按钮状态跟会话走（切会话/重开会话/窗口重载后由这一条纠偏）。
     // 判据是**已落盘**的 lastTurn，所以重载窗口甚至重启 VS Code 之后按钮照常在。

@@ -14,7 +14,12 @@
  * - **B 上限**：`<=` 语义（恰好等于要放行）、张数、**与 webview 镜像字面量对拍**
  *   （两边各写一份常量，漂了要在这里红）。
  * - **C 文件名**：输入来自 webview/操作系统，是不可信输入（`../../evil.png`、`CON`、300 字符）。
- * - **D 说明文字**：路径/大小/MIME/「看不到」都要在，**`@"` 一定不能在**。
+ * - **D 展示面与抽取**：chip/导出的那行摘要，以及「从消息里捞出本会话的图片清单」
+ *   （`imagesInMessages` —— C17b 状态表的唯一输入）。
+ *
+ * ⚠️ **那段说明文字本身的判据不在这里**：C17b 把它从消息里搬进了系统提示词，
+ * 于是它的家变成 `scripts/probe-image-prompt.mjs`（文案 + 端到端读盘 + 结构守卫）。
+ * 一个判据只有一个家 —— 原来这里的 D1–D4 整个搬走了，别再搬回来。
  *
  * **这份探针够不着的地方（写在这里，免得后人以为它全包了）**：`chatViewProvider.ts` 里那几段
  * 接线（`_readFileAttachment` 的分支顺序、`_resolveAttachments` 绝不抄 `dataBase64`、
@@ -46,14 +51,16 @@ const {
   IMAGE_MEDIA_TYPES,
   IMAGE_DIR_REL,
   MAX_IMAGE_BYTES,
-  MAX_IMAGE_NOTE_CHARS,
   MAX_IMAGES_PER_MESSAGE,
   binaryFileError,
-  describeImageAttachment,
   extensionFor,
   formatBytes,
   imageBytesAllowed,
-  imageNote,
+  imageRouteFrom,
+  imageRouteFromHeader,
+  imageRouteTag,
+  IMAGE_ROUTE_TAGS,
+  imagesInMessages,
   imageTooLargeError,
   imagesWithinCount,
   isImageMediaType,
@@ -98,6 +105,10 @@ function eq(actual, expected, what = '') {
   const e = JSON.stringify(expected);
   if (a !== e) throw new Error(`${what}：期望 ${e}，实得 ${a}`);
 }
+
+/** 读仓库里的源码文本（结构守卫用）。**声明要早于 E 组** —— 那边也用得到它。 */
+const readSrc = (f) => readFileSync(join(repoRoot, 'src', f), 'utf8');
+const providerSrc = readSrc('chatViewProvider.ts');
 
 // ---------- 样本字节（手写文件头，不依赖任何图片文件） ----------
 
@@ -217,6 +228,13 @@ check('B4 与 webview 的镜像字面量对拍（两边各写一份常量，漂�
   for (const t of IMAGE_MEDIA_TYPES) {
     ok(js.includes(`'${t}'`), `media/chat.js 没镜像图片类型 ${t}`);
   }
+  // C20：两档末标的镜像是**逐字**对拍的（改措辞只改一边 ⇒ 这里红）。上面那三条是「常量等值」，
+  // 这两条是「句子等值」—— chip 的整个价值就在那几个字上，差一个字都是两个世界说两句话。
+  for (const r of ['blind', 'readable']) {
+    const t = IMAGE_ROUTE_TAGS[r];
+    ok(js.includes(`tag: '${t.tag}'`), `media/chat.js 的 ${r} 档标签与扩展侧不一致：${t.tag}`);
+    ok(js.includes(`title: '${t.title}'`), `media/chat.js 的 ${r} 档 tooltip 与扩展侧不一致`);
+  }
 });
 
 check('B5 落盘目录只在自己完全拥有的子目录里（不碰 .hello-chat 顶层的用户产物）', () => {
@@ -299,68 +317,14 @@ check('C10 图片的准入集合与那张表**不是一回事**（借过来就�
   eq(sniffImageMediaType(PDF), undefined);
 });
 
-// ---------- D 说明文字 ----------
+// ---------- D 展示面（说明文字本身搬去了 probe-image-prompt.mjs） ----------
+//
+// C17b：原来这里有一组「D 说明文字」（`imageNote` 的 11 条）。那段文字不再随消息走，
+// 所以它的判据**整个搬去了 `probe-image-prompt.mjs`** —— 一个判据只有一个家。
+// 留在本文件里的是**展示面**（chip / 导出）与**抽取**（从消息里捞出图片清单）这两块，
+// 它们与「那段话怎么送到模型」无关。
 
-console.log('\n--- D 说明文字（发给模型的那段）---');
-
-const NOTE_INPUT = {
-  name: 'shot.png',
-  path: 'D:\\proj\\.hello-chat\\images\\shot.png',
-  bytes: 1258291,
-  mediaType: 'image/png',
-};
-
-check('D1 路径 / 字节数 / MIME / 文件名都在', () => {
-  const n = imageNote(NOTE_INPUT);
-  ok(n.includes(NOTE_INPUT.path), '没有路径');
-  ok(n.includes('1258291'), '没有原始字节数');
-  ok(n.includes('1.2 MB'), '没有人读的大小');
-  ok(n.includes('image/png'), '没有 MIME');
-  ok(n.includes('shot.png'), '没有文件名');
-});
-
-check('D1b 盘符路径附 WSL 第二读法；非盘符路径**不附**（真机上那一轮白烧就是这么来的）', () => {
-  // 正控：真机那次给的就是这个形态，agent 的 bash 在 WSL 里，`d:/…` 直接「找不到文件」
-  const win = imageNote({ ...NOTE_INPUT, path: 'D:\\proj\\.hello-chat\\images\\shot.png' });
-  ok(win.includes('/mnt/d/proj/.hello-chat/images/shot.png'), '没有给 WSL 里可执行的那一读');
-  ok(win.includes('WSL'), '给了第二读法却没说它什么时候用得上');
-  // 反控：POSIX 路径换算后原样返回 ⇒ 不该凭空多出一行 `/mnt/…`（macOS/Linux 上那是纯噪音）
-  const posix = imageNote({ ...NOTE_INPUT, path: '/home/u/.hello-chat/images/shot.png' });
-  ok(!posix.includes('/mnt/'), 'POSIX 路径上凭空长出了 WSL 读法');
-  ok(!posix.includes('WSL'), 'POSIX 路径上多了一句 WSL 的话');
-  // 反控 2：真·Windows 路径里本来就带 `mnt` 词（`D:\mnt\x`）时，第二读法要老实换算
-  const odd = imageNote({ ...NOTE_INPUT, path: 'D:\\mnt\\a\\shot.png' });
-  ok(odd.includes('/mnt/d/mnt/a/shot.png'), '带 mnt 段的路径换算错了');
-});
-
-check('D2 明说「模型看不到」与「不支持图片输入」', () => {
-  const n = imageNote(NOTE_INPUT);
-  ok(n.includes('不支持图片输入'), '没说清是模型不支持');
-  ok(n.includes('看不到'), '没说「看不到」—— 模型会一本正经地描述画面');
-  ok(n.includes('不要'), '没有「不要凭文件名猜测」那半句');
-});
-
-check('D2b 明说「别去『看』它」—— 真机上一句「这是什么东西」就让 agent 装了整套 OCR 栈', () => {
-  const n = imageNote(NOTE_INPUT);
-  ok(n.includes('不要试图用工具'), '没有拦「用工具把它看出来」这条路');
-  ok(n.includes('OCR') && n.includes('装识别工具'), '没有点名那几种走不通的做法');
-  ok(n.includes('直接告诉用户'), '只说了别做什么，没说该做什么');
-  // 反控：正当的文件操作**必须仍然放行** —— 收得太紧会把「把这个文件挪到 X」也一起拒掉，
-  // 那是另一个方向的错（把一个能用的工具变成不能用的）。
-  ok(n.includes('只有用户明确要求'), '把用工具这条路整个堵死了 —— 正当的文件操作也会被拒');
-});
-
-check('D3 绝不出现 `@"`（DSH 的 @ 只管会话引用，发了等于把 agent 引向文本工具）', () => {
-  const n = imageNote(NOTE_INPUT);
-  ok(!n.includes('@"'), '说明文字里出现了 @"');
-  ok(!/dsh-session:/.test(n), '混进了会话引用语法');
-});
-
-check('D4 超长路径 ⇒ 整段截到上限，不无限膨胀', () => {
-  const n = imageNote({ ...NOTE_INPUT, path: 'D:\\' + 'x'.repeat(5000) + '.png' });
-  ok(n.length <= MAX_IMAGE_NOTE_CHARS + 20, `长度 ${n.length} 超过上限 ${MAX_IMAGE_NOTE_CHARS}`);
-  ok(n.includes('已截断'), '截断了却没说');
-});
+console.log('\n--- D 展示面与抽取 ---');
 
 check('D5 formatBytes 的口径（webview 那份镜像要与它一致）', () => {
   eq(formatBytes(0), '0 B');
@@ -373,12 +337,91 @@ check('D5 formatBytes 的口径（webview 那份镜像要与它一致）', () =>
   eq(formatBytes(-5), '0 B');
 });
 
-check('D6 describeImageAttachment 一行摘要写得像「图片」而不是「文件」', () => {
-  const line = describeImageAttachment({ name: 'shot.png', mediaType: 'image/png', bytes: 1258291 });
-  ok(line.includes('图片'), '没写「图片」');
-  ok(line.includes('模型看不到'), '没写「模型看不到」');
-  ok(line.includes('1.2 MB'), '没有大小');
-  ok(!line.includes('base64'), '摘要里混进了 base64');
+check('D6 C20 两档末标 + 判定：这两句话**只许从这张表出去**，且说的不是同一件事', () => {
+  eq(imageRouteTag('blind'), '图片输入未接通');
+  eq(imageRouteTag('readable'), '模型需自行读取');
+  // ⚠️ **两档都不许出现「模型看不到」** —— 那是把**部署**的事实说成**模型**的属性，多模态下就是假话。
+  // （这句话在 chip 上出现过一整代，C17 的老毛病；D6 这条就是防它回来。）
+  for (const r of ['blind', 'readable']) {
+    const t = IMAGE_ROUTE_TAGS[r];
+    ok(!t.tag.includes('模型看不到'), `${r} 档的标签写成「模型看不到」了`);
+    ok(!t.title.includes('模型看不到'), `${r} 档的 tooltip 写成「模型看不到」了`);
+    ok(t.tag.length > 0 && t.title.length > t.tag.length, `${r} 档的 tooltip 没有把话说全`);
+  }
+  // 两档说的是**不同主语**：一档讲这份配置（部署事实），一档讲取用方式。别拿一个去对另一个取证。
+  ok(IMAGE_ROUTE_TAGS.blind.tag !== IMAGE_ROUTE_TAGS.readable.tag, '两档的标签撞了 —— 那就没有「跟着世界变」这回事');
+});
+
+check('D6b C20 判定：`read_image` 在不在这一轮的工具表里（fail-closed）', () => {
+  // 「在」⟺ 运行时挂上了附件仓库（dsh-tool-fs 把 read_image 注册在 ctx.inject(['attachments']) 内部）
+  eq(imageRouteFromHeader({ tools: ['bash', 'read', 'read_image', 'write'] }), 'readable');
+  eq(imageRouteFromHeader({ tools: ['bash', 'read', 'write'] }), 'blind');
+  // 认不出来的一律「关」：缺字段 / 不是数组 / 元素形态不认识 / 表里只有别的工具
+  eq(imageRouteFromHeader({}), 'blind');
+  eq(imageRouteFromHeader({ tools: 'read_image' }), 'blind', 'tools 不是数组却当成了「开」');
+  eq(imageRouteFromHeader(undefined), 'blind');
+  eq(imageRouteFromHeader(null), 'blind');
+  eq(imageRouteFromHeader({ tools: [] }), 'blind');
+  eq(imageRouteFromHeader({ tools: [null, 42, {}, 'read'] }), 'blind', '认不出来的元素被当成了工具名');
+  // 元素是 `{name}` 形态（上游另一种可能形状）也要认得出 —— 只认字符串会让判定恒「关」
+  eq(imageRouteFromHeader({ tools: [{ name: 'bash' }, { name: 'read_image' }] }), 'readable');
+  // 前缀 / 大小写都不算：判定是**逐字精确**的名字匹配
+  eq(imageRouteFromHeader({ tools: ['read_image_preview', 'Read_Image'] }), 'blind', '判定不是逐字精确的');
+  // 落盘那个 boolean → 档位：只有**确证为真**才算「开」
+  eq(imageRouteFrom(true), 'readable');
+  eq(imageRouteFrom(false), 'blind');
+  eq(imageRouteFrom(undefined), 'blind', '缺值没按「关」处理 —— fail-closed 破了');
+});
+
+check('D6c C20 结构守卫：chip / 导出那两句话都不许在别处硬编（今天就是这么漂掉的）', () => {
+  // 「图片输入未接通」「模型需自行读取」只许出现在这张表里（webview 的镜像是**刻意**的第二份，
+  // 有 probe-webview-render 两边对拍；导出侧直接 import 本表，所以这里只查 src/ 的其它文件）
+  for (const f of ['chatViewProvider.ts', 'sessionExport.ts', 'imagePromptPlugin.ts']) {
+    const src = readSrc(f);
+    for (const w of ['图片输入未接通', '模型需自行读取']) {
+      ok(!src.includes(w), `${f} 里又硬编了一句「${w}」—— 末标只许从 IMAGE_ROUTE_TAGS 出去`);
+    }
+  }
+  // 导出那一行必须真的走那张表（import 掉了就说明它自己在拼）
+  ok(readSrc('sessionExport.ts').includes('imageRouteTag'), '导出没有走 imageRouteTag');
+});
+
+const imgRef = (over = {}) => ({
+  name: 'shot.png',
+  path: 'D:\\proj\\.hello-chat\\images\\shot.png',
+  kind: 'image',
+  mediaType: 'image/png',
+  bytes: 1258291,
+  ...over,
+});
+
+check('D8 imagesInMessages：按时间序捞出会话里所有图片（C17b 状态表的唯一输入）', () => {
+  const msgs = [
+    { id: 'm1', role: 'user', text: 'a', status: 'done', attachments: [imgRef({ name: 'a.png', path: 'D:\\i\\a.png' })] },
+    { id: 'm2', role: 'assistant', text: 'b', status: 'done' },
+    { id: 'm3', role: 'user', text: 'c', status: 'done', attachments: [imgRef({ name: 'b.png', path: 'D:\\i\\b.png' })] },
+  ];
+  const got = imagesInMessages(msgs);
+  eq(got.map((x) => x.name), ['a.png', 'b.png'], '顺序或条数不对（最旧的要在前：上限丢的是最旧的）');
+  eq(got[0].mediaType, 'image/png');
+  eq(got[0].bytes, 1258291);
+});
+
+check('D8b 抽取的反控：拒掉的图 / 老式文本附件 / 缺字段的旧数据，一律不进清单', () => {
+  const msgs = [
+    // 读取失败的图片（超限 / 不是可用图片）：_sendUser 已整条拒发，这里再兜一道
+    { id: 'm1', role: 'user', text: '', status: 'done', attachments: [imgRef({ readError: '图片过大' })] },
+    // kind 说 image 但没有 path（落盘失败那一支的形态）
+    { id: 'm2', role: 'user', text: '', status: 'done', attachments: [imgRef({ path: undefined })] },
+    // 老数据：没有 kind（照旧是普通文本附件）
+    { id: 'm3', role: 'user', text: '', status: 'done', attachments: [{ name: 'note.txt', content: 'x' }] },
+    // 非图片类型的 mediaType 混进来（协议说只可能是那四种，这里不许信）
+    { id: 'm4', role: 'user', text: '', status: 'done', attachments: [imgRef({ mediaType: 'image/svg+xml' })] },
+    // 没有 attachments 的消息
+    { id: 'm5', role: 'user', text: '', status: 'done' },
+  ];
+  eq(imagesInMessages(msgs), [], '不该进清单的东西进去了 —— 表里会多出模型根本看不见的文件');
+  eq(imagesInMessages([]), []);
 });
 
 console.log('\n--- D7 三条拒绝文案（分开说，是本次要修的缺陷之一）---');
@@ -410,22 +453,23 @@ console.log('\n--- E 落盘反证（会话存储里一个字节的 base64 都不
 const scratch = mkdtempSync(join(tmpdir(), 'hello-c17-'));
 const SESS_FILE = 'probe-c17-sessions.json';
 
-const imgAttachment = (over = {}) => ({
-  name: 'shot.png',
-  path: 'D:\\proj\\.hello-chat\\images\\shot.png',
-  kind: 'image',
-  mediaType: 'image/png',
-  bytes: 1258291,
-  note: imageNote(NOTE_INPUT),
-  ...over,
-});
+const imgAttachment = (over = {}) => imgRef(over);
 
-check('E1 图片附件的形状：有路径/类型/大小/说明，**没有 content**', () => {
+check('E1 图片附件的形状：有路径/类型/大小，**没有 content**', () => {
   const a = imgAttachment();
   ok(a.kind === 'image', 'kind 不是 image');
-  ok(typeof a.note === 'string' && a.note.length > 0, '没有说明文字');
   eq(a.content, undefined, '图片附件带了 content');
-  ok(a.note.includes('看不到'), '说明里没有「看不到」');
+});
+
+check('E1b `Attachment.note` 已退役（C17b：那段说明搬进系统提示词了）', () => {
+  // 字段本身没了 —— 钉的是**没有第二份说明**这件事：只要有人把那段话再挂回附件上，
+  // 「说明住哪儿」就又有两个答案了（而消息里一个字节都不该有它）。
+  const proto = readSrc('protocol.ts');
+  const decl = proto.slice(proto.indexOf('export interface Attachment'));
+  const body = decl.slice(0, decl.indexOf('\n}'));
+  ok(!/^\s*note\?:/m.test(body), 'Attachment 上又有 note 字段了');
+  ok(!providerSrc.includes('noteForAttachment'), 'provider 里还有 noteForAttachment');
+  ok(!providerSrc.includes('imageNote('), 'provider 里还在调 imageNote');
 });
 
 check('E2 带图片附件的会话落盘再读回：字段一个不少、base64 一个字节没有', () => {
@@ -455,7 +499,7 @@ check('E2 带图片附件的会话落盘再读回：字段一个不少、base64 
   eq(a.mediaType, 'image/png');
   eq(a.bytes, 1258291);
   eq(a.content, undefined, '读回来竟然是文本内容');
-  ok(a.note.includes('看不到'), '说明文字丢了');
+  eq(a.note, undefined, '说明文字又回到附件上了（C17b 之后它住系统提示词）');
 });
 
 check('E3 导出成 Markdown：写着「图片」与大小，且不带正文', () => {
@@ -474,12 +518,29 @@ check('E3 导出成 Markdown：写着「图片」与大小，且不带正文', (
   ok(md.includes('shot.png'), '导出里没有文件名');
 });
 
+check('E3b C20 导出那一行跟着**图片通路**走（缺值按「关」，与 chip 说同一句话）', () => {
+  const base = {
+    id: 's1',
+    title: '贴了一张图',
+    createdAt: 1,
+    updatedAt: 1,
+    messages: [{ id: 'm1', role: 'user', text: '', status: 'done', attachments: [imgAttachment()] }],
+  };
+  // 会话上没记过（老会话 / 从没连过运行时）⇒ 按「关」，绝不替运行时吹牛
+  ok(sessionToMarkdown(base).includes('图片输入未接通'), '缺值时没按「关」渲染');
+  // 会话上记着通路开着 ⇒ 翻到另一档
+  ok(sessionToMarkdown({ ...base, imageRead: true }).includes('模型需自行读取'), '记着通路开着却还写「未接通」');
+  // 显式入参赢过会话字段（provider 用它把「同一 dsh id 组」的判定带进来）
+  ok(sessionToMarkdown({ ...base, imageRead: true }, false).includes('图片输入未接通'), '显式入参没赢过会话字段');
+  // 反控：无论哪一档，那一行都不许出现「模型看不到」
+  for (const s of [base, { ...base, imageRead: true }]) {
+    ok(!sessionToMarkdown(s).includes('模型看不到'), '导出里又写成「模型看不到」了');
+  }
+});
+
 // ---------- F 源码结构守卫 ----------
 
 console.log('\n--- F 源码结构守卫（顺序与出口都是判据）---');
-
-const readSrc = (f) => readFileSync(join(repoRoot, 'src', f), 'utf8');
-const providerSrc = readSrc('chatViewProvider.ts');
 
 check('F1 `readFileAttachment` 的图片分支**先于** 10KB 那道闸（否则截图永远是「文件过大」）', () => {
   const body = providerSrc.slice(providerSrc.indexOf('private _readFileAttachment'));
@@ -513,12 +574,38 @@ check('F2 `_runLive` 的图片分支在 `<file` 那行**之前**（否则图片�
   ok(imgAt < fileAt, '图片分支排到 <file> 后面了 —— 模型会以为那个文件是空的');
 });
 
-check('F3 chat 模式的 `_buildPrompt` 也有一份（两个模式不许说两套）', () => {
-  const body = providerSrc.slice(providerSrc.indexOf('private _buildPrompt'));
-  const imgAt = body.indexOf("a.kind === 'image'");
-  const fileAt = body.indexOf('<file name=');
-  ok(imgAt > 0 && fileAt > 0 && imgAt < fileAt, '_buildPrompt 里没有图片分支（或排到了 <file> 后面）');
-  ok(body.includes('noteForAttachment(a)'), '没有走共用的 noteForAttachment');
+check('F2b 两个模式的图片分支里**一个字都不许 push 进消息**（C17b：气泡干净就靠这条）', () => {
+  // 判据是「图片那段说明真的不在消息里」—— 行为判据在 probe-image-prompt 的 C 组（读盘上
+  // 真实的 `user/message`）；这里是结构守卫，管的是「有人换一种写法又把它加回来」。
+  // 两个分支体各自切到下一个 `continue;` 为止，正好是那段分支体。
+  for (const anchor of ['private async _runLive', 'private _buildPrompt']) {
+    const body = providerSrc.slice(providerSrc.indexOf(anchor));
+    const imgAt = body.indexOf("a.kind === 'image'");
+    ok(imgAt > 0, `${anchor} 里找不到图片分支`);
+    const branch = body.slice(imgAt, body.indexOf('continue;', imgAt));
+    ok(branch.length > 0, `${anchor} 的图片分支没有 continue（掉进 <file> 会拼出空块）`);
+    ok(!branch.includes('parts.push'), `${anchor} 的图片分支又往消息里塞东西了`);
+    ok(!branch.includes('note'), `${anchor} 的图片分支里出现了 note 字样`);
+  }
+});
+
+check('F3 `_writeImagePromptState` 出现在 `runtime.prompt(` **之前**（否则这一轮读到的还是旧表）', () => {
+  const live = providerSrc.slice(providerSrc.indexOf('private async _runLive'));
+  const writeAt = live.indexOf('this._writeImagePromptState()');
+  const promptAt = live.indexOf('runtime.prompt(');
+  const connectAt = live.indexOf('await this._connectLive()');
+  ok(writeAt > 0, '_runLive 里没有写图片说明表');
+  ok(promptAt > 0, '_runLive 里找不到 runtime.prompt(');
+  ok(writeAt < promptAt, '表写在发请求之后了 —— 这一轮模型读到的是上一次的清单');
+  ok(connectAt > 0 && writeAt < connectAt, '表写在起进程之后了 —— 第一步请求读不到它');
+});
+
+check('F8 图片说明的出口只有一个：`_writeImagePromptState` 是唯一写到表里的地方', () => {
+  const writes = [...providerSrc.matchAll(/writeImagePromptState\(/g)].length;
+  ok(writes > 0, '没有任何地方写图片说明表');
+  ok(!/fs\.writeFileSync\([^)]*image-prompt-state/.test(providerSrc), '有人绕过 writeImagePromptState 直接写表');
+  // 表是 store 的**纯函数**：不许出现「只删一个键」这类增量维护（那就会有第二份真相）
+  ok(!providerSrc.includes('delete table[') && !providerSrc.includes('.delete(dshId'), '出现了增量维护表的写法');
 });
 
 check('F4 `dataBase64` 只在协议里声明、只在解析处被读 —— 没有任何地方把它抄进 Attachment', () => {

@@ -1771,8 +1771,8 @@ check('C16 CSS 守卫：.approval-scope 走 warn 那套 token（不是 warning�
 
 // ---------- C17 · 图片附件（诚实降级） ----------
 //
-// 真机看到的是：贴一张截图 ⇒ 待发条上是一枚写着「图片 · 1.2 MB · 模型看不到」的 chip，
-// 发出去之后模型收到的是一段说明（不是图，永远不是图 —— 它到不了）。
+// 真机看到的是：贴一张截图 ⇒ 待发条上是一枚写着「图片 · 1.2 MB · 图片输入未接通」的 chip
+// （末标是 C20 的通路判定，两档见下），发出去之后模型收到的是一段说明（不是图，永远不是图 —— 它到不了）。
 //
 // 这里验影子能表达的部分：**字节怎么走（dataBase64，且绝不带 content）、chip 怎么说话、
 // 三道闸（大小 / 张数 / 坏附件不许发）拦不拦得住**，以及一条反控 —— 文本附件照旧走老路。
@@ -1840,16 +1840,78 @@ check('C17 粘一张图 ⇒ 一条 user-message，带字节，**绝不带 conten
   eq(a.content, undefined, '图片附件带上了 content —— 那是把二进制当文本递给了模型');
 });
 
-check('C17 chip 上写的是「图片 + 真实大小 + 模型看不到」', () => {
+check('C17/C20 chip：「图片 + 真实大小 + 通路判定」，缺省那一档是「关」', () => {
   resetAttach();
+  // C20：先喂一条**不带 imageRead**的快照（缺省 = 关），让这条用例的档位是确定的，
+  // 而不是"上一条用例恰好留下了什么"
+  send({ type: 'snapshot', messages: [] });
   pasteFiles([fakeImage()]);
   const chip = $('attach-list').children[0];
   ok(chip.classList.contains('chip-image'), '没打上 .chip-image');
   ok(hasText(chip, 'shot.png'), '没写文件名');
   ok(hasText(chip, '图片'), '没写「图片」');
   ok(hasText(chip, '1.2 MB'), '没写真实大小');
-  ok(hasText(chip, '模型看不到'), '没写「模型看不到」—— 那这枚 chip 就在暗示模型看见过它');
+  // C20 的末标是**两档**，这里是「关」那一档（今天真机的档位）
+  ok(hasText(chip, '图片输入未接通'), `缺省档位不是「关」：${texts(chip).join('|')}`);
+  ok(!hasText(chip, '模型需自行读取'), '缺省档位渲染成了「开」那一档');
+  // ⚠️ 两档都**刻意不写「模型看不到」**：那是把「这份配置没开通」说成模型的属性，多模态下就是假话
+  ok(!hasText(chip, '模型看不到'), '又写成「模型看不到」了 —— 多模态下这句是假话');
   eq(walk(chip).filter((e) => e.tagName === 'IMG').length, 0, '画了 <img>');
+});
+
+check('C20 chip 跟着 snapshot.imageRead 翻档（三处跟随在 webview 这一侧）', () => {
+  resetAttach();
+  const bubbleChip = () => {
+    send({
+      type: 'snapshot',
+      messages: [
+        {
+          id: 'c20-m1',
+          role: 'user',
+          text: '',
+          status: 'done',
+          attachments: [
+            { name: 'shot.png', path: 'D:\\p\\shot.png', kind: 'image', mediaType: 'image/png', bytes: 1258291 },
+          ],
+        },
+      ],
+      imageRead: true,
+    });
+    const nodes = msgNodes();
+    const chip = walk(nodes[nodes.length - 1]).filter((e) => e.classList.contains('chip-image'))[0];
+    ok(chip, '气泡里没画出图片 chip');
+    return chip;
+  };
+  // ① 通路开着 ⇒ 末标是**取用方式**（说的是模型该用什么动作），且工具名点得出来
+  const open = bubbleChip();
+  ok(hasText(open, '模型需自行读取'), `imageRead:true 却还是「关」那一档：${texts(open).join('|')}`);
+  ok(!hasText(open, '图片输入未接通'), 'imageRead:true 时两档的字都在');
+  // ② 显式 false ⇒ 回到「关」（同一枚 chip 的两种画法必须只差那几个字）
+  send({
+    type: 'snapshot',
+    messages: [
+      {
+        id: 'c20-m1',
+        role: 'user',
+        text: '',
+        status: 'done',
+        attachments: [
+          { name: 'shot.png', path: 'D:\\p\\shot.png', kind: 'image', mediaType: 'image/png', bytes: 1258291 },
+        ],
+      },
+    ],
+    imageRead: false,
+  });
+  const off = walk(msgNodes().slice(-1)[0]).filter((e) => e.classList.contains('chip-image'))[0];
+  ok(hasText(off, '图片输入未接通'), 'imageRead:false 没有回到「关」那一档');
+  // ③ 缺字段（老扩展）⇒ 也是「关」：**fail-closed**，与扩展侧同一条纪律
+  send({ type: 'snapshot', messages: [] });
+  pasteFiles([fakeImage()]);
+  ok(
+    hasText($('attach-list').children[0], '图片输入未接通'),
+    '快照没带 imageRead 时待发 chip 没按「关」渲染'
+  );
+  resetAttach(); // 后面的用例从干净局面开始（档位此刻已经是「关」，与真机今天一致）
 });
 
 check('C17 超 3.5MB ⇒ chip 上说「图片过大」，且 send() 什么都不发', () => {
@@ -1916,9 +1978,31 @@ check('C17 气泡里的图片附件画成文字 chip（不是图）', () => {
   const node = nodes[nodes.length - 1];
   const chip = walk(node).filter((e) => e.classList.contains('chip-image'))[0];
   ok(chip, '气泡里没画出图片 chip');
-  ok(hasText(chip, 'shot.png') && hasText(chip, '1.2 MB') && hasText(chip, '模型看不到'), `chip 文案不对：${texts(chip).join('|')}`);
+  ok(
+    hasText(chip, 'shot.png') && hasText(chip, '1.2 MB') && hasText(chip, '图片输入未接通'),
+    `chip 文案不对（缺省档位应当是「关」）：${texts(chip).join('|')}`
+  );
   eq(walk(node).filter((e) => e.tagName === 'IMG').length, 0, '气泡里出现了 <img> —— 读起来就是「模型看见过这张图」');
   send({ type: 'snapshot', messages: [] });
+});
+
+check('C20 结构守卫：末标只从那张表读，且档位在 renderSnapshot **之前**落定', () => {
+  // ① 那句话不许在别处硬编（今天就是这么漂的：chip 的 tooltip 里写着「当前模型路由没开图片输入」，
+  //    那是一个写死的状态断言，没人跟着改）
+  const badge = chatJs.slice(chatJs.indexOf('function appendImageBadges'));
+  const body = badge.slice(0, badge.indexOf('\n  }'));
+  ok(body.includes('IMAGE_ROUTE_TAGS[imageRoute]'), 'chip 的末标不是从那张表读的');
+  // 「只许出现一次」= 只许写在顶部那张镜像表里。写第二处就是今天 tooltip 那个毛病的形状。
+  for (const w of ['图片输入未接通', '模型需自行读取']) {
+    eq(chatJs.split(w).length - 1, 1, `media/chat.js 里「${w}」出现了 ${chatJs.split(w).length - 1} 次（末标只许写在镜像表那一处）`);
+  }
+  // ② 档位必须在 renderSnapshot 之前设 —— 晚一步就会用上一档把这一屏画完
+  const snap = chatJs.slice(chatJs.indexOf("case 'snapshot':"));
+  const at = snap.indexOf('imageRoute = data.imageRead');
+  const render = snap.indexOf('renderSnapshot(data.messages)');
+  ok(at > 0, 'snapshot 处理里没有落定档位');
+  ok(at < render, '档位设在 renderSnapshot 之后了 —— 这一屏的 chip 会用上一档画完');
+  ok(snap.includes("data.imageRead === true ? 'readable' : 'blind'"), '缺字段没有按「关」处理（fail-closed）');
 });
 
 check('C17 CSS 守卫：图片 chip 那两枚小标走的是 dsh-live.css 里真有的 token', () => {
