@@ -139,10 +139,16 @@ class El {
     const a = this._listeners.get(type);
     if (a) this._listeners.set(type, a.filter((f) => f !== fn));
   }
-  /** 影子专用（真 DOM 里 click() 也是这么派的）：派发一次事件 */
-  dispatch(type) {
+  /** 影子专用（真 DOM 里 click() 也是这么派的）：派发一次事件。
+   *  C17：可选 `props` 并进事件对象 —— 只有这样才带得动 `clipboardData.files` / `dataTransfer.files`
+   *  （粘贴与拖拽那条路）。不带 props 的老调用（含 `click()`）语义一字未变。 */
+  dispatch(type, props) {
+    const ev = Object.assign(
+      { type: type, target: this, preventDefault() {}, stopPropagation() {} },
+      props || {}
+    );
     const a = this._listeners.get(type) || [];
-    for (const fn of a) fn({ type: type, target: this, preventDefault() {}, stopPropagation() {} });
+    for (const fn of a) fn(ev);
   }
   click() { this.dispatch('click'); }
   querySelectorAll() { return []; }
@@ -268,7 +274,28 @@ const sandbox = {
   MessageEvent: class { constructor(t, i) { this.type = t; this.data = i && i.data; } },
   URL: { createObjectURL: () => 'blob:probe', revokeObjectURL: () => {} },
   Blob: class { constructor() {} },
-  FileReader: class { readAsText() {} addEventListener() {} },
+  /**
+   * C17：`readAsDataURL` 必须**真的**把结果交回去。今天这个影子里的 `FileReader` 只有
+   * `readAsText`（**而且从不回调**），所以 paste / drop / addFilesFromList 这条路从来没被跑过。
+   *
+   * 假 File 就是普通对象 `{ name, type, size, dataUrl }`；结果从 `dataUrl` 取。
+   * ⚠️ 这里是**同步**回调（真 FileReader 是异步的）。有意的：本探针整体是同步的（没有 await），
+   * 而同步回调让「贴第 5 张图」那条用例测得到前端那道张数闸。**真机上异步顺序会让同时拖进来的
+   * 5 张各自看到「当前 0 张」而全部放行** —— 兜底在扩展侧（`_sendUser` 的那道复查），
+   * 这里测不到它，也不该假装测到了。
+   */
+  FileReader: class {
+    readAsDataURL(f) {
+      if (typeof f.dataUrl === 'string') {
+        this.result = f.dataUrl;
+        if (typeof this.onload === 'function') this.onload({ target: this });
+      } else if (typeof this.onerror === 'function') {
+        this.onerror({ target: this });
+      }
+    }
+    readAsText() {}
+    addEventListener() {}
+  },
   Promise, JSON, Math, Date, Object, Array, String, Number, Boolean, Error, RegExp, Map, Set, Intl,
 };
 sandbox.globalThis = sandbox;
@@ -1740,6 +1767,175 @@ check('C16 CSS 守卫：.approval-scope 走 warn 那套 token（不是 warning�
     '.approval-scope 写了 -warning- 那套 token —— dsh-live.css 里没有它，会静默退到 VS Code 兜底色（.approval-note 正是这个情况）'
   );
   ok(!/display:/.test(scope), '.approval-scope 里写了 display —— [hidden] 会失效，没信任可说时也占一块位置');
+});
+
+// ---------- C17 · 图片附件（诚实降级） ----------
+//
+// 真机看到的是：贴一张截图 ⇒ 待发条上是一枚写着「图片 · 1.2 MB · 模型看不到」的 chip，
+// 发出去之后模型收到的是一段说明（不是图，永远不是图 —— 它到不了）。
+//
+// 这里验影子能表达的部分：**字节怎么走（dataBase64，且绝不带 content）、chip 怎么说话、
+// 三道闸（大小 / 张数 / 坏附件不许发）拦不拦得住**，以及一条反控 —— 文本附件照旧走老路。
+
+const fakeImage = (over = {}) =>
+  Object.assign(
+    {
+      name: 'shot.png',
+      type: 'image/png',
+      size: 1258291,
+      dataUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB',
+    },
+    over
+  );
+
+/** 贴文件：走**真实的 paste 监听器**（不是直接调内部函数） */
+function pasteFiles(files) {
+  $('input').dispatch('paste', { clipboardData: { files } });
+}
+
+/** 按 Enter 发送：走**真实的 keydown 监听器** */
+function pressEnter() {
+  $('input').dispatch('keydown', { key: 'Enter', shiftKey: false });
+}
+
+let c17Ack = 0;
+/**
+ * 干净局面。两件事都要做，少一件后面的用例就会**因为错误的原因通过**：
+ * - 逐个点掉待发 chip（✕ 是真实的移除路径）；
+ * - 收一条扩展回执 —— `sending` 只有在回执里才会归位，而 `send()` 开头就是
+ *   `if (inputEl.disabled || sending) return`：不归位的话下一条用例按 Enter 什么都不会发生，
+ *   于是「有坏附件却发出去了」这类断言会**假绿**。
+ */
+function resetAttach() {
+  for (let i = 0; i < 40 && $('attach-list').children.length > 0; i++) {
+    const chip = $('attach-list').children[0];
+    const x = chip.children.filter((c) => c.classList.contains('chip-x'))[0];
+    if (!x) break;
+    x.click();
+  }
+  send({
+    type: 'user-message',
+    message: { id: 'c17-ack-' + ++c17Ack, role: 'user', text: '', status: 'done' },
+  });
+  $('input').value = '';
+  posted.length = 0;
+}
+
+check('C17 粘一张图 ⇒ 一条 user-message，带字节，**绝不带 content**', () => {
+  resetAttach();
+  pasteFiles([fakeImage()]);
+  eq($('attach-bar').hidden, false, '贴了图但待发条没出现');
+  $('input').value = '看看这张图';
+  pressEnter();
+  eq(posted.length, 1, `该只发一条消息，实际 ${posted.length} 条`);
+  const m = posted[0];
+  eq(m.type, 'user-message');
+  eq(m.attachments.length, 1, '附件数不对');
+  const a = m.attachments[0];
+  eq(a.kind, 'image', 'kind 没传上去 —— 扩展侧只能靠 dataBase64 猜');
+  eq(a.mediaType, 'image/png', 'mediaType 没传（扩展侧会重新嗅探，但 chip 要用它）');
+  eq(a.bytes, 1258291, 'bytes 没传 —— chip 上的大小就没得显示');
+  ok(typeof a.dataBase64 === 'string' && a.dataBase64.length > 0, '没把字节传上去，扩展侧无从落盘');
+  ok(!/^data:/.test(a.dataBase64), 'base64 里带着 `data:` 前缀 —— 扩展侧解出来会多一段垃圾');
+  eq(a.content, undefined, '图片附件带上了 content —— 那是把二进制当文本递给了模型');
+});
+
+check('C17 chip 上写的是「图片 + 真实大小 + 模型看不到」', () => {
+  resetAttach();
+  pasteFiles([fakeImage()]);
+  const chip = $('attach-list').children[0];
+  ok(chip.classList.contains('chip-image'), '没打上 .chip-image');
+  ok(hasText(chip, 'shot.png'), '没写文件名');
+  ok(hasText(chip, '图片'), '没写「图片」');
+  ok(hasText(chip, '1.2 MB'), '没写真实大小');
+  ok(hasText(chip, '模型看不到'), '没写「模型看不到」—— 那这枚 chip 就在暗示模型看见过它');
+  eq(walk(chip).filter((e) => e.tagName === 'IMG').length, 0, '画了 <img>');
+});
+
+check('C17 超 3.5MB ⇒ chip 上说「图片过大」，且 send() 什么都不发', () => {
+  resetAttach();
+  pasteFiles([fakeImage({ name: 'huge.png', size: 4 * 1024 * 1024 })]);
+  const chip = $('attach-list').children[0];
+  ok(hasText(chip, '图片过大'), `没说清是图片过大：${texts(chip).join('|')}`);
+  $('input').value = '发';
+  pressEnter();
+  eq(posted.length, 0, '有坏附件却发出去了');
+});
+
+check('C17 第 5 张图 ⇒ 拒的是**张数**，不是大小', () => {
+  resetAttach();
+  for (let i = 0; i < 4; i++) pasteFiles([fakeImage({ name: `a${i}.png` })]);
+  eq($('attach-list').children.length, 4, '前 4 张该都进来（上限是 4）');
+  pasteFiles([fakeImage({ name: 'a5.png' })]);
+  const last = $('attach-list').children[4];
+  ok(last, '第 5 张连 chip 都没有 —— 那用户根本不知道自己贴的那张去哪了');
+  ok(hasText(last, '图片最多 4 张'), `第 5 张的说法不对：${texts(last).join('|')}`);
+});
+
+check('C17 反控：文本附件照旧走 content 那一路（图片分支不许把老的带坏）', () => {
+  resetAttach();
+  send({ type: 'files-picked', attachments: [{ name: 'a.txt', path: 'D:\\p\\a.txt', content: 'hello' }] });
+  const chip = $('attach-list').children[0];
+  ok(!chip.classList.contains('chip-image'), '文本附件被打上了图片标');
+  $('input').value = 'q';
+  pressEnter();
+  const a = posted[0].attachments[0];
+  eq(a.content, 'hello', '文本内容没发出去');
+  eq(a.dataBase64, undefined, '文本附件带上了 dataBase64');
+  eq(a.kind, undefined, '文本附件被贴上了 kind');
+});
+
+check('C17 待发项的 truncated 要转发（今天它在这里被丢掉）', () => {
+  resetAttach();
+  send({
+    type: 'files-picked',
+    attachments: [{ name: 'big.txt', content: 'x'.repeat(10), truncated: true }],
+  });
+  ok(hasText($('attach-list').children[0], '已截断'), 'chip 上没提示已截断');
+  $('input').value = 'q';
+  pressEnter();
+  eq(posted[0].attachments[0].truncated, true, 'truncated 又被丢了 —— 扩展侧只会看到一段"完好"的内容');
+});
+
+check('C17 气泡里的图片附件画成文字 chip（不是图）', () => {
+  send({
+    type: 'snapshot',
+    messages: [
+      {
+        id: 'c17-m1',
+        role: 'user',
+        text: '',
+        status: 'done',
+        attachments: [
+          { name: 'shot.png', path: 'D:\\p\\shot.png', kind: 'image', mediaType: 'image/png', bytes: 1258291 },
+        ],
+      },
+    ],
+  });
+  const nodes = msgNodes();
+  const node = nodes[nodes.length - 1];
+  const chip = walk(node).filter((e) => e.classList.contains('chip-image'))[0];
+  ok(chip, '气泡里没画出图片 chip');
+  ok(hasText(chip, 'shot.png') && hasText(chip, '1.2 MB') && hasText(chip, '模型看不到'), `chip 文案不对：${texts(chip).join('|')}`);
+  eq(walk(node).filter((e) => e.tagName === 'IMG').length, 0, '气泡里出现了 <img> —— 读起来就是「模型看见过这张图」');
+  send({ type: 'snapshot', messages: [] });
+});
+
+check('C17 CSS 守卫：图片 chip 那两枚小标走的是 dsh-live.css 里真有的 token', () => {
+  const css = readFileSync(join(repoRoot, 'media', 'chat.css'), 'utf8');
+  const live = readFileSync(join(repoRoot, 'media', 'dsh-live', 'dsh-live.css'), 'utf8');
+  for (const cls of ['.chip-tag', '.chip-dim']) {
+    ok(css.includes(cls), `chat.css 里找不到 ${cls}`);
+  }
+  const dim = css.slice(css.indexOf('.chip-dim'));
+  const scope = dim.slice(0, dim.indexOf('}'));
+  ok(/--dsw-alias-label-secondary/.test(scope), '.chip-dim 没走 label-secondary');
+  ok(
+    live.includes('--dsw-alias-label-secondary'),
+    'dsh-live.css 里没有 --dsw-alias-label-secondary —— 那它会静默退到 VS Code 兜底色'
+  );
+  // 同 C16 那条：chip 上是 [hidden] 管的显隐，一条 display 就能把它整条废掉
+  ok(!/display:/.test(scope), '.chip-dim 里写了 display');
 });
 
 console.log('');

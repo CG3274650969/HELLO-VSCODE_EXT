@@ -32,6 +32,23 @@ const BIN_EXT = new Set([
   'woff', 'woff2', 'ttf', 'eot', 'otf',
 ]);
 
+/**
+ * 扩展名是否在「不该按 utf8 预览」的二进制表里。
+ *
+ * **导出是给 C17 的附件那条路复用的**：`_readFileAttachment` 要问的是同一个问题（「这个文件能不能
+ * 当文本读」），而两张清单分头维护迟早会漂 —— 那样就会出现「审阅里认得是二进制、附件里读成乱码」
+ * 这种自相矛盾。**但图片**那条路**不要**用它：图片的准入集合是上游那四种（见 `imageAttach.ts`
+ * 里为什么不复用这张表的注释）。
+ */
+export function binaryExt(name: string): boolean {
+  return BIN_EXT.has(path.extname(name).slice(1).toLowerCase());
+}
+
+/** 头 8KB 里有 NUL 字节 ⇒ 真二进制（扩展名表没盖住的那种）。导出理由同上。 */
+export function hasNulByte(buf: Uint8Array, scanBytes = 8192): boolean {
+  return buf.subarray(0, scanBytes).includes(0);
+}
+
 /** 遍历到该文件数直接中止（宁可本轮无审阅也不卡死面板） */
 const MAX_FILES = 60000;
 /** 单文件内容上限：超过只记 size+mtime（不预览、不还原轮前内容） */
@@ -145,12 +162,12 @@ function readEntry(
 
   let content: string | null = null;
   let truncated = false;
-  const isBinExt = BIN_EXT.has(path.extname(abs).slice(1).toLowerCase());
+  const isBinExt = binaryExt(abs);
   if (!isBinExt && size <= MAX_FILE_STORE_BYTES && budget > 0) {
     try {
       const buf = fs.readFileSync(abs);
       // 前 8KB 含 NUL → 判二进制（扩展名表没盖住的真二进制）
-      if (!buf.subarray(0, 8192).includes(0)) {
+      if (!hasNulByte(buf)) {
         content = buf.toString('utf8');
         budget -= buf.length;
         if (budget <= 0) truncated = true;

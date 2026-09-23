@@ -2613,6 +2613,62 @@
   var MAX_CHIP_TEXT = 200000;
   /** 浏览器 File 直接读取时的字节上限，再大就不读了（与扩展侧一致：10KB）。 */
   var MAX_FILE_BYTES = 10 * 1024;
+  /**
+   * C17：图片那一路的上限与类型表 —— **与扩展侧 `src/imageAttach.ts` 有意重复**（webview 加载不了
+   * TS）。漂了会在 `scripts/probe-image-attach.mjs` 的 B4 条上红，那条专门对拍这几个字面量。
+   *
+   * 这里判断「是不是图片」用的是**文件类型 / 扩展名**，而**扩展侧一律按魔数重判** ——
+   * 前端这一层只决定「用哪个 reader 去读」，真正的准入判定只有扩展侧那一份。
+   */
+  var IMAGE_MEDIA_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+  var MAX_IMAGE_BYTES = 3.5 * 1024 * 1024;
+  var MAX_IMAGES_PER_MESSAGE = 4;
+  /** 看着像图片的扩展名（与扩展侧 `IMAGE_EXT_HINTS` 同集合；`file.type` 常常是空串）。 */
+  var IMAGE_EXT_RE = /\.(png|jpe?g|jpe|jfif|gif|webp|bmp|ico|cur|svg|tiff?|avif|heic|heif)$/i;
+
+  /** 人读的字节数。口径与扩展侧 `imageAttach.formatBytes` 一致。 */
+  function formatBytes(n) {
+    if (typeof n !== 'number' || !isFinite(n) || n < 0) return '0 B';
+    if (n < 1024) return n + ' B';
+    var kb = n / 1024;
+    if (kb < 1024) return (kb < 10 ? kb.toFixed(1) : Math.round(kb)) + ' KB';
+    var mb = kb / 1024;
+    return (mb < 10 ? mb.toFixed(1) : Math.round(mb)) + ' MB';
+  }
+
+  /** 这个 File 该走图片那一路吗（类型或扩展名任一命中）。真伪由扩展侧按魔数说了算。 */
+  function looksLikeImage(file) {
+    if (IMAGE_MEDIA_TYPES.indexOf(file.type) >= 0) return true;
+    return IMAGE_EXT_RE.test(file.name || '');
+  }
+
+  /** 待发送里已有几张图片（张数上限是**落盘量**的安全阀，不是模型的要求）。 */
+  function countPendingImages() {
+    var n = 0;
+    for (var i = 0; i < pending.length; i++) {
+      if (pending[i].kind === 'image' && !pending[i].readError) n++;
+    }
+    return n;
+  }
+
+  /** 图片 chip 上的三个小标：图片 / 大小 / 模型看不到。**全部 textContent**（零 innerHTML）。 */
+  function appendImageBadges(chip, a) {
+    var tag = document.createElement('span');
+    tag.className = 'chip-tag';
+    tag.textContent = '图片';
+    chip.appendChild(tag);
+    if (typeof a.bytes === 'number' && a.bytes > 0) {
+      var dim = document.createElement('span');
+      dim.className = 'chip-dim';
+      dim.textContent = formatBytes(a.bytes);
+      chip.appendChild(dim);
+    }
+    var warn = document.createElement('span');
+    warn.className = 'chip-dim';
+    warn.textContent = '模型看不到';
+    warn.title = '当前模型不支持图片输入：图片只落成一个文件，agent 得用命令才碰得到它';
+    chip.appendChild(warn);
+  }
 
   function addPending(src) {
     var item = { key: 'p' + (++pendingSeq), name: src.name };
@@ -2620,6 +2676,11 @@
     if (src.content) item.content = src.content;
     if (src.truncated) item.truncated = true;
     if (src.readError) item.readError = src.readError;
+    // C17：图片那一路的字段。**图片永不带 content** —— 带的是字节的 base64，落盘时被消费掉
+    if (src.kind === 'image') item.kind = 'image';
+    if (src.mediaType) item.mediaType = src.mediaType;
+    if (typeof src.bytes === 'number') item.bytes = src.bytes;
+    if (src.dataBase64) item.dataBase64 = src.dataBase64;
     pending.push(item);
     renderPending();
     updateBusy();
@@ -2667,6 +2728,11 @@
       err.className = 'chip-err';
       err.textContent = p.readError;
       chip.appendChild(err);
+    } else if (p.kind === 'image') {
+      // C17：图片 chip **说它是一张图、说它多大、说模型看不到它**。这里刻意不画缩略图：
+      // 气泡里出现一张图，读起来就是「模型看见过它」—— 那是假的。
+      chip.className = 'chip chip-image';
+      appendImageBadges(chip, p);
     } else if (p.truncated) {
       var tr = document.createElement('span');
       tr.className = 'chip-err';
@@ -2703,6 +2769,10 @@
         err.className = 'chip-err';
         err.textContent = a.readError;
         chip.appendChild(err);
+      } else if (a.kind === 'image') {
+        // C17：与待发送 chip **同一套标**（同一条消息在发出前后长得一样，只是少了移除钮）
+        chip.className = 'chip readonly chip-image';
+        appendImageBadges(chip, a);
       } else if (a.truncated) {
         var tr = document.createElement('span');
         tr.className = 'chip-err';
@@ -2718,6 +2788,49 @@
   function addFilesFromList(fileList) {
     for (var i = 0; i < fileList.length; i++) {
       var file = fileList[i];
+      // C17：图片走自己那条路 —— **用 `readAsDataURL` 而不是 `readAsText`**（后者会把 PNG 读成
+      // 乱码喂给模型），也不走 10KB 那道闸（截图动辄几百 KB，那道闸是给文本附件的）。
+      // 为什么不用 `readAsArrayBuffer` + `btoa`：`readAsDataURL` 白送 base64，省掉
+      // Uint8Array / 分块 fromCharCode 一整类问题（DOM 影子那边也只要补一个真回调，见 D5）。
+      if (looksLikeImage(file)) {
+        if (file.size > MAX_IMAGE_BYTES) {
+          addPending({ name: file.name, kind: 'image', readError: '图片过大(>3.5MB)' });
+          continue;
+        }
+        if (countPendingImages() >= MAX_IMAGES_PER_MESSAGE) {
+          addPending({
+            name: file.name,
+            kind: 'image',
+            readError: '图片最多 ' + MAX_IMAGES_PER_MESSAGE + ' 张',
+          });
+          continue;
+        }
+        // 立即闭包捕获这一个 file，避免异步回调读到循环末态
+        (function (f) {
+          var r = new FileReader();
+          r.onload = function () {
+            var data = String(r.result);
+            var comma = data.indexOf(',');
+            if (comma < 0) {
+              addPending({ name: f.name, kind: 'image', readError: '无法读取' });
+              return;
+            }
+            // 剥掉 `data:image/png;base64,` 前缀：扩展侧只收纯 base64（它会重新嗅探字节）
+            addPending({
+              name: f.name,
+              kind: 'image',
+              mediaType: f.type || '',
+              bytes: f.size,
+              dataBase64: data.slice(comma + 1),
+            });
+          };
+          r.onerror = function () {
+            addPending({ name: f.name, kind: 'image', readError: '无法读取' });
+          };
+          r.readAsDataURL(f);
+        })(file);
+        continue;
+      }
       if (file.size > MAX_FILE_BYTES) {
         addPending({ name: file.name, readError: '文件过大(>10KB)' });
         continue;
@@ -2743,6 +2856,18 @@
     return e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0;
   }
 
+  /**
+   * 粘贴来的文件在 **`clipboardData`** 上，**不在 `dataTransfer` 上** —— 浏览器在 `paste` 事件上
+   * 不给 `dataTransfer`（那是 `drop`/`dragover` 的字段）。
+   *
+   * ⚠️ C17 之前这里问的是 `dropHasFiles(e)`，于是它**恒为假**：粘贴这条路（Ctrl+V 一张截图，
+   * 正是图片附件最常见的那条入口）从来没生效过，而且失效得毫无声响 —— 不会报错，只是什么都不发生。
+   * 是 `probe-webview-render` 的 C17 组把它抓出来的（影子按真浏览器的语义只给 clipboardData）。
+   */
+  function pasteHasFiles(e) {
+    return !!(e.clipboardData && e.clipboardData.files && e.clipboardData.files.length > 0);
+  }
+
   // ---------- 事件 ----------
 
   function send() {
@@ -2757,6 +2882,16 @@
       var a = { name: p.name };
       if (p.path) a.path = p.path;
       if (p.content) a.content = p.content;
+      // C17：`truncated` 今天在这里被丢掉了 —— 扩展侧于是在一条**已经被前端截断过**的附件上
+      // 看到"完好内容"，永远不会补那句「已截断」。顺手修掉（协议里它已上移到 FileRef）。
+      if (p.truncated) a.truncated = true;
+      // C17：图片只发**元数据 + 字节的 base64**，`content` 一个字都不发（扩展侧落盘后丢弃字节）
+      if (p.kind === 'image') {
+        a.kind = 'image';
+        if (p.mediaType) a.mediaType = p.mediaType;
+        if (typeof p.bytes === 'number') a.bytes = p.bytes;
+        if (p.dataBase64) a.dataBase64 = p.dataBase64;
+      }
       attachments.push(a);
     }
     // 不清空、不删 chip：等扩展回执。被拒（附件过大等）时内容原样保留；成功后再统一收尾
@@ -2938,9 +3073,11 @@
     attachBtn.addEventListener('click', function () {
       post({ type: 'pick-files' });
     });
-    // 粘贴文件（Ctrl+V 复制的文件）→ 读为附件
+    // 粘贴文件（Ctrl+V 复制的文件 / 一张截图）→ 读为附件。
+    // ⚠️ 判据必须是 `clipboardData`（见 pasteHasFiles 的注释）—— 这里曾用 dropHasFiles，
+    // 于是整条粘贴路径静默失效。
     inputEl.addEventListener('paste', function (e) {
-      if (dropHasFiles(e)) {
+      if (pasteHasFiles(e)) {
         e.preventDefault();
         addFilesFromList(e.clipboardData.files);
       }

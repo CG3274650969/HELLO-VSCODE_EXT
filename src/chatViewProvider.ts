@@ -85,6 +85,23 @@ import {
   writeEffortPluginFiles,
   writeEffortState,
 } from './effortPlugin';
+// C17：图片附件的判据全在纯模块里（能在扩展宿主之外加载 → 探针验得了）。
+import {
+  binaryFileError,
+  imageExtHint,
+  IMAGE_DIR_REL,
+  imageBytesAllowed,
+  imageNote,
+  imageTooLargeError,
+  imagesWithinCount,
+  noteForAttachment,
+  notAnImageError,
+  safeImageFileName,
+  sniffImageMediaType,
+  tooManyImagesError,
+} from './imageAttach';
+// 二进制判定只有一份源：附件这条路问的是与审阅同一个问题（「这文件能不能当文本读」）
+import { binaryExt, hasNulByte } from './fileSnapshot';
 import { isAbortError, streamMockReply } from './mockAssistant';
 import {
   capToolInput,
@@ -161,6 +178,11 @@ import { writeToolPolicyPluginFiles, type ToolPolicyMount } from './toolPolicyPl
 /** 附件内容上限：超过这个字节数的文件不读；超过这个字符数的内容截断。 */
 const MAX_FILE_BYTES = 10 * 1024; // 单文件最多 10KB
 const MAX_CONTENT_CHARS = 200 * 1024;
+
+/** C17：落盘图片的存活期。**7 天**（选区临时文件只留 6 小时 —— 那个只在当轮有意义，图片会被
+ *  人回过头来引用）。转写里仍留着文件名与大小，所以 chip 不会消失，只是「用命令打开它」这条路
+ *  过期了。之所以敢按时间删：C15 的分叉意味着两条会话可能引用同一个路径，按引用回收做不到。 */
+const IMAGE_TTL_MS = 7 * 24 * 3600 * 1000;
 
 /** globalState 里记住上次用的模式 */
 const MODE_KEY = 'hello.chat.mode';
@@ -1017,6 +1039,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    // C17：图片张数上限的**兜底复查**。webview 侧有一份镜像（贴第 5 张时当场就拦了），这一条是
+    // 防两边都被改漏 —— 少一道，用户拖 50 张截图进来就是往工作区写一百多 MB。
+    const images = attachments.filter((a) => a.kind === 'image');
+    if (images.length > 0 && !imagesWithinCount(images.length)) {
+      const reason = tooManyImagesError(images.length);
+      vscode.window.showWarningMessage(`已取消发送：${reason}`);
+      this._post({ type: 'user-message-rejected', reason });
+      return;
+    }
+
     // 4) 两模式共用的首条默认标题 + 入库
     const isFirst = this._active.messages.length === 0;
     this._hadHistoryBeforeSend = !isFirst; // live 首轮判断要不要插"失忆"note（须在 user 消息入列后插）
@@ -1168,6 +1200,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           } else {
             parts.push(this._selectionExcerpt(a));
           }
+          continue;
+        }
+        if (a.kind === 'image') {
+          // C17：图片**永远不发字节**（它到不了模型），发的是那段说明（路径 + 「你看不到它」）。
+          // 它必须排在下面 `<file>` 那行**之前**：图片没有 content，掉进那行只会拼出一个空块，
+          // 而模型会以为「这个文件是空的」而不是「这个文件我看不见」。
+          parts.push(noteForAttachment(a));
           continue;
         }
         const loc = a.path ? ` path="${a.path}"` : '';
@@ -3922,6 +3961,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const out: Attachment[] = [];
     for (const r of refs) {
       const name = r.name || (r.path ? path.basename(r.path) : '（未命名文件）');
+      // C17：图片走自己那条路（落盘 / 原地引用），**永不进下面按 utf8 读内容的分支**。
+      // 判据用 `kind` 或 `dataBase64` 任一：老 webview 不带 kind，但带了字节就一定是图片。
+      if (r.kind === 'image' || typeof r.dataBase64 === 'string') {
+        out.push(this._resolveImageRef(r, name));
+        continue;
+      }
       let att: Attachment;
       if (r.path && r.content === undefined) {
         att = this._readFileAttachment(r.path);
@@ -3938,19 +3983,162 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           att.readError = '没有可用的文件内容';
         }
       }
+      // C17：webview 自己截过的那一段（`MAX_CHIP_TEXT`）标记要透传上来 —— 否则扩展侧看到的是
+      // 一段"完好"的内容，永远不会说「已截断」（今天真实存在的一个缺陷）。
+      if (r.truncated) att.truncated = true;
       if (r.selection) att.selection = true; // 选区标记透传：组包时落成 @临时文件 chip（气泡干净）
       out.push(att);
     }
     return out;
   }
 
-  /** 按路径读文件为附件：超大的不读、超长的截断、异常给 readError。 */
+  /** 图片落盘目录。**优先工作区**（DSH agent 与工作区同盘、用命令直接读得到），无工作区才退
+   *  扩展存储目录 —— 理由与 `_writeSelectionTmp` 一模一样，见那里的注释（agent 曾为读到
+   *  C:\ 下的临时文件而把它复制进工作区，制造出幽灵改动）。 */
+  private _imageDir(): string {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    return root ? path.join(root, ...IMAGE_DIR_REL.split('/')) : path.join(this._storageDir, 'images');
+  }
+
+  /** 只在我们**完全拥有**的子目录里放一枚 `.gitignore`（内容 `*`），**绝不碰 `.hello-chat/`
+   *  顶层** —— 那里有 C12 的 `profile.json`，是用户可能真想提交进仓库的配置。
+   *  已存在就不动（用户自己改过的优先）。写不进去（只读盘/权限）不影响贴图本身。
+   *  这是防手滑：快照本来就忽略 `.hello-chat`，它不会出现在 2.1 审阅里。 */
+  private _ensureImageGitignore(dir: string): void {
+    try {
+      const p = path.join(dir, '.gitignore');
+      if (fs.existsSync(p)) return;
+      fs.writeFileSync(p, '*\n', 'utf8');
+    } catch {
+      /* 忽略 */
+    }
+  }
+
+  /**
+   * C17：把一条图片引用变成附件。**两种输入形态，待遇不同**：
+   *
+   * - **有 `path`**（系统选择器拾取来的）：**原地引用，不复制**。不写用户没要求的文件是更保守的
+   *   选择（同 C12「不写用户任何文件」）。代价只是原文件被移走/改名后路径失效 —— 那时 agent
+   *   本来也读不到它。
+   * - **只有 `dataBase64`**（粘贴/拖拽来的）：**必须落盘**，否则 agent 够不着 —— 而「agent 能用
+   *   命令碰它」正是这次降级唯一的实际价值。
+   *
+   * ⚠️ **不信任 webview**：拿解出来的字节**重新嗅探**一遍、在**解码后**的长度上重新查上限。
+   * 它报的 `mediaType`/`bytes` 只当展示用。
+   */
+  private _resolveImageRef(r: FileRef, name: string): Attachment {
+    if (r.path && !r.dataBase64) {
+      return this._readFileAttachment(r.path);
+    }
+    const buf = Buffer.from(r.dataBase64 ?? '', 'base64');
+    if (buf.length === 0) {
+      return { name, kind: 'image', readError: '图片内容为空或无法解码' };
+    }
+    const mediaType = sniffImageMediaType(buf);
+    if (!mediaType) {
+      return { name, kind: 'image', readError: notAnImageError() };
+    }
+    if (!imageBytesAllowed(buf.length)) {
+      return { name, kind: 'image', mediaType, bytes: buf.length, readError: imageTooLargeError() };
+    }
+    try {
+      const dir = this._imageDir();
+      fs.mkdirSync(dir, { recursive: true });
+      // 顺序有意：先扫（可能顺手删掉过期的 .gitignore），再补 .gitignore，最后才写图 ——
+      // 反过来的话，那一次「扫掉了 .gitignore」的落盘就会写出一张不被忽略的图。
+      this._sweepStaleFiles(dir, IMAGE_TTL_MS);
+      this._ensureImageGitignore(dir);
+      const fileName = safeImageFileName(name, mediaType, this._existingNames(dir));
+      const target = path.join(dir, fileName);
+      fs.writeFileSync(target, buf);
+      return {
+        name: fileName,
+        path: target,
+        kind: 'image',
+        mediaType,
+        bytes: buf.length,
+        note: imageNote({ name: fileName, path: target, bytes: buf.length, mediaType }),
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { name, kind: 'image', mediaType, bytes: buf.length, readError: `图片落盘失败：${message}` };
+    }
+  }
+
+  /** 目录里已存在的文件名（撞名加序号用）。读不出来当空目录。 */
+  private _existingNames(dir: string): string[] {
+    try {
+      return fs.readdirSync(dir);
+    } catch {
+      return [];
+    }
+  }
+
+  /** C17：激活时补扫一次图片目录。
+   *
+   *  光靠「下次落盘时顺带扫」不够：**只贴过一张图、之后再没贴过的用户**永远等不到下一次落盘，
+   *  那张图就永远躺在工作区里。启动是一次确定性的事件，放这里刚好补上。 */
+  public sweepImageAttachments(): void {
+    this._sweepStaleFiles(this._imageDir(), IMAGE_TTL_MS);
+  }
+
+  /** 只读文件头若干字节（够魔数嗅探与 NUL 判断）。读不出来就当空 —— 后面一律按「不是图片」判。 */
+  private _readHead(filePath: string, bytes: number): Uint8Array {
+    try {
+      const fd = fs.openSync(filePath, 'r');
+      try {
+        const buf = Buffer.alloc(bytes);
+        const n = fs.readSync(fd, buf, 0, bytes, 0);
+        return buf.subarray(0, n);
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      return new Uint8Array(0);
+    }
+  }
+
+  /**
+   * 按路径读文件为附件。C17 把「图片」与「二进制」两条路从「一律按 utf8 读」里拆了出来，
+   * 判据按这个**优先级**走（顺序本身就是判据，`probe-image-attach` 里有结构守卫钉着）：
+   *
+   * 1. **魔数命中四种图片之一** ⇒ 图片路。**内容一个字都不读进正文** —— 发给模型的是一段
+   *    `imageNote` 说明（路径 + 「你看不到它」）。今天这条路会把小图标读成乱码喂给模型。
+   * 2. **扩展名看着像图片但魔数不是** ⇒ 「不是可用的图片」。**绝不掉进按文本读** —— 用户以为
+   *    自己贴的是图，读到一堆代码只会莫名其妙。
+   * 3. **扩展名在二进制表里 / 头 8KB 有 NUL** ⇒ 「二进制文件，模型读不了」（PDF/ZIP/EXE 都算）。
+   * 4. **超过 10KB** ⇒ 照旧不读。⚠️ 这一条**必须排在图片之后**：截图动辄几百 KB，落在这道闸
+   *    后面就永远是「文件过大（>10KB）」—— 对图片那句话既不对（上限不是 10KB）也没用
+   *    （换一张小图照样进不了模型）。
+   * 5. 剩下的才是文本：照旧读、超长截断。
+   */
   private _readFileAttachment(filePath: string): Attachment {
     const name = path.basename(filePath);
     try {
       const st = fs.statSync(filePath);
       if (!st.isFile()) {
         return { name, path: filePath, readError: '不是文件' };
+      }
+      const head = this._readHead(filePath, 8192);
+      const mediaType = sniffImageMediaType(head);
+      if (mediaType) {
+        if (!imageBytesAllowed(st.size)) {
+          return { name, path: filePath, kind: 'image', mediaType, bytes: st.size, readError: imageTooLargeError() };
+        }
+        return {
+          name,
+          path: filePath,
+          kind: 'image',
+          mediaType,
+          bytes: st.size,
+          note: imageNote({ name, path: filePath, bytes: st.size, mediaType }),
+        };
+      }
+      if (imageExtHint(name)) {
+        return { name, path: filePath, readError: notAnImageError() };
+      }
+      if (binaryExt(name) || hasNulByte(head)) {
+        return { name, path: filePath, readError: binaryFileError() };
       }
       if (st.size > MAX_FILE_BYTES) {
         return { name, path: filePath, readError: `文件过大（>${MAX_FILE_BYTES / 1024}KB），未读取` };
@@ -4007,6 +4195,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const parts: string[] = [];
     if (text) parts.push(text);
     for (const a of attachments) {
+      if (a.kind === 'image') {
+        // C17：与 `_runLive` **同一句话**（同一个 `noteForAttachment`）—— 两个模式不许说两套。
+        parts.push(noteForAttachment(a));
+        continue;
+      }
       const loc = a.path ? ` path="${a.path}"` : '';
       const err = a.readError ? ` error="${a.readError}"` : '';
       const body = a.readError ? '' : (a.content ?? '');
@@ -4509,7 +4702,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         ? path.join(root, '.hello-chat', 'selection-attach')
         : path.join(this._storageDir, 'selection-attach');
       fs.mkdirSync(dir, { recursive: true });
-      this._sweepSelectionTmp(dir); // 顺带清掉过期文件，防堆积
+      this._sweepStaleFiles(dir); // 顺带清掉过期文件，防堆积
       const target = path.join(dir, `${a.name}·选区`);
       fs.writeFileSync(target, a.content ?? '', 'utf8');
       return target;
@@ -4518,9 +4711,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** 清掉 selection-attach 目录里超过存活期的临时文件（agent 通常只在当轮读它；留多轮窗口防
-   *  会话续聊引用失效）。目录不存在 / 单文件删除失败都静默忽略。 */
-  private _sweepSelectionTmp(dir: string, maxAgeMs = 6 * 3600 * 1000): void {
+  /** 清掉落盘目录里超过存活期的文件。两处用：1.1 的 `selection-attach`（默认 6 小时 —— agent
+   *  通常只在当轮读它，留多轮窗口防会话续聊引用失效）与 C17 的 `images`（7 天，见 `IMAGE_TTL_MS`）。
+   *
+   *  ⚠️ 它是**按 mtime** 扫的，不看会话引用 —— 这是有意的：C15 的分叉意味着两条会话可能引用
+   *  同一个路径，按引用回收要么误删要么永远不删。目录不存在 / 单文件删除失败都静默忽略。 */
+  private _sweepStaleFiles(dir: string, maxAgeMs = 6 * 3600 * 1000): void {
     try {
       const now = Date.now();
       for (const f of fs.readdirSync(dir)) {

@@ -38,20 +38,45 @@ export interface FileRef {
   name: string;
   /** 绝对路径（能拿到时才有；浏览器拖拽/粘贴的文件没有） */
   path?: string;
-  /** 已读出的文本内容（拖拽/粘贴时由 webview 先读出） */
+  /** 已读出的文本内容（拖拽/粘贴时由 webview 先读出）。
+   *  ⚠️ **图片附件永不带这个字段** —— 见下方 `dataBase64` 的注释。 */
   content?: string;
   /** 1.1 自动附选区注入的引用（非手动附件）：content = 编辑器缓冲里选中的确切文本（dirty 未保存
    *  也含）。组包时把它落成临时文件、只发 `@"临时文件"` chip → 原生 DSH 气泡保持干净（chip + 用户
    *  手打的话），agent 打开文件读到精确的选中行。写盘失败才回退内联摘录。 */
   selection?: boolean;
+  /** C17：普通文件还是图片。缺省 = `'file'`（老 webview 不带这个字段，一切照旧）。 */
+  kind?: 'file' | 'image';
+  /** C17：图片的 MIME（只可能是上游认的那四种，见 `imageAttach.IMAGE_MEDIA_TYPES`）。
+   *  **扩展侧不信这个值**：落盘时拿解出来的字节重新嗅探一遍（webview 不是可信输入）。 */
+  mediaType?: string;
+  /** C17：图片的原始字节数（webview 侧的 `file.size`；仅用于展示）。 */
+  bytes?: number;
+  /**
+   * C17：图片字节的 base64（**不含 `data:` 前缀**）。
+   *
+   * ⚠️ 这是 **webview → 扩展的单向字段**：在 `_resolveAttachments` 里被消费掉（落盘成文件），
+   * **绝不进 `Attachment`**。整份 `attachments` 会**原样落进 `sessions*.json`**，而用户提示词正文
+   * 没有任何上限 —— 一次贴图就能把会话存储写成几十 MB。
+   */
+  dataBase64?: string;
+  /**
+   * 内容超限被截断。**C17 从 `Attachment` 上移到这里**：webview 自己也会截断（`MAX_CHIP_TEXT`），
+   * 这个标记本来该由它发上来，扩展侧才好补一句「已截断」—— 而旧协议只允许扩展侧产出它，
+   * 于是 webview 截过的那一段在扩展侧看起来是完好的（今天真实存在的一个缺陷）。
+   */
+  truncated?: boolean;
 }
 
 /** 读取/整理后的附件：带大小截断或读取失败的标记。 */
 export interface Attachment extends FileRef {
-  /** 内容超限被截断 */
-  truncated?: boolean;
-  /** 读取失败原因（存在则 content 为空） */
+  /** 读取失败原因（存在则 content 为空）。**图片的失败原因走它**：超限 / 不是可用图片 /
+   *  二进制非文本，三条各有各的话（今天它们全都说成「文件过大（>10KB）」或干脆说成乱码）。 */
   readError?: string;
+  /** C17：图片附件**发给模型的那段说明文字**（路径 + 「当前模型不支持图片输入、你看不到它」）。
+   *  组包时优先用它；缺省则由 `imageAttach.imageNote` 现算 —— 两个模式（live / chat）都读这里，
+   *  不许各说各的话。 */
+  note?: string;
 }
 
 /** 一条对话消息。id 由扩展签发，全局唯一（带会话前缀），webview 只消费。

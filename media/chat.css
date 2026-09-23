@@ -897,6 +897,20 @@ body.vscode-high-contrast .brand-mark {
   color: var(--dsw-alias-state-error-primary, var(--vscode-errorForeground, #f14c4c));
   font-style: italic;
 }
+/* C17：图片附件。**刻意不画缩略图** —— 气泡里出现一张图，读起来就是「模型看见过它」，
+   而本次的实情恰恰相反（图片只落成一个文件，agent 得用命令才碰得到）。所以只有三个小标。 */
+.chip-tag {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 7px;
+  background: var(--dsw-alias-bg-layer-2, var(--vscode-badge-background, rgba(128, 128, 128, 0.22)));
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  font-size: 10px;
+}
+.chip-dim {
+  flex: none;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+}
 .chip-x {
   flex: none;
   border: none;
