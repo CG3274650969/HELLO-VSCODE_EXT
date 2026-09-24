@@ -1353,12 +1353,20 @@ body.live-busy #send-btn {
 }
 /* 口径说明那几行：比读数轻一档，且允许折行（它们本来就是整句）。
    第一条前面拉一条分隔线 —— 不拉的话整块读起来是一团同质的灰字。
-   `+` 正好只命中紧跟在读数行后面那一条（`已压缩 N 次` 那种无标签行也是一条读数行）。 */
+   `+` 正好只命中紧跟在读数行后面那一条（`已压缩 N 次` 那种无标签行也是一条读数行）。
+
+   ⚠️ 用的是 **tertiary 不是 dimmed**（C22d，2026-09-24 真机反馈：用户「黑色主题下有点暗」）。
+   `label-dimmed` 在这套令牌梯里是**最淡那一档**（亮色 = bluish-200 `rgb(225,229,238)`、
+   暗色 = bluish-750 `rgb(67,69,74)`），它是给"几乎不用看见的装饰"用的，不是给"安静的文字"用的：
+   浮层底色是 VS Code 的 dropdown-listBackground（暗色 ≈ `rgb(43,43,48)`）⇒ 暗色下对比度 ≈1.5:1。
+   tertiary 才是这套系统里"降一档但仍可读"的那一档，且**层级照旧**：
+   数字(label-primary) > 行标签(label-secondary) > 说明(label-tertiary)（暗色 ≈6.6:1 / 亮色 ≈3.7:1）。
+   探针按**梯子的顺序**守着这件事（说明那档必须夹在行标签与 dimmed 之间），不认字面量。 */
 .ctx-note {
   padding: 2px 10px;
   font-size: 11px;
   line-height: 1.5;
-  color: var(--dsw-alias-label-dimmed, var(--vscode-descriptionForeground, #999));
+  color: var(--dsw-alias-label-tertiary, var(--vscode-descriptionForeground, #999));
   white-space: normal;
 }
 .ctx-readout .lc-model-item + .ctx-note {

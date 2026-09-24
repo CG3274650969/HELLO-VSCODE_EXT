@@ -1087,7 +1087,7 @@ check('C22 结构守卫：四个令牌在 dsh-live.css 里**真的存在**（写
     '--dsw-alias-label-secondary',
     '--dsw-alias-border-l2',
     '--dsw-alias-state-warn-primary',
-    '--dsw-alias-label-dimmed', // C22b：浮层的口径说明行用它（比读数轻一档）
+    '--dsw-alias-label-tertiary', // C22d：浮层的口径说明行用它（比读数轻一档，但**看得见**）
   ];
   for (const t of used) {
     ok(tokens.includes(t + ':'), `dsh-live.css 里没有定义 ${t} —— 会静默退到 VS Code 兜底色`);
@@ -1097,6 +1097,57 @@ check('C22 结构守卫：四个令牌在 dsh-live.css 里**真的存在**（写
     const hits = tokens.split(t + ':').length - 1;
     ok(hits >= 2, `${t} 只定义了 ${hits} 次 —— 明暗两套主题里少了一套（那套下会退到兜底色）`);
   }
+});
+
+check('C22d 结构守卫：说明那几行的色阶必须**夹在**行标签与 dimmed 之间（暗色下不再看不见）', () => {
+  // 由来：用户 2026-09-24 在**暗色主题**下看浮层，原话「这句话…有点暗，可以稍微亮一点」。
+  // 原来用的是 `--dsw-alias-label-dimmed` —— 它在 dsh-live.css 的令牌梯里是最淡那一档
+  //（亮色 = bluish-200 `rgb(225,229,238)`、暗色 = bluish-750 `rgb(67,69,74)`），而浮层底色是
+  // VS Code 的 dropdown-listBackground（暗色 ≈ `rgb(43,43,48)`）⇒ 暗色下对比度 ≈1.5:1。
+  // dimmed 是给"几乎不用看见的装饰"的，不是给"安静的文字"的。
+  //
+  // ⚠️ 这里卡的是**梯子上的位置**，不是令牌名也不是色值（C21b 的教训：卡字面量等于把当时那个值
+  //    写成了正确，下一个人只会照着字面量改回去）：
+  //      ① 必须**弱于**行标签（保住「数字 > 标签 > 说明」的层级，说明不能比读数还响）；
+  //      ② 必须**强于** dimmed（否则又回到"看不见"）。
+  //    梯子顺序抄自 dsh-live.css 那两套别名块（明暗一致：primary > secondary > tertiary > caption > dimmed）。
+  const css = readFileSync(join(repoRoot, 'media', 'chat.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  const LADDER = ['primary', 'secondary', 'tertiary', 'caption', 'dimmed']; // 越靠前越显眼
+  const tier = (sel) => {
+    // 允许 `label-primary-bluish` 这类同族名：取最长匹配前缀
+    const m = new RegExp('\\.' + sel + '\\s*\\{([^}]*)\\}').exec(css);
+    if (!m) return null;
+    const c = /color\s*:\s*var\(\s*--dsw-alias-label-([a-z-]+)\s*,/.exec(m[1]);
+    if (!c) return null;
+    const name = LADDER.find((t) => c[1] === t || c[1].startsWith(t + '-'));
+    return name ? { name, i: LADDER.indexOf(name), block: m[1] } : { name: c[1], i: -1, block: m[1] };
+  };
+  const note = tier('ctx-note');
+  const label = tier('ctx-row-label');
+  ok(label, 'chat.css 里找不到 `.ctx-row-label` 的 color（或它不再走带兜底的 `--dsw-alias-label-*`）');
+  ok(note, 'chat.css 里找不到 `.ctx-note` 的 color（或它不再走带兜底的 `--dsw-alias-label-*`）');
+  if (!note || !label) return;
+  ok(
+    label.i >= 0 && note.i >= 0,
+    `说明/标签用了梯子之外的令牌（说明 = ${note.name}、标签 = ${label.name}）—— ` +
+      '梯子外的不保证明暗两套都给得出来，暗色下很可能就退成看不见'
+  );
+  ok(
+    note.i > label.i,
+    `说明那档（${note.name}）不比行标签那档（${label.name}）弱 —— 层级反了：` +
+      '说明是不需要先读的东西，不能和读数一样响'
+  );
+  ok(
+    note.i < LADDER.indexOf('dimmed'),
+    `说明那档是 ${note.name}，已经落到 dimmed 那一侧了 —— dimmed 是"几乎不用看见的装饰"那一档` +
+      '（暗色下 ≈1.5:1，就是 C22d 用户报的那条"有点暗"）'
+  );
+  // 兜底链不能丢：media/dsh-live 产物缺失时 chat.html 那条 <link> 是空的，那时全靠第二个参数。
+  ok(
+    /color\s*:\s*var\(\s*--dsw-alias-label-[a-z-]+\s*,\s*var\(/.test(note.block),
+    '说明行的 color 没有兜底（`var(令牌, var(--vscode-…))` 这样一路退下去）—— ' +
+      'dsh-live 产物缺失时说明会变成不可见'
+  );
 });
 
 // ---------- D4 · 转写折叠（纯界面，不碰存储） ----------
