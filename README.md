@@ -1,8 +1,14 @@
 <div align="center">
 
+<!-- 头图必须是**绝对 https 的 PNG**，别改回相对路径的 SVG（打包器会直接中止）：
+     vsce 只重写 markdown 的相对链接，裸 <img src="media/…"> 会被判 Invalid image source；
+     而 .svg 还要 host 落在 vsce 的 TrustedSVGSources 白名单里（raw.githubusercontent.com
+     不在里面）⇒ 报 `SVGs are restricted in README.md; please use other file image
+     formats, such as PNG`。media/logo-*.svg 仍是源文件：改造型改它们，再渲成同名 .png。
+     ⚠️ 这两条 URL 钉在 **main** 分支上 ⇒ 发版前 dev 必须先合进 main，否则图裂。 -->
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="media/logo-dark.svg">
-  <img src="media/logo-light.svg" alt="AlohaDSH" width="220">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/CG3274650969/HELLO-VSCODE_EXT/main/media/logo-dark.png">
+  <img src="https://raw.githubusercontent.com/CG3274650969/HELLO-VSCODE_EXT/main/media/logo-light.png" alt="AlohaDSH" width="220">
 </picture>
 
 # AlohaDSH —— VS Code 侧栏的 DeepSeek-Harness（DSH）聊天面板
@@ -56,6 +62,21 @@
 「内嵌聊天」是未完成的沙盒、**本版未开放入口**（按钮已隐藏，代码保留，只用于打磨流式/渲染管线）。
 哪些做完、哪些有意没做，见 [docs/backlog.md](docs/backlog.md)。
 
+## 安装
+
+**从 VSIX**（本版尚未上架 Marketplace）：
+
+1. 到 [Releases](https://github.com/CG3274650969/HELLO-VSCODE_EXT/releases) 下载
+   `hello-vscode-ext-0.0.1.vsix`。
+2. VS Code 扩展面板右上角 `…` → **Install from VSIX…** 选中它；或在终端跑
+   `code --install-extension hello-vscode-ext-0.0.1.vsix`。
+3. Reload 窗口。
+
+**从源码**：走下面的「运行（三步）」——`F5` 起的是同一个扩展。
+
+> 扩展里**不含** DSH 运行时。Harness 模式要你自己有一份 DSH 检出，见
+> [手册第 0–2 节](docs/manual.zh-CN.md#完整路径从零到跑通-harness)。
+
 ## 运行（三步）
 
 前提是你已经有一份 DSH 检出（还没有？见[手册第 0–2 节](docs/manual.zh-CN.md#完整路径从零到跑通-harness)）：
@@ -86,6 +107,8 @@ PR 同样欢迎；当前工作线是常驻的 `dev` 分支。
 
 `npm run compile`（tsc）是构建。另有自检与一族探针（[scripts/](scripts/)），
 F5 之前必须全绿。见[手册：开发与安全提示](docs/manual.zh-CN.md#开发与安全提示)。
+
+打包与发布（VSIX 怎么出、Marketplace 上怎么传）见 [docs/publishing.md](docs/publishing.md)。
 
 ## License
 

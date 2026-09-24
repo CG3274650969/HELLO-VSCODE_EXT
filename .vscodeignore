@@ -1,0 +1,40 @@
+# 打包排除表 —— 这里列的是**不进 VSIX** 的东西，其余全进。
+#
+# ⚠️ **这个文件不能删**：vsce 找不到 .vscodeignore 时会退回去把 .gitignore 当排除表，
+# 而 out/ 正在 .gitignore 里 ⇒ 入口文件被排除掉、打出一个装起来不会动的包（且不报错）。
+#
+# 有意**留在包里**的：package.json、out/**（入口 + 全部编译产物）、
+# media/**（chat.html / chat.js / chat.css、icon.svg 活动栏图标、logo*、
+# dsh-live/** 真 DSH 组件画面）、README.md、CHANGELOG.md、LICENSE、THIRD_PARTY_NOTICES.md。
+#
+# 判过「扩展运行时不需要」才排的：
+#   runtime/**  —— 只有 cordis.default.yml 这个构建期模板；运行时读的是 src/dshHooks.ts
+#                  里那份**构建期快照**，不是这个文件（out/*.js 里对它的引用全在注释里）。
+#   media/dsh-live/** —— 见文件末尾那段：**拍板进包**，所以这里没有它。
+.vscode/**
+.claude/**
+.github/**
+.vscodeignore
+.gitignore
+tsconfig.json
+package-lock.json
+src/**
+scripts/**
+docs/**
+logs/**
+runtime/**
+node_modules/**
+dist-runtime/**
+probe-*.cjs
+probe-*.mjs
+probe-*.html
+*.vsix
+README.en.md
+README.zh-CN.md
+
+# media/dsh-live/ 是 DSH 构建产物（内含 @deepseek-ai 组件实现），仓库本身 gitignore 它
+# （公开仓不带 5.4 MB 的构建产物），但**发布包里带**（2026-09-24 拍板）：装完即得
+# 「真 DSH 组件画面」，不用使用者自己重建。它缺失时扩展会自动退回 VS Code 观感、
+# 功能一个不少 ⇒ 这一行是「发不发那套观感」的开关，不是「能不能跑」的开关。
+# 要发一个不带它的包：把下面这行取消注释，重新打包。
+# media/dsh-live/**

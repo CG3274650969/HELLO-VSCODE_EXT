@@ -1,8 +1,16 @@
 <div align="center">
 
+<!-- The header image must be an **absolute https PNG** — do not switch it back to a
+     relative SVG. vsce only rewrites relative markdown links; a bare <img src="media/…">
+     fails with "Invalid image source", and .svg additionally requires the host to be in
+     vsce's TrustedSVGSources allowlist (raw.githubusercontent.com is not) ⇒ "SVGs are
+     restricted in README.md; please use other file image formats, such as PNG". The
+     media/logo-*.svg files remain the sources: restyle those, then re-render the .png.
+     ⚠️ Both URLs are pinned to the **main** branch ⇒ dev must be merged into main before
+     a release, or the image breaks. -->
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="media/logo-dark.svg">
-  <img src="media/logo-light.svg" alt="AlohaDSH" width="220">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/CG3274650969/HELLO-VSCODE_EXT/main/media/logo-dark.png">
+  <img src="https://raw.githubusercontent.com/CG3274650969/HELLO-VSCODE_EXT/main/media/logo-light.png" alt="AlohaDSH" width="220">
 </picture>
 
 # AlohaDSH — a DeepSeek-Harness (DSH) side panel for VS Code
@@ -61,6 +69,21 @@ release** (the button is hidden; the code is kept to exercise the streaming/rend
 pipeline). What is done and what is deliberately not is tracked in
 [docs/backlog.md](docs/backlog.md).
 
+## Install
+
+**From a VSIX** (not on the Marketplace yet):
+
+1. Grab `hello-vscode-ext-0.0.1.vsix` from
+   [Releases](https://github.com/CG3274650969/HELLO-VSCODE_EXT/releases).
+2. In VS Code: Extensions view → the `…` menu → **Install from VSIX…** — or run
+   `code --install-extension hello-vscode-ext-0.0.1.vsix`.
+3. Reload the window.
+
+**From source**: follow "Run" below — `F5` starts the same extension.
+
+> The extension does **not** bundle the DSH runtime. Harness mode needs your own DSH
+> checkout — see [manual §0–2](docs/manual.md#full-setup-from-a-clean-machine-to-a-live-harness).
+
 ## Run
 
 Assuming you already have a DSH checkout (no checkout yet? see [manual §0–2](docs/manual.md#full-setup-from-a-clean-machine-to-a-live-harness)):
@@ -94,6 +117,9 @@ Pull requests are welcome too — the active line is the long-running `dev` bran
 `npm run compile` (tsc) is the build. Beside it there is a self-check and a family of
 probes under [scripts/](scripts/), all of which must be green before an F5 pass. See
 [manual: Development & security notes](docs/manual.md#development--security-notes).
+
+Packaging and publishing (how the VSIX is produced, how it is uploaded) is covered in
+[docs/publishing.md](docs/publishing.md) (Chinese).
 
 ## License
 
