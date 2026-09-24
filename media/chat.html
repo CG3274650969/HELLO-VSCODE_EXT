@@ -127,21 +127,24 @@
     <div id="attach-bar" class="attach-bar" hidden>
       <div id="attach-list" class="attach-list"></div>
     </div>
-    <!-- C3a 用量读数细条：本轮/本会话 token + 上下文占用率。挂在输入卡正上方、composer 内 →
-         react-live 只藏 #messages，两种画面都看得见（同 review-bar 的道理）。
-         由扩展 usage / snapshot 驱动：没数据时（旧会话、刚切过来、内嵌聊天）整条隐藏。
-         文案由 chat.js 用 textContent 落进这一个 span（全仓零 innerHTML）。 -->
-    <div id="usage-bar" class="usage-bar" hidden>
-      <span id="usage-summary" class="usage-summary"></span>
-    </div>
-    <!-- C9 运行检查器条：本轮的工具调用次数 / 耗时 / 失败数，点「查看」开浮层看完整时间线。
-         同 usage-bar 挂在 composer 内 → react-live 只藏 #messages，两种画面都可见。
-         与 usage-bar 的差别：harness 下**从没跑过也显示**（「本轮尚无」）—— 调试面板要等第一轮
-         跑完才有入口，就等于没有入口。内嵌聊天则整条隐藏（没有 DSH 帧，永远不会有内容）。
-         文案由 chat.js 用 textContent 落进这一个 span（全仓零 innerHTML）；判据一律在扩展侧算。 -->
-    <div id="runs-bar" class="runs-bar" hidden>
-      <span id="runs-summary" class="runs-summary"></span>
-      <button id="runs-view" class="link-button" type="button">查看</button>
+    <!-- C21 本轮读数**行**（原 C3a 用量条 + C9 运行条合并）：C22 起这里**只剩运行读数** ——
+         本轮运行摘要 + 最右的「运行记录 ›」（点开浮层看完整时间线）。原来左半那段
+         「本轮/累计/上下文」2026-09-24 搬进了配置条里的一枚环（C22，见下面 #ctx-ring）：
+         一行字挤进工具栏放不下，一枚环放得下，而工具栏正是它该常驻的地方（不用低头看第二处）。
+         ⚠️ **它是一行，不是一张卡** —— composer 里只有"要你动手"的条（审批 / 审阅 / 继续）才配
+         一张软卡（1px 边框 + 圆角 + 底色）。读数是常驻的背景信息，四条同款卡并排会让读数与动作
+         一样重。所以这一行**没有 border、没有 background**，C22 起也**没有任何会变色的状态**了
+         （C21 那个 `.near` 随上下文那半一起搬到了环上，见 chat.css 的 `.ctx-ring.near`）。
+         挂在输入卡正上方、composer 内 → react-live 只藏 #messages，两种画面都看得见（同 review-bar）。
+         由扩展 runs / snapshot 驱动：harness 下运行读数**从没跑过也下发**（`{runs: []}` ⇒ 写
+         「本轮尚无」），因为调试浮层的入口不能等第一轮跑完才出现；内嵌聊天没有数据 ⇒ 隐藏。
+         文案由 chat.js 用 textContent 落进那个 span（全仓零 innerHTML）；判据一律在扩展侧算。
+         `#runs-view` 这个 id 与「查看」那个按钮是同一个元素（改名会白连累 chat.js 的绑定与探针），
+         变的是它的**显隐**：默认 opacity 0，行 hover / 键盘聚焦时才显形（CSS 负责，见 .status-open）。 -->
+    <div id="status-row" class="status-row" hidden>
+      <span id="status-run" class="status-run"></span>
+      <button id="runs-view" class="link-button status-open" type="button"
+              title="本轮每一轮的工具调用 / 耗时 / 失败数（完整时间线）">运行记录 ›</button>
     </div>
     <!-- C8「继续」条：上一轮以中断/出错收场时出现，点一下把上一条消息重发、接着这个 DSH 会话跑。
          同 review-bar / approval-bar 挂在 composer 内 —— react-live 只藏 #messages，两种画面都可见
@@ -204,6 +207,57 @@
             </button>
             <div id="live-model-menu" class="lc-model-menu" role="menu" aria-label="模型列表"></div>
           </div>
+          <!-- C22b 上下文占用环：配置条上的**第三个方块钮**，夹在模型钮与推理档位钮之间
+               （用户点名的位置 —— 它就是 Claude Code 那一枚的位置）。
+               弧长 = 本次上下文占用比例（usedTokens / contextWindow），从 12 点顺时针长；
+               颜色只在接近 DSH 压缩阈值时转警告色（.near），读数是上次落盘的样本时整环变淡（.stale）。
+               悬停出完整悬浮信息，**点它开一个只读浮层**（同一份读数分行列出来 + 口径说明）
+               —— C21 那行字一个字没丢，只是从"占一行"挪到了"占一枚按钮"。
+
+               📌 **为什么不自己一套样式**（C22b 的由来）：C22 第一版它是"裸 span + 自绘 CSS"，
+               而同一条工具栏里推理档位 / profile 两个钮是
+               `div.lc-model-wrap > button.tool-icon.lc-knob + div.lc-model-menu` ——
+               **同一条工具栏里两套外观来源**，hover 时也不一样（它们亮底，环不亮）。
+               现在三个钮用的是同一套：外层 `.lc-model-wrap`（浮层定位基准）+ `button.tool-icon.lc-knob`
+               （26×26 方块，与附件钮逐字同款）+ `.lc-model-menu` 浮层。
+               ⚠️ **环自己的 `width` / `height` / `color` / `background` / `cursor` 一个字都不写**
+               （全从 `.tool-icon` 来）—— 写回一处就等于又长出一套外观，探针有守卫钉着。
+               ⚠️ **别再把它改回 span**：`.lc-model-menu` 是绝对定位的浮层，需要一个
+               `position: relative` 的祖先（`.lc-model-wrap` 提供）。
+
+               📌 **它是钮，但不是"要你动手"那一类**：浮层是**只读**的（没有可选项），所以
+               ① **不随 busy 禁用**（看读数什么时候都该能看，运行中正是最想看的时候）；
+               ② 开跑时**不收起**（与旁边三个"改配置"的钮相反）；③ 角上的 `.on` 点**一次都不挂**
+               （C22b 拍板：点和变色说的是同一件事，两处一起喊就白建了）。挂 `.lc-knob` 只是为了让
+               三个钮的类名逐字同款。
+
+               📌 **它没有 `hidden`**（C22c 用户推翻 C22 那条"没有数据就整个藏掉"）：
+               新建对话、一句话还没发的时候这枚环**照样在这儿**，只是弧为空、读作 0 ——
+               "一个控件在新建对话里凭空消失、发了第一句话才冒出来"本身就是个疑点。
+               空态由 chat.js 写进一行读数（「本轮尚无用量」+ 一句"数从第一次请求开始记"），
+               **不写数字 0**：读不到读数也可能是"拼不出这个会话的数"（未知），写成 0 就成了假话。
+               所以**别在这儿加 `hidden`**，`paintContextRing` 也不再有人写它（探针有守卫）。
+
+               ⚠️ 几何常量钉在 chat.css 的 `stroke-dasharray` 上：r=6.5 ⇒ 2πr ≈ 40.84，
+               两处必须相等，探针有一条守卫专门防它们漂移。
+               ⚠️ 弧的 `stroke-dashoffset` 由 chat.js 用 setAttribute 写**表现属性** ——
+               所以 chat.css 的 `.ctx-ring-arc` 里**绝不许**出现 `stroke-dashoffset`（CSS 会盖掉属性，
+               弧就永远卡在满环上）。同样有守卫。
+               ⚠️ SVG 必须**静态写在这里**：探针的 DOM 影子没有 `document.createElementNS`，
+               动态建 SVG 在 F5 之前唯一的验证路子上根本走不通。
+               （`title` 不写死在这儿：它每帧由 chat.js 重写，写一份静态的只会是过期文案。） -->
+          <div id="ctx-ring-wrap" class="lc-model-wrap">
+            <button id="ctx-ring" class="tool-icon lc-knob ctx-ring" type="button"
+                    aria-label="上下文占用" aria-haspopup="dialog">
+              <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+                <circle class="ctx-ring-track" cx="8" cy="8" r="6.5"></circle>
+                <circle id="ctx-ring-arc" class="ctx-ring-arc" cx="8" cy="8" r="6.5"
+                        transform="rotate(-90 8 8)"></circle>
+              </svg>
+            </button>
+            <div id="ctx-ring-menu" class="lc-model-menu ctx-readout" role="dialog"
+                 aria-label="上下文读数"></div>
+          </div>
           <!-- C11 推理档位：与模型选择器同款浮层菜单（复用 .lc-model-* 类）。
                与模型不同的是它**按会话**记、且通常热生效（不重启子进程）。
                图标取四角星（AI 界面里"思考/推理"的通用符号，且是单色路径，能跟着主题走）。
@@ -242,6 +296,13 @@
                   title="引导式配置 DSH 运行路径（node / 入口 / 工作目录 / tsconfig / config，保存到用户设置）">配置 DSH</button>
           <button id="live-api-btn" class="link-button lc-api" type="button"
                   title="配置 DEEPSEEK_API_KEY（保存到 VS Code SecretStorage，回退读取 ~/.dsh/.credentials.yaml）">API</button>
+          <!-- C23 余额读数：只读，点一下刷新；**不挂状态点** —— 状态由文字自己说（¥28.70 / … / —），
+               再点一个红绿点就是同一件事喊两次（C22b 的判据）。静态那行字只在"新 webview + 老扩展"
+               时会真的露面，所以 title 写的是**永远为真**的一句话，不写"正在加载"这种会过期的文案。
+               ⚠️ 整串字（含「余额：」前缀）由扩展下发后**平铺写进 textContent**，不塞子元素 ——
+               影子 DOM 的 textContent 不含子节点，塞了会让探针的逐字断言与真机不是一回事。 -->
+          <button id="live-balance-btn" class="link-button lc-balance" type="button"
+                  title="查询 DeepSeek 账户余额（点一下刷新；连接时与新建对话时各查一次，之后每 5 分钟一次）">余额：—</button>
         </div>
         <span class="toolbar-actions">
           <span id="composer-hint" class="composer-hint" aria-hidden="true">Enter 发送 · ⇧ 换行</span>

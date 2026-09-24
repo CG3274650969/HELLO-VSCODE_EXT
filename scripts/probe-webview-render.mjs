@@ -236,6 +236,19 @@ function pressKey(key, target) {
   for (const fn of docListeners.get('keydown') || []) fn(ev);
 }
 
+/**
+ * 在 document 上派一次 click（target 默认是 body —— 「点在外面」的那种点法）。
+ *
+ * ⚠️ 影子**不做事件冒泡**：`El.click()` 只跑元素自己身上的监听器，永远到不了 document。
+ * 所以"点别处就把浮层收起来"这条判据在真 DOM 里是自动的、在这里必须显式派一次。
+ * 也正因如此，`contains()` 那个恒 false 的桩在这里**帮了忙**：任何 target 都算"在外面"，
+ * 于是"某一条 clause 漏了"会被这条判据直接抓出来（漏的那个菜单没人关）。
+ */
+function docClick(target) {
+  const ev = { type: 'click', target: target || document.body, preventDefault() {}, stopPropagation() {} };
+  for (const fn of docListeners.get('click') || []) fn(ev);
+}
+
 const posted = [];
 let messageHandler = null;
 const win = {
@@ -314,8 +327,48 @@ try {
 
 const $ = (id) => document.getElementById(id);
 const messagesEl = () => $('messages');
-const usageBar = () => $('usage-bar');
-const usageSummary = () => $('usage-summary');
+// C21：读数**行**（原 C3a 的 `#usage-bar` + C9 的 `#runs-bar` 合并成 `#status-row`）。
+// C22 起这行**只剩运行读数**，用量/上下文那半搬去了配置条里的 `#ctx-ring`（见下）。
+const statusRow = () => $('status-row');
+const statusRun = () => $('status-run');
+
+// C22 上下文占用环。`#ctx-ring` 是外壳（承载 title / aria-label / `.near` / `.stale`），
+// `#ctx-ring-arc` 是那条弧（承载 stroke-dashoffset 与 hidden）。
+// ⚠️ C22c 起**外壳没有 `hidden` 这一档**（新建对话里它也在，读作 0）—— 弧的 `hidden` 还在。
+// ⚠️ 影子没有 `document.createElementNS`，所以 SVG 是**静态写在 chat.html 里**的，chat.js 只
+// `getElementById` 再写属性 —— 也正因如此，`setAttribute` 必须真存真取（老影子吞掉它的话，
+// 弧长这条判据就只能靠肉眼，正是本仓库最恨的那种）。
+const ctxRing = () => $('ctx-ring');
+const ctxArc = () => $('ctx-ring-arc');
+// C22b：环变成按钮之后多了一个**只读浮层**（与三个菜单同一套壳）。它挂在 `#ctx-ring-wrap` 里，
+// 「点在外面」那条判据靠 wrap.contains 决定关不关 —— 影子写的 contains 恒 false（见 El 的桩），
+// 所以下面验互斥/关法时**不能走真事件冒泡**，得直接派一次 document 上的 click（docClick）。
+const ctxMenu = () => $('ctx-ring-menu');
+
+/** 从一个开始标签的原文里取出 class 列表（影子不种静态属性，这类判据只能读 chat.html 原文）。 */
+function classOf(tag) {
+  const m = /class="([^"]*)"/.exec(tag || '');
+  return m ? m[1].split(/\s+/).filter(Boolean) : [];
+}
+
+/**
+ * chat.js 的 `CTX_RING_LEN` 与 chat.css 的 `stroke-dasharray` 必须相等，**钉一份在这里**。
+ * 这是有意的三重复：它一旦与另两处不一致，下面「弧长正比」那组与 CSS 守卫会一起变红 ——
+ * 那就该有人去看是"实现改了"还是"探针过时了"，而不是静默地画出半圈。
+ */
+const CTX_RING_LEN = 40.84;
+
+/** 弧的 stroke-dashoffset（number）。**没写过**不是 0，是「chat.js 没画弧」—— 得红，不能静默当满环。 */
+function arcOffset() {
+  const raw = ctxArc().getAttribute('stroke-dashoffset');
+  ok(raw !== null && raw !== undefined, '环的 stroke-dashoffset 根本没写过 —— chat.js 没在画弧');
+  const n = Number(raw);
+  ok(Number.isFinite(n), 'stroke-dashoffset 不是个有限数（写坏成 ' + JSON.stringify(raw) + ' 了）');
+  return n;
+}
+/** 浮点比较：chat.js 已经收过一次两位小数，这里再给一点余量。
+ *  名字躲开 `near`（那个词在这个文件里到处是 CSS 的 `.near` 类，撞名会读到隔壁的阴影）。 */
+const closeTo = (a, b, eps = 0.02) => Math.abs(a - b) <= eps;
 
 /** 整棵子树的元素（前序） */
 function walk(el, out = []) {
@@ -393,76 +446,708 @@ check('#dsh-live-host 初值是 hidden（否则 isReactLive() 为真，addMessag
   ok($('dsh-live-host').hidden === true, '影子没按 chat.html 给出 hidden 初值 —— 折叠那组断言会变成假绿');
 });
 
-// ---------- D1 · 占用指示（扩 #usage-bar 的上下文段） ----------
+// ---------- D1 · 上下文占用环（C22 起是配置条里的 `#ctx-ring`） ----------
+//
+// C22 把这段读数从"读数行的左半"搬成了"配置条上的一枚环"：**文案一个字没改，整段搬进了环的
+// `title`**。所以下面这些断言全部原样保留，只是落点从 `statusSummary().textContent` 换成
+// `ctxRing().title`，`#status-row` 的 `hidden`/`.near` 换成 `#ctx-ring` 的 —— 语义一条没放松。
+// 唯一宽松的地方：`title` 是多行，所以"整段只有一处"那条改成比**第一行**逐字相等。
+// ⚠️ **C22c 翻掉了其中唯一那条"藏起来"**（用户要求新建对话里也看得见这枚钮）：现在没有读数
+//    时报的是**空态一行文案**，不再是 `hidden`。其余语义（near / stale / 已压缩 / aria）一字未动。
+// ⚠️ 影子不种静态属性、也不连父子关系，所以 `#ctx-ring` 的 `class` / `tabindex` / `role`
+//    一概读 chat.html 原文（见下面 C22 那组结构守卫），这里只断言运行时写出来的东西。
 
-check('D1 没有任何用量 → 整条隐藏', () => {
+check('D1 没有任何用量（新建对话）→ 环**照常在**、只是不画弧，并明说「本轮尚无用量」', () => {
+  // C22c 推翻了 C22 那条"没有数据就整个藏掉"（用户原话：「新建对话时也要有这个按钮，
+  // 只不过是"0"即可」）。藏起来的问题不是审美：一个控件在新建对话里凭空消失、发了第一句话
+  // 才冒出来，本身就是个疑点。所以**环读作 0，话说成"尚无"**：
   send({ type: 'usage', usage: null });
-  ok(usageBar().hidden, '没有读数时条应隐藏');
+  ok(!ctxRing().hidden, '没有读数时环被藏了 —— 新建对话里它该在（只是读作 0）');
+  ok(ctxArc().hidden, '一条读数都没有却画了弧 —— 空弧既会被读成 0%，而真相可能是"不知道"');
+  eq(ctxRing().title.split('\n')[0], '本轮尚无用量', '空态那行文案不对：' + ctxRing().title);
+  ok(ctxRing().title.includes('第一次请求跑完就有数了'), '空态没解释"为什么现在是 0"：' + ctxRing().title);
+  // ⚠️ 空态**不写数字**：`usageState` 为空既可能是"刚新建"（那真是 0），也可能是"这个会话
+  //    我们拼不出读数"（那是**未知**）。写成 `↑0 ↓0` 就把后一种说成了前一种 —— 那是句假话。
+  ok(!/[↑↓]/.test(ctxRing().title), '空态写了 ↑0 ↓0 —— 把"未知"写成了 0：' + ctxRing().title);
 });
 
-check('D1 有占用但离阈值远 → 显示占用、不挂 .near、不喊 ⚠', () => {
+check('D1 有占用但离阈值远 → 环显示、title 写占用、不挂 .near、不喊 ⚠', () => {
   send({ type: 'usage', usage: usage({ context: { usedTokens: 24000, contextWindow: 1000000 } }) });
-  ok(!usageBar().hidden, '有读数时条应显示');
+  ok(!ctxRing().hidden, '有读数时环应显示');
   // 24K 那段按 fmtTokens 的档位给：<1e5 保留一位小数，所以是 24.0K 而不是 24K
-  ok(hasText(usageSummary(), '上下文 24.0K / 1.0M'), '占用段文案不对：' + usageSummary().textContent);
-  ok(!usageSummary().textContent.includes('⚠'), '没接近阈值却喊了警');
-  ok(!usageBar().classList.contains('near'), '没接近阈值却挂了 .near');
+  ok(ctxRing().title.includes('上下文 24.0K / 1.0M'), '占用段文案不对：' + ctxRing().title);
+  ok(!ctxRing().title.includes('⚠'), '没接近阈值却喊了警');
+  ok(!ctxRing().classList.contains('near'), '没接近阈值却挂了 .near');
 });
 
 check('D1 state=ok 与缺省同义（都不算 near）', () => {
   send({ type: 'usage', usage: usage({ context: { usedTokens: 24000, contextWindow: 1000000, state: 'ok' } }) });
-  ok(!usageBar().classList.contains('near'), "state:'ok' 被当成了 near");
+  ok(!ctxRing().classList.contains('near'), "state:'ok' 被当成了 near");
 });
 
-check('D1 state=near → 文案带 ⚠ 且条挂 .near', () => {
+check('D1 state=near → 文案带 ⚠ 且环挂 .near', () => {
   send({ type: 'usage', usage: usage({ context: { usedTokens: 700000, contextWindow: 1000000, state: 'near' } }) });
-  ok(hasText(usageSummary(), '⚠ 接近压缩阈值'), '接近阈值时没喊警：' + usageSummary().textContent);
-  ok(usageBar().classList.contains('near'), '.near 没挂上（CSS 的警示色就靠它）');
+  ok(ctxRing().title.includes('⚠ 接近压缩阈值'), '接近阈值时没喊警：' + ctxRing().title);
+  ok(ctxRing().classList.contains('near'), '.near 没挂上（CSS 的警示色就靠它）');
 });
 
 check('D1 near 的 title 必须写明「我们的数不是 DSH 的判据」（口径诚实是硬要求）', () => {
-  const t = usageSummary().title;
+  const t = ctxRing().title;
   ok(t.includes('不是同一个数'), 'title 没写口径差异 —— 界面会让人以为到了这条线就一定会压缩');
   ok(!t.includes('还有'), 'title 里出现了「还有 X」式承诺：分子口径不支持这种说法');
 });
 
-check('D1 stale → 标「上次」，但不因此挂 .near', () => {
+check('D1 stale → 标「上次」+ 挂 .stale，但不因此挂 .near', () => {
   send({ type: 'usage', usage: usage({ context: { usedTokens: 24000, contextWindow: 1000000, stale: true } }) });
-  ok(hasText(usageSummary(), '· 上次'), '陈旧读数没标「上次」：' + usageSummary().textContent);
-  ok(!usageBar().classList.contains('near'), '陈旧不等于接近');
-  ok(usageSummary().title.includes('上一次跑完时留下的样本'), 'title 没解释「上次」是什么');
+  ok(ctxRing().title.includes('· 上次'), '陈旧读数没标「上次」：' + ctxRing().title);
+  ok(ctxRing().classList.contains('stale'), '.stale 没挂上 —— 环不会变淡，陈旧与实时就分不出来了');
+  ok(!ctxRing().classList.contains('near'), '陈旧不等于接近');
+  ok(ctxRing().title.includes('上一次跑完时留下的样本'), 'title 没解释「上次」是什么');
 });
 
-check('D1 stale + near 两个后缀**并列**（不是 else if）', () => {
+check('D1 stale + near 两个后缀**并列**（不是 else if），两个类也同时挂', () => {
   send({ type: 'usage', usage: usage({ context: { usedTokens: 700000, contextWindow: 1000000, state: 'near', stale: true } }) });
-  const s = usageSummary().textContent;
+  const s = ctxRing().title;
   ok(s.includes('· 上次') && s.includes('⚠ 接近压缩阈值'), '两个后缀应同时出现：' + s);
+  ok(
+    ctxRing().classList.contains('stale') && ctxRing().classList.contains('near'),
+    '两个状态类应同时挂 —— 「很旧的读数」与「快压了」是两件事，不该互相吃掉'
+  );
 });
 
 check('D1 near → 回到 ok 时 .near 要摘掉（add/remove 两条路都走一遍）', () => {
   send({ type: 'usage', usage: usage({ context: { usedTokens: 700000, contextWindow: 1000000, state: 'near' } }) });
-  ok(usageBar().classList.contains('near'), '前置条件不成立');
+  ok(ctxRing().classList.contains('near'), '前置条件不成立');
   send({ type: 'usage', usage: usage({ context: { usedTokens: 24000, contextWindow: 1000000, state: 'ok' } }) });
-  ok(!usageBar().classList.contains('near'), '从 near 回退后 .near 没摘掉');
+  ok(!ctxRing().classList.contains('near'), '从 near 回退后 .near 没摘掉');
 });
 
 check('D1 compacted>0 → 追加「已压缩 N 次」', () => {
   send({ type: 'usage', usage: usage({ compacted: 3, context: { usedTokens: 24000, contextWindow: 1000000 } }) });
-  ok(hasText(usageSummary(), '已压缩 3 次'), '压缩计数没上条：' + usageSummary().textContent);
+  ok(ctxRing().title.includes('已压缩 3 次'), '压缩计数没上条：' + ctxRing().title);
 });
 
-check('D1 只有 compacted、别的段全空 → 条仍要显示（不能被 parts 为空的分支藏掉）', () => {
+check('D1 只有 compacted、别的段全空 → 环仍要显示、但不画弧（不能被 parts 为空的分支藏掉）', () => {
   send({ type: 'usage', usage: { compacted: 1 } });
-  ok(!usageBar().hidden, '只有压缩计数时条被藏了 —— 那这条唯一的持久提醒就没了');
-  eq(usageSummary().textContent, '已压缩 1 次', '只有一段时的文案不对');
+  ok(!ctxRing().hidden, '只有压缩计数时环被藏了 —— 那这条唯一的持久提醒就没了');
+  eq(ctxRing().title.split('\n')[0], '已压缩 1 次', '只有一段时那一段的文案不对');
+  ok(ctxArc().hidden, '压根没有 context 段却画了弧 —— 空弧会被读成 0%，而真相是「不知道」');
 });
 
-check('D1 整条隐藏的那条路也要摘 .near（否则下次亮起来带着旧警示色）', () => {
-  send({ type: 'usage', usage: usage({ context: { usedTokens: 700000, contextWindow: 1000000, state: 'near' } }) });
-  ok(usageBar().classList.contains('near'), '前置条件不成立');
-  send({ type: 'usage', usage: { compacted: 0 } });
-  ok(usageBar().hidden, '一段都没有时条应隐藏');
-  ok(!usageBar().classList.contains('near'), '隐藏分支没摘 .near');
+check('D1 落到空态那条路也要摘 .near / .stale（否则新建对话里环带着上一份读数的旧警示色）', () => {
+  send({ type: 'usage', usage: usage({ context: { usedTokens: 700000, contextWindow: 1000000, state: 'near', stale: true } }) });
+  ok(ctxRing().classList.contains('near') && ctxRing().classList.contains('stale'), '前置条件不成立');
+  send({ type: 'usage', usage: { compacted: 0 } }); // 一段都拼不出来 ⇒ 空态
+  eq(ctxRing().title.split('\n')[0], '本轮尚无用量', '前提不成立：这一份该落到空态');
+  ok(!ctxRing().classList.contains('near'), '空态没摘 .near');
+  ok(!ctxRing().classList.contains('stale'), '空态没摘 .stale');
+  ok(ctxArc().hidden, '空态还留着上一份读数的弧 —— 那弧是上个会话的占用比例');
+});
+
+// ---------- C21 · 读数行：两半合成一条（原 C3a 用量条 + C9 运行条） ----------
+//
+// 合并是"搬一半"的高发区，两处最容易丢的**老决定**：
+//   ① 只有 runs、没有 usage 时**整行仍要显示**（C9 的原话：运行浮层的入口不能等第一轮跑完才出现）；
+//   ② 两半在同一帧里各写各的，谁都不能把谁挤掉。
+// 另加两条**结构守卫**：老 id 留一个就是死代码；而"读数不画卡"这条设计整个活在 CSS 里，
+// 影子 DOM 看不见样式，只能按原文钉。
+
+// 右半的最小读数（不动 C9_READOUT：那个在下面，此处引它会撞 TDZ）
+const C21_READOUT = {
+  runs: [{ id: 1, turn: 1, outcome: 'completed', startedAt: Date.now() - 11226, durationMs: 11226, stepCount: 1, toolCount: 10, toolErrors: 0, toolUnknown: 0, errorCount: 0, truncated: false }],
+};
+
+check('C21 只有 runs、完全没用过 usage → 行仍要显示（C9 的入口不等第一轮）', () => {
+  send({ type: 'usage', usage: null });
+  send({ type: 'runs', readout: { runs: [] } });
+  ok(!statusRow().hidden, '只有 runs 时整行被藏了 —— 运行浮层的入口就跟着没了');
+  ok(!ctxRing().hidden, '没有用量时环被藏了 —— C22c 起它一直在（新建对话就该看得见它）');
+  eq(statusRun().textContent, '本轮尚无', '空读数的文案不对（入口自己就叫「运行记录」，这里不该再说一遍）');
+});
+
+check('C21/C22 同一帧里环与行各就各位：环画占用，行上只有运行文案 + 入口', () => {
+  send({ type: 'usage', usage: usage({ context: { usedTokens: 24000, contextWindow: 1000000 } }) });
+  send({ type: 'runs', readout: C21_READOUT });
+  ok(!statusRow().hidden, '有运行读数时行反而不显示');
+  ok(!ctxRing().hidden, '有用量时环反而不显示');
+  ok(ctxRing().title.includes('上下文 24.0K / 1.0M'), '环被行挤掉了：' + ctxRing().title);
+  ok(hasText(statusRun(), '10 工具'), '行被环挤掉了：' + statusRun().textContent);
+  // 入口的归属按 chat.html 的原文钉：影子不给元素连父子关系（seedFromHtml 只读 hidden 属性），
+  // 所以 `statusRow().children` 在这里恒为空 —— 那不是判据，别写成断言。
+  const rowHtml = /<div id="status-row"[\s\S]*?<\/div>/.exec(readFileSync(join(repoRoot, 'media', 'chat.html'), 'utf8'));
+  ok(rowHtml, 'chat.html 里找不到 #status-row 那个块');
+  ok(rowHtml[0].includes('id="runs-view"'), '入口按钮不在 #status-row 块里 —— 搬块时漏了它');
+  ok(/id="runs-view"[^>]*class="[^"]*status-open/.test(rowHtml[0]), '入口按钮丢了 .status-open —— 它就不会半淡常显（脚下那条 C21 CSS 守卫也白写了）');
+  // C22 反过来的一条：占用那半搬去配置条了，**不许留一半在这儿**
+  ok(!rowHtml[0].includes('ctx-ring'), '环又跑回读数行里了 —— 它该在配置条上（模型钮与推理钮之间）');
+});
+
+check('C21/C22 快照那一路：环与行随快照整帧重放（快照那条叫 `runs`，与流式那条的 `readout` 不同）', () => {
+  send({
+    type: 'snapshot',
+    sessionId: 's-c21',
+    messages: [],
+    usage: usage({ context: { usedTokens: 24000, contextWindow: 1000000 } }),
+    runs: C21_READOUT,
+  });
+  ok(!statusRow().hidden, '快照带了两个字段，行却不显示');
+  ok(!ctxRing().hidden, '快照带了 usage，环却不显示');
+  ok(ctxRing().title.includes('上下文 24.0K / 1.0M'), '快照的 usage 没画到环上');
+  ok(
+    hasText(statusRun(), '10 工具'),
+    '快照的 runs 没画上 —— 两个字段名八成被合并成同一个了：' + statusRun().textContent
+  );
+});
+
+check('C21/C22 结构守卫：搬走了的老 id 一个都不许留（搬一半最典型的样子）', () => {
+  const html = readFileSync(join(repoRoot, 'media', 'chat.html'), 'utf8');
+  // C21 那两个 + **C22 搬走的那个**：`status-summary` 是这一轮的新增项 ——
+  // 占用那半搬去了 `#ctx-ring`，读数行里那个 span 就该连 id 带规则一起删干净。
+  for (const dead of ['usage-bar', 'runs-bar', 'usage-summary', 'runs-summary', 'status-summary', 'statusSummary']) {
+    ok(!html.includes(dead), `chat.html 里还留着 \`${dead}\``);
+    ok(!chatJs.includes(dead), `chat.js 里还留着 \`${dead}\``);
+  }
+});
+
+check('C21 结构守卫：读数行无边框无底色、不再有任何变色状态，入口半淡常显且键盘可达', () => {
+  const css = readFileSync(join(repoRoot, 'media', 'chat.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  // ① 行本身没有 border / background —— 这就是"读数不画卡"本身
+  const row = /\.status-row\s*\{([^}]*)\}/.exec(css);
+  ok(row, 'chat.css 里找不到 .status-row 的规则块');
+  for (const dead of [/(^|[;\s])border\s*:/, /(^|[;\s])background(-color)?\s*:/]) {
+    ok(!dead.test(row[1]), `.status-row 里又出现了边框/底色（${dead}）—— 四张同款卡就是这么长回来的`);
+  }
+  // ② C22：这一行**不再变色**了 —— 警示色搬去了环上，同一个警示不许在两处同时喊。
+  //    （留着一个 `.status-row.near` 规则 = 那个类还可能被别处挂上来，等于埋了个哑炮。）
+  ok(
+    !/\.status-row\.near\b/.test(css),
+    'chat.css 里还有 .status-row.near —— 警示色该只在环上（.ctx-ring.near），别两处一起喊'
+  );
+  // ③ 入口**半淡常显**（C21b）：默认不透明度必须落在开区间 (0, 1) 里。
+  //    0 = C21 第一版那个"要悬停才存在"的入口（真机撞过：用户找不着），
+  //    1 = 它和运行读数一样重 —— 那 hover 那条规则也就白留了。改用 display/visibility 也不行：
+  //    display:none 会把它摘出流（左边的字会重排），visibility:hidden 则连键盘一起挡掉。
+  const open = /\.status-open\s*\{([^}]*)\}/.exec(css);
+  ok(open, 'chat.css 里找不到 .status-open 的规则块');
+  const openOpacity = /opacity:\s*([\d.]+)/.exec(open[1]);
+  ok(openOpacity, '.status-open 没有 opacity —— 入口默认得是"半淡"，不是随行文字');
+  const openOpacityNum = openOpacity ? Number(openOpacity[1]) : NaN;
+  ok(
+    openOpacityNum > 0 && openOpacityNum < 1,
+    `.status-open 的默认不透明度是 ${openOpacityNum} —— 必须「看得见但更轻」（0 < x < 1）：` +
+      '0 = 入口找不着（C21b 之前就是），1 = 与读数一样重'
+  );
+  ok(!/display\s*:\s*none/.test(open[1]), '.status-open 改成 display:none 了 —— 按钮会退出流，左边的字会重排');
+  ok(!/visibility\s*:\s*hidden/.test(open[1]), '.status-open 改成 visibility:hidden 了 —— 键盘再也够不到这个入口');
+  ok(/\.status-row:focus-within\s+\.status-open/.test(css), '没有 :focus-within 显形规则 —— Tab 到入口它也不会出现（键盘不可达）');
+  // 半淡是"默认"而不是"永远"：悬停 / 聚焦必须把它推到满
+  const reveal = /\.status-row:hover\s+\.status-open[^{]*\{([^}]*)\}/.exec(css);
+  ok(reveal, '没有 `.status-row:hover .status-open` 显形规则 —— 半淡就成了恒态，指针停在行上也不见它变亮');
+  ok(reveal && /opacity:\s*1\s*;/.test(reveal[1]), '悬停 / 聚焦那条规则没把不透明度推到 1 —— 入口没有"点亮"这一步');
+});
+
+// ---------- C22 · 上下文占用环（配置条上、模型钮与推理钮之间） ----------
+//
+// 这一组管的是**环自己的东西**：弧长怎么算、两端怎么办、没有数据时画什么；
+// 外加四条**结构守卫**（影子看不见样式与静态属性，只能按 chat.html / chat.css 原文钉）。
+// 文案与状态类那一半在上面 D1（照原样保留，只换了落点）。
+
+check('C22 弧长正比于占用比（8% 那种小数也要看出来，这是它取代数字的全部理由）', () => {
+  // offset 是「把那段 dash 往回推多少」，所以**占用 25% ⇒ 推掉 75%**（露出 25%）。
+  // 别把这两个数写反 —— 写反了画出来仍然是个像模像样的环，只是比例倒过来
+  //（"还剩多少"而不是"用了多少"），肉眼几乎看不出来，所以这里按公式钉死。
+  send({ type: 'usage', usage: usage({ context: { usedTokens: 250000, contextWindow: 1000000 } }) });
+  ok(closeTo(arcOffset(), CTX_RING_LEN * 0.75), '25% 占用的 offset 不对（该推掉 75%）：' + arcOffset());
+  send({ type: 'usage', usage: usage({ context: { usedTokens: 500000, contextWindow: 1000000 } }) });
+  ok(closeTo(arcOffset(), CTX_RING_LEN * 0.5), '50% 占用的 offset 不对：' + arcOffset());
+  // 单调性：占用涨 ⇒ offset 必须**变小**（弧变长）。反了就是那个最经典的实现错误
+  // ——`LEN * ratio` 写成了正比，画出来刚好是"还剩多少"，看着也挺像回事。
+  const big = arcOffset();
+  send({ type: 'usage', usage: usage({ context: { usedTokens: 900000, contextWindow: 1000000 } }) });
+  ok(arcOffset() < big, '占用涨了弧反而短了 —— offset 的符号写反了（那是"剩余比例"不是"占用比例"）');
+  ok(!ctxArc().hidden, '有占用却把弧收起来了');
+});
+
+check('C22 两个端点：0% 不画弧（不能留个圆头冒充 5%），100% 是满环', () => {
+  send({ type: 'usage', usage: usage({ context: { usedTokens: 0, contextWindow: 1000000 } }) });
+  ok(!ctxRing().hidden, '0% 也是有效读数，环不该整个消失');
+  ok(closeTo(arcOffset(), CTX_RING_LEN), '0% 时 offset 该顶满整圈（一点不露）：' + arcOffset());
+  ok(
+    ctxArc().hidden,
+    '0% 时弧没收起来 —— `stroke-linecap: round` 会在零长弧上留一个 ~5% 长的圆头，' +
+      '那就是把一个"没用"读成"用了 5%"；一个 5% 的谎比不画更糟'
+  );
+  send({ type: 'usage', usage: usage({ context: { usedTokens: 1000000, contextWindow: 1000000 } }) });
+  ok(closeTo(arcOffset(), 0), '用满窗口时该是满环（offset 0）：' + arcOffset());
+  ok(!ctxArc().hidden, '满环也是有效读数，弧不该被收起来');
+  // 超出窗口（分母是 DSH 的估算、分子是 provider 实测的，这个组合真的会发生）：
+  // 不夹的话 offset 变负数，弧会反着绕出去画第二圈
+  send({ type: 'usage', usage: usage({ context: { usedTokens: 1500000, contextWindow: 1000000 } }) });
+  ok(closeTo(arcOffset(), 0), '用量超过窗口时 offset 必须夹在 0（不然弧反着绕一圈）：' + arcOffset());
+  ok(!ctxArc().hidden, '超出窗口时弧该保持满环');
+});
+
+check('C22 没有 context 段 → 环还在、不画弧，悬浮信息里如实写「暂无数据」', () => {
+  send({ type: 'usage', usage: usage({ compacted: 2 }) });
+  ok(!ctxRing().hidden, '环被藏了 —— 「已压缩 N 次」那条唯一的持久提醒会跟着一起没');
+  ok(ctxArc().hidden, '没有上下文数据却画了弧 —— 空弧会被读成 0%，而真相是「不知道」');
+  ok(
+    ctxRing().title.includes('已压缩 2 次'),
+    '环上该留着压缩计数（compaction 说明会随转写滚走，条上这段才常在）：' + ctxRing().title
+  );
+  const aria = ctxRing().getAttribute('aria-label');
+  ok(
+    typeof aria === 'string' && aria.includes('暂无数据'),
+    '没有数据时 aria-label 该如实说「暂无数据」（留空或写 0% 都是在撒谎）：' + JSON.stringify(aria)
+  );
+});
+
+check('C22 aria-label 是给读屏的**短话**：说清占用、状态，但不抄那一整段多行口径', () => {
+  send({ type: 'usage', usage: usage({ context: { usedTokens: 24000, contextWindow: 1000000, state: 'near', stale: true } }) });
+  const aria = ctxRing().getAttribute('aria-label');
+  ok(aria.includes('上下文占用'), 'aria-label 没说这是上下文占用：' + aria);
+  ok(aria.includes('2%'), 'aria-label 没带上比例：' + aria);
+  ok(aria.includes('接近压缩阈值'), 'near 时 aria-label 该说出来（读屏用户看不到颜色）：' + aria);
+  ok(aria.includes('上次'), 'stale 时 aria-label 该说出来：' + aria);
+  ok(!aria.includes('\n'), 'aria-label 里带了换行 —— 读屏会读成一段多行说明，那就成了噪音');
+  ok(!aria.includes('不是同一个数'), 'aria-label 抄了整段口径说明 —— 那是 title 的活，读屏一次念完等于刷屏');
+});
+
+// ---------- C22b · 环成了配置条第三个方块钮，点开一个**只读**浮层 ----------
+//
+// 用户原话：「希望它能变成一个按钮，并且使用「推理档位」和「profile」相同的容器，这样可以统一
+// 样式」。于是它挂上 `.tool-icon .lc-knob`、外面套 `.lc-model-wrap`，并多了一个只读浮层。
+// 这一组验的全是**行为**（影子能派 click / 读 class / 读 children）；"类名与那两个钮逐字同款"
+// 与"自己的规则块里没写回外观"那些看不见的东西，在下面那组结构守卫里按 chat.html/css 原文钉。
+
+/** 浮层里一行的文本 = 它两个 span 拼起来（label + body），空 label 就只有 body。 */
+const ctxRowText = (row) => row.children.map((c) => c.textContent).join(' ');
+
+check('C22b 点环 ⇒ 浮层开（钮与浮层同时挂 .open，与三个菜单同款）；再点 ⇒ 关', () => {
+  send({ type: 'usage', usage: usage({ context: { usedTokens: 24000, contextWindow: 1000000 } }) });
+  eq(ctxMenu().classList.contains('open'), false, '前提不成立：读数浮层一开始就开着');
+  ctxRing().click();
+  eq(ctxMenu().classList.contains('open'), true, '点了环浮层没开 —— 那就还是个纯读数（C22b 要的正是点得开）');
+  eq(ctxRing().classList.contains('open'), true, '浮层开了但触发钮没挂 .open —— 三个菜单都是两个一起挂的');
+  ctxRing().click();
+  eq(ctxMenu().classList.contains('open'), false, '再点一下没关上（开关只说了一半）');
+  eq(ctxRing().classList.contains('open'), false, '关上了但钮的 .open 没摘');
+});
+
+check('C22b 浮层逐行与 title **同源**：把浮层的行拼回去必须逐字等于 title 第一行', () => {
+  // 造一份**每一段都在**的读数（含 stale + near + 压缩计数 ⇒ 4 行 + 说明里最长的那条两段）
+  send({
+    type: 'usage',
+    usage: usage({
+      turn: { inputTokens: 11000, cacheReadTokens: 800, outputTokens: 948 },
+      session: { inputTokens: 50000, cacheReadTokens: 8200, outputTokens: 4100 },
+      compacted: 2,
+      context: { usedTokens: 280000, contextWindow: 1000000, state: 'near', stale: true },
+    }),
+  });
+  const lines = ctxRing().title.split('\n');
+  const rowEls = childWithClass(ctxMenu(), 'ctx-row');
+  const noteEls = childWithClass(ctxMenu(), 'ctx-note');
+  ok(rowEls.length >= 4, `读数行只有 ${rowEls.length} 行 —— 本轮/累计/上下文/已压缩 四段该都在`);
+  // ⚠️ 判据是"拼回去相等"，**不是**按 ` · ` 切开数行数：一段 body 里本来就可能带 ` · `
+  //    （「本轮 ↑… ↓… · 缓存 97%」就是一个 body 里的分隔），按分隔符数必然假红。
+  eq(rowEls.map(ctxRowText).join(' · '), lines[0], '浮层的行拼不回 title 第一行 —— 两处各拼了一套（那就必然会漂移）');
+  eq(
+    noteEls.map((e) => e.textContent).join('\n'),
+    lines.slice(1).join('\n'),
+    '浮层的说明行与 title 第一行之后的那些行对不上'
+  );
+  // 「接近阈值」那条说明里带一个换行 ⇒ 必须拆成两行铺开，不许缩成一行（`.ctx-note` 是 white-space:normal）
+  ok(
+    noteEls.some((e) => e.textContent.includes('不是同一个数')),
+    '口径那条说明没进浮层 —— 只读浮层正是为了让键盘/读屏用户读到它（C22 记的已知局限）'
+  );
+  ctxRing().click(); // 开一下再关：确认开着的时候（也在每帧重建的那条路上）内容是对的
+  ctxRing().click();
+  eq(ctxMenu().children.length, rowEls.length + noteEls.length, '浮层里的元素数与行+说明对不上（有东西每帧在往里面加）');
+});
+
+check('C22c 空态那一行也走同一条同源判据（新建对话里点得开，里面写着为什么是 0）', () => {
+  // 空态是 C22c 新加的一行**读数**（不是特例分支）：所以它照旧由 `rows` 派生 —— 浮层里那一行、
+  // `title` 第一行、读屏那句仍然只有一个来源。要是哪天有人图省事在浮层里写死一句"尚无用量"，
+  // 这一条会红。
+  send({ type: 'usage', usage: null });
+  const rowEls = childWithClass(ctxMenu(), 'ctx-row');
+  eq(rowEls.length, 1, `空态该只有一行读数，实际 ${rowEls.length} 行`);
+  eq(rowEls.map(ctxRowText).join(' · '), ctxRing().title.split('\n')[0], '空态那行在浮层里与 title 第一行对不上');
+  ctxRing().click();
+  eq(ctxMenu().classList.contains('open'), true, '空态下浮层点不开 —— 新建对话里点它什么都不发生，那这枚钮就是个摆设');
+  ok(childWithClass(ctxMenu(), 'ctx-note').length >= 1, '空态浮层里没有那句"数从第一次请求开始记"');
+  ctxRing().click();
+});
+
+check('C22b 浮层开着时跟着流式帧刷新（不是打开那一刻的快照）', () => {
+  send({ type: 'usage', usage: usage({ context: { usedTokens: 24000, contextWindow: 1000000 } }) });
+  ctxRing().click();
+  ok(hasText(ctxMenu(), '24.0K'), '前提不成立：浮层里没有 24.0K');
+  send({ type: 'usage', usage: usage({ context: { usedTokens: 48000, contextWindow: 1000000 } }) });
+  ok(hasText(ctxMenu(), '48.0K'), '开着的浮层没跟着刷新 —— 数字会冻在打开那一刻（流式跑一轮就看出来了）');
+  ok(!hasText(ctxMenu(), '24.0K'), '旧数字还在浮层里 —— 每帧是**整份重建**，不是往上追加');
+  ctxRing().click();
+});
+
+check('C22b 同一排浮层只开一个：开环的浮层时，另外三个菜单全收起来', () => {
+  $('live-effort-btn').click();
+  eq($('live-effort-menu').classList.contains('open'), true, '前提不成立：推理档位菜单没打开');
+  ctxRing().click();
+  eq(ctxMenu().classList.contains('open'), true, '环的浮层没开');
+  eq(
+    $('live-effort-menu').classList.contains('open'),
+    false,
+    '开环的浮层时没收掉档位菜单 —— 两个浮层会叠在同一个位置上'
+  );
+  ctxRing().click(); // 收起来，别把开着的浮层留给后面
+});
+
+check('C22b 点别处 ⇒ 浮层关（document 那条"点在外面"的判据里，环这一句也在）', () => {
+  ctxRing().click();
+  eq(ctxMenu().classList.contains('open'), true, '前提不成立：浮层没开');
+  docClick(document.body);
+  eq(
+    ctxMenu().classList.contains('open'),
+    false,
+    '点在外面的空白处，读数浮层没关 —— 那条判据里漏了环（另外三个菜单都有，就它没有）'
+  );
+  eq(ctxRing().classList.contains('open'), false, '浮层关了但钮的 .open 没摘');
+});
+
+check('C22b Esc 关浮层，且只关它（层次链里排在审阅/运行/对照三个面板之前）', () => {
+  ctxRing().click();
+  eq(ctxMenu().classList.contains('open'), true, '前提不成立：浮层没开');
+  pressKey('Escape');
+  eq(ctxMenu().classList.contains('open'), false, 'Esc 没关掉读数浮层');
+  // 顺序：它开着时按 Esc 只该收它这一层，不许顺手把身后的运行面板也收了。
+  // 影子不做冒泡，所以这里用真实入口把运行面板打开（那条入口同时置内部标志与 .open）。
+  $('runs-view').click();
+  eq($('runs-panel').classList.contains('open'), true, '前提不成立：运行面板没打开');
+  ctxRing().click();
+  eq(ctxMenu().classList.contains('open'), true, '前提不成立：浮层没开');
+  pressKey('Escape');
+  eq(ctxMenu().classList.contains('open'), false, 'Esc 没收掉读数浮层');
+  eq($('runs-panel').classList.contains('open'), true, '一次 Esc 把身后的运行面板也收了 —— 层次链的顺序不对');
+  $('runs-panel-close').click(); // 收干净，别留给后面
+});
+
+check('C22c 整条配置条藏起来时（切走 harness）⇒ 读数浮层必须收掉', () => {
+  // C22b 那条老守卫走的是"环自己被藏"那两条早退路径；C22c 之后环**不再被藏**（见 chat.js 函数头），
+  // 那两条路整条没了 —— 但"幽灵浮层"这件事还在，入口收敛成了这一个：绝对定位的浮层不能锚在
+  // 一个看不见的控件上（整条 `#live-config-bar` 藏起来时它就在那个位置上）。
+  send({ type: 'mode-set', mode: 'harness' });
+  send({ type: 'usage', usage: usage({ context: { usedTokens: 24000, contextWindow: 1000000 } }) });
+  ok(!$('live-config-bar').hidden, '前提不成立：harness 下配置条没显示');
+  ctxRing().click();
+  eq(ctxMenu().classList.contains('open'), true, '前提不成立：浮层没开');
+  send({ type: 'mode-set', mode: 'chat' });
+  eq($('live-config-bar').hidden, true, '前提不成立：切到 chat 模式配置条没藏起来');
+  eq(
+    ctxMenu().classList.contains('open'),
+    false,
+    '整条配置条都藏了、浮层还开着 —— 它锚在一个看不见的控件旁边（点不到、也关不掉）'
+  );
+  eq(ctxRing().classList.contains('open'), false, '浮层关了但钮的 .open 没摘');
+  send({ type: 'mode-set', mode: 'harness' }); // 复原，别把 chat 模式留给后面的检查
+});
+
+check('C22b 运行中（busy）环照旧可点 —— 旁边三个钮灰掉时它不灰（刻意的差异）', () => {
+  send({ type: 'usage', usage: usage({ context: { usedTokens: 24000, contextWindow: 1000000 } }) });
+  ctxRing().click();
+  eq(ctxMenu().classList.contains('open'), true, '前提不成立：浮层没开');
+  send({ type: 'run-busy', busy: true });
+  eq($('live-effort-btn').disabled, true, '前提不成立：忙碌时档位钮没灰');
+  eq(ctxRing().disabled, false, '忙时把读数环也禁用了 —— 看读数什么时候都该能看，运行中正是最想看它的时候');
+  eq(
+    ctxMenu().classList.contains('open'),
+    true,
+    '开跑那一刻读数浮层被收了 —— 那条"收起所有菜单"只该收三个"改配置"的，读数浮层正相反（开着看数字）'
+  );
+  ctxRing().click(); // 忙时也关得掉
+  eq(ctxMenu().classList.contains('open'), false, '忙时点它关不掉浮层（开关在忙时被短路了）');
+  ctxRing().click(); // 忙时照样点得开
+  eq(ctxMenu().classList.contains('open'), true, '忙时点不开读数浮层 —— 那就等于把它也禁用了');
+  ctxRing().click();
+  send({ type: 'run-busy', busy: false });
+  eq($('live-effort-btn').disabled, false, '前提不成立：跑完了档位钮还灰着');
+});
+
+check('C22b 结构守卫：环是配置条**第三个方块钮**（与推理/profile 钮逐字同款），且仍夹在两个钮之间', () => {
+  const html = readFileSync(join(repoRoot, 'media', 'chat.html'), 'utf8');
+  // C22b 起它是 `<button>`（C22 那版是 `<span role="img" tabindex="0">`）—— 上面那组行为断言
+  // 点的就是它，所以这里连标签名一起钉住。
+  const ring = /<button id="ctx-ring"[^>]*>/.exec(html);
+  ok(ring, 'chat.html 里找不到 #ctx-ring 的 <button> 开始标签（C22b 起它是按钮，不再是 span）');
+  const tag = ring ? ring[0] : '';
+  // ① 位置：用户点名的就是"在模型版本选择和推理挡位之间"（Claude Code 那一枚的位置）。
+  //    影子不连父子关系，DOM 上的"之间"在这个探针里只能按**源码下标**验。
+  const iRing = html.indexOf('id="ctx-ring"');
+  const iModel = html.indexOf('id="live-model-btn"');
+  const iEffort = html.indexOf('id="live-effort-btn"');
+  ok(iModel >= 0 && iEffort >= 0, 'chat.html 里找不到模型钮或推理钮 —— 位置判据没了基准');
+  ok(iModel < iRing && iRing < iEffort, '环不在模型钮与推理钮之间（用户点名的就是那个位置）');
+  // ② **同一份外观来源**（C22b 的全部理由）：挂 `.tool-icon`（26×26 / 圆角 / hover / 光标 /
+  //    灰字全从它来）+ `.lc-knob`（与推理/profile 钮逐字同款）。这里逐字比类名集合，
+  //    不许靠"看着差不多"——多一个少一个都说明它又在自己长一套样式。
+  const ringCls = classOf(tag);
+  ok(ringCls.includes('tool-icon'), '环没挂 .tool-icon —— 那它就又是一套自绘外观（C22b 要的正是统一）');
+  ok(ringCls.includes('lc-knob'), '环没挂 .lc-knob —— 与推理/profile 钮的类名就不再逐字同款了');
+  ok(!ringCls.includes('link-button'), '环挂了 .link-button —— 那是**文字**钮（带 padding 与 hover 底色），它是方块图标钮');
+  const knob = /<button id="live-effort-btn"[^>]*>/.exec(html);
+  ok(knob, 'chat.html 里找不到推理钮的开始标签 —— 类名对拍的基准没了');
+  const knobCls = classOf(knob ? knob[0] : '');
+  const extra = ringCls.filter((c) => !knobCls.includes(c));
+  ok(
+    extra.length === 1 && extra[0] === 'ctx-ring',
+    `环与推理钮的类名只该差一个 .ctx-ring，实际差 ${JSON.stringify(extra)} —— 同一条工具栏里又长出第二套外观`
+  );
+  // ③ 键盘/读屏可达：`<button>` 天然可聚焦，所以不再需要 tabindex（C22 那条 tabindex="0" 随 span
+  //    一起去掉了；留着反而会出现"作者自己声明可聚焦"与原生焦点顺序两套说法）。
+  ok(!/tabindex=/.test(tag), '环上又写了 tabindex —— <button> 本来就进 Tab 顺序，重复声明只会打架');
+  ok(/aria-label="[^"]+"/.test(tag), '环没有 aria-label —— <button> 的可访问名只能从它来（钮里只有两个 SVG 圆）');
+  ok(/aria-haspopup=/.test(tag), '环没写 aria-haspopup —— 读屏不会知道按下去会弹东西出来');
+  // C22c 翻面：一帧数据都没有时**也要在**（新建对话里就该看得见它，只是读作 0）。
+  // 上面 D1 那组按运行时验的是同一件事，这里连 `hidden` 属性本身都不许写回 —— 写回一个静态
+  // `hidden` 就会在 F5 里变成"新建对话看不见这枚钮"，而那正是用户这轮要改掉的毛病。
+  ok(!/\shidden[\s/>]/.test(tag), '环上又写了 hidden —— C22c 起它一直在（没有数据就是读作 0，不是消失）');
+  // ④ 浮层：外层必须是 `.lc-model-wrap`（绝对定位浮层的基准），浮层壳必须是 `.lc-model-menu`
+  //    —— 这两条就是"统一样式"里"用同一个容器"的字面落实。
+  ok(
+    /<div id="ctx-ring-wrap" class="lc-model-wrap">/.test(html),
+    '环外面没有 `.lc-model-wrap` —— 浮层会失去定位基准（模型/档位/profile 三个都是这么套的）'
+  );
+  const menu = /<div id="ctx-ring-menu" class="([^"]*)"/.exec(html);
+  ok(menu, 'chat.html 里找不到 #ctx-ring-menu 那个浮层');
+  ok(menu && menu[1].includes('lc-model-menu'), '读数浮层没用 `.lc-model-menu` 那套壳 —— 它会与另外三个浮层长得不一样');
+  ok(menu && /role="dialog"/.test(html.slice(menu.index, menu.index + 200)), '读数浮层没写 role="dialog" —— 它是只读的，不该被读成 menu');
+  // ⑤ 弧必须是 <circle> 且绕了 -90°：不转的话从 3 点钟起步，读数方向就错了
+  const arc = /<circle id="ctx-ring-arc"[\s\S]*?<\/circle>/.exec(html);
+  ok(arc, 'chat.html 里找不到 #ctx-ring-arc 那个 <circle>');
+  ok(arc[0].includes('rotate(-90'), '弧没绕 -90° —— 它会从 3 点钟起步，而不是从 12 点顺时针长');
+});
+
+check('C22b 结构守卫：环自己的规则块里**不许写回外观**（那等于又长出第二套样式），警示色只用真令牌', () => {
+  const css = readFileSync(join(repoRoot, 'media', 'chat.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  const ring = /\.ctx-ring\s*\{([^}]*)\}/.exec(css);
+  ok(ring, 'chat.css 里找不到 .ctx-ring 的规则块');
+  // C22b：外观（26×26 / 圆角 / hover / 光标 / 灰字）**全从 `.tool-icon` 来**。这里写回任何一条，
+  // 就等于悄悄分叉出第二套外观 —— 平时看不出来，等哪天 .tool-icon 统一调尺寸时就它不跟。
+  // （C22 那版正是自绘全套，还专门断言过"不许挂 .tool-icon"，C22b 整个翻了过来。）
+  for (const dead of [
+    /(^|[;\s])width\s*:/,
+    /(^|[;\s])height\s*:/,
+    /(^|[;\s])color\s*:/,
+    /(^|[;\s])border\s*:/,
+    /(^|[;\s])background(-color)?\s*:/,
+    /(^|[;\s])cursor\s*:/,
+  ]) {
+    ok(!dead.test(ring[1]), `.ctx-ring 上出现了 ${dead} —— 外观该全从 .tool-icon 来（写回一处就是第二套样式）`);
+  }
+  // 换色只改 `color`：弧是 `stroke: currentColor` 一路吃到环上，所以规则块里只该有状态色那条。
+  const nearRule = /\.ctx-ring\.near[^{]*\{([^}]*)\}/.exec(css);
+  ok(nearRule, 'chat.css 里找不到 .ctx-ring.near —— 「上下文要压了」就再也喊不出来');
+  // ⚠️ 这条先判、且判的是**否定式**，因为它报的错最精确：`-warning-` 那个名字在 dsh-live.css 里
+  // **根本没定义**，写错不报错，只会静默退到 --vscode-editorWarning-foreground 兜底色
+  //（看着"差不多对"，所以一直没人发现）。C21 在读数行上写的就是它 —— 这轮搬到环上才逮到。
+  // 放在正面断言之前：否则一写错就先挨「没走 warn 那套 token」，那句话说不出真正的原因。
+  ok(
+    !/(^|[;\s(])--dsw-alias-state-warning-/.test(nearRule[1]),
+    '.ctx-ring.near 写的是 `-warning-` 那套 token —— dsh-live.css 里只有 `warn`，' +
+      '写错不报错、只会静默退到兜底色（C21 在读数行上正是这么错的，C22 才逮到）'
+  );
+  ok(
+    /--dsw-alias-state-warn-primary/.test(nearRule[1]),
+    '.ctx-ring.near 没走 warn 那套 token —— 和旁边两个 .tool-icon 就只剩粗细不一样了'
+  );
+  // ⚠️⚠️ **`:hover` 那一条不能省**：`.ctx-ring.near`（0,2,0）斗不过 `.tool-icon:hover:not(:disabled)`
+  //（0,3,0），少了它，指针一压上去警告色就被换成普通亮字 —— 而那正是最该看见警示的时候。
+  // 这条只能按**选择器原文**验：影子不解析样式，算不出权重，更不会替你发现"被 hover 盖掉了"。
+  const nearSel = /(\.ctx-ring\.near[^{]*)\{/.exec(css);
+  ok(
+    nearSel && /\.ctx-ring\.near:hover/.test(nearSel[1]),
+    '.ctx-ring.near 那条没带 `:hover` 版本 —— 与 `.tool-icon:hover` 权重打平、靠源码顺序决胜，' +
+      '少了它，指针一压上去警告色就没了（探针看不到样式，只能在这里钉住选择器）'
+  );
+  // 唯一性：同一个警示不许在环和读数行两处一起喊（`.status-row.near` 那条规则该已经删了）
+  ok(!/\.status-row\.near\b/.test(css), 'chat.css 里还有 .status-row.near —— 警示色该只在环上');
+  // stale 必须真的变淡，且用的是 opacity（不是 display/visibility —— 那会连焦点一起摘掉）
+  const stale = /\.ctx-ring\.stale\s*\{([^}]*)\}/.exec(css);
+  ok(stale, 'chat.css 里找不到 .ctx-ring.stale —— 陈旧读数就看不出来了');
+  ok(/opacity\s*:/.test(stale[1]), '.ctx-ring.stale 没给透明度 —— 「这个数有点旧」就说不出来');
+});
+
+check('C22 结构守卫：弧的两条 CSS 契约 —— dasharray 等于 JS 那个常量，且这块**绝不写** dashoffset', () => {
+  const css = readFileSync(join(repoRoot, 'media', 'chat.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  const arc = /\.ctx-ring-arc\s*\{([^}]*)\}/.exec(css);
+  ok(arc, 'chat.css 里找不到 .ctx-ring-arc 的规则块');
+  // ① 两处常量必须相等（第三份钉在这个文件顶上）。两者漂移 ⇒ 弧的长度整体错位，
+  //    而且**画出来仍然是个圆环**、只是比例不对 —— 肉眼最难发现的那种错。
+  const dash = /stroke-dasharray\s*:\s*([\d.]+)/.exec(arc[1]);
+  ok(dash, '.ctx-ring-arc 里没写 stroke-dasharray —— 没有它 dashoffset 什么也推不动');
+  ok(
+    closeTo(Number(dash[1]), CTX_RING_LEN, 0.005),
+    `stroke-dasharray(${dash[1]}) 与 chat.js 的 CTX_RING_LEN(${CTX_RING_LEN}) 对不上了`
+  );
+  // ② ⚠️⚠️ 这块里**绝不许出现 dashoffset 这个属性**：chat.js 是用 setAttribute 写的**表现属性**，
+  //    表现属性在 CSS 里优先级最低 —— 这里写一个值就会把 JS 写的整个盖掉，弧从此永远卡在
+  //    同一个长度上，**而且不报错**。
+  //    注意判据要的是"声明"（`stroke-dashoffset:`），不是"出现过这个词"：
+  //    `transition: stroke-dashoffset 0.2s ease` 是合法的，它只是补一段动画、并不设置值。
+  ok(
+    !/(^|[;{\s])stroke-dashoffset\s*:/.test(arc[1]),
+    '.ctx-ring-arc 里给 stroke-dashoffset 写了值 —— CSS 会盖掉 chat.js 写的那条表现属性，' +
+      '弧会永远停在同一个长度上（而且是静默的）'
+  );
+});
+
+check('C22b 结构守卫：读数浮层看着是同一套菜单，但**不假装能点**', () => {
+  const css = readFileSync(join(repoRoot, 'media', 'chat.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  // 行复用 `.lc-model-item` 的排版（"统一样式"要的就是这个），但那是**菜单项**的样式：
+  // 带手形光标、hover 亮底。读数行不可点，这两样留着就是骗人 —— 悬停亮起来、点下去没反应。
+  const item = /\.ctx-readout\s+\.lc-model-item\s*\{([^}]*)\}/.exec(css);
+  ok(item, 'chat.css 里找不到 `.ctx-readout .lc-model-item` —— 读数行会带着"我能点"的手形光标');
+  ok(
+    item && /cursor\s*:\s*default/.test(item[1]),
+    '读数行没把手形光标改回来 —— 它在假装自己能点（它是只读浮层）'
+  );
+  ok(
+    /\.ctx-readout\s+\.lc-model-item:hover\s*\{[^}]*background\s*:\s*none/.test(css),
+    '读数行保留了 hover 亮底 —— 悬停亮起来、点下去没反应，那比不给反馈更糟'
+  );
+  ok(/\.ctx-note\s*\{/.test(css), 'chat.css 里找不到 `.ctx-note` —— 口径说明那几行没地方放');
+});
+
+check('C22c 结构守卫：读数浮层的**排版**四件事（宽度 / 基线 / 标签定宽 / 值独占一列）', () => {
+  // 由来：用户 2026-09-24 真机看了第一版浮层，原话「排版改一下，太丑了」。丑的具体形状是
+  // 值折行、行行高矮不齐、标签浮在两行中间 —— 这几条都只活在 CSS 里，影子看不见样式，
+  // 所以只能按原文钉。⚠️ 这里卡的是**机制**（有没有那一列 / 有没有那个单位），不是字面值
+  // —— C21b 的教训：卡字面量的守卫等于把当时那个值写成了正确。
+  const css = readFileSync(join(repoRoot, 'media', 'chat.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  const item = /\.ctx-readout\s+\.lc-model-item\s*\{([^}]*)\}/.exec(css);
+  ok(item, 'chat.css 里找不到 `.ctx-readout .lc-model-item`');
+  ok(
+    item && /align-items\s*:\s*baseline/.test(item[1]),
+    '读数行还是 .lc-model-item 的 center 对齐 —— 值一折成两行，标签就浮在两行中间（这就是"丑"的头一条）'
+  );
+  ok(
+    item && /white-space\s*:\s*normal/.test(item[1]),
+    '读数行还是 nowrap —— 它继承的是菜单项那条（一行的短名字），读数是句子，折不动就顶出去'
+  );
+  // 宽度：`.lc-model-menu` 给的是 150/230px（那是"模型名"的量级），而最长的一行读数
+  // `76.9K / 1.0M · ⚠ 接近压缩阈值` 放不进 230px ⇒ 值一动就折行。
+  // ⚠️ 选择器**必须带 `.lc-model-menu`**：那一条排在本文件**后面**，同权重靠源码顺序决胜 ——
+  //    只写 `.ctx-readout` 会被它盖掉（C22b 的 `.near:hover` 是同一条坑）。探针看不到层叠结果，
+  //    所以这里把选择器原文钉住；宽度本身卡的是"> 230px"这个**关系**，不是某个具体数。
+  const width = /\.lc-model-menu\.ctx-readout\s*\{([^}]*)\}/.exec(css);
+  ok(
+    width,
+    'chat.css 里找不到 `.lc-model-menu.ctx-readout` 的宽度覆盖 —— ' +
+      '只写 `.ctx-readout` 会被后面那条 `.lc-model-menu`（150/230px）盖掉，白写'
+  );
+  // 下限允许写成 `min(Npx, calc(100vw - …))`（侧栏拖窄时跟着缩，别把浮层顶出面板），
+  // 所以这里把可选的 `min(` 吃掉再读那个 px。
+  const minW = width && /min-width\s*:\s*(?:min\(\s*)?(\d+)px/.exec(width[1]);
+  ok(
+    minW && Number(minW[1]) > 230,
+    `.lc-model-menu.ctx-readout 的 min-width 是 ${minW ? minW[1] + 'px' : '（没写）'} —— ` +
+      '不比 .lc-model-menu 的 max-width(230px) 宽，最长那行读数照样折行（宽度覆盖就成了摆设）'
+  );
+  ok(
+    width && /max-width\s*:/.test(width[1]),
+    '读数浮层没有自己的 max-width —— 那条 230px 会继续生效，宽度覆盖等于只改了下限'
+  );
+  // 标签定宽右对齐（3em = 三个汉字）：三行的值列左边缘因此对齐，读起来是一张表。
+  const label = /\.ctx-row-label\s*\{([^}]*)\}/.exec(css);
+  ok(label, 'chat.css 里找不到 `.ctx-row-label`');
+  ok(
+    label && /min-width\s*:\s*[\d.]+em/.test(label[1]),
+    '标签没有按 em 定宽 —— 本轮/累计/上下文 三个标签宽度不同，三行的值就会各自从不同的 x 起，' +
+      '读起来是散着的三段而不是一列'
+  );
+  ok(label && /text-align\s*:\s*right/.test(label[1]), '标签没右对齐 —— 值列对不齐，定宽也就白定了');
+  // 值独占一列：吃掉剩余宽度 + 允许缩到 0。少了 `min-width: 0`，flex 项不肯缩到内容宽度以下
+  //（值是长句子时会把整行顶宽，折行也折不动）。
+  const body = /\.ctx-row-body\s*\{([^}]*)\}/.exec(css);
+  ok(body, 'chat.css 里找不到 `.ctx-row-body`');
+  ok(
+    body && /flex\s*:\s*1/.test(body[1]) && /min-width\s*:\s*0/.test(body[1]),
+    '值那一列不是"吃掉剩余宽度 + 允许缩到 0" —— 窄面板下长值会把行顶宽，而且折不进自己那一列'
+  );
+  ok(
+    /\.ctx-readout\s+\.lc-model-item\s*\+\s*\.ctx-note\s*\{[^}]*border-top/.test(css),
+    '口径说明与上面的读数之间没有分隔线 —— 数字和说明读起来是一团同质的灰字'
+  );
+});
+
+check('C22 结构守卫：四个令牌在 dsh-live.css 里**真的存在**（写错不报错，只会静默退色）', () => {
+  const tokens = readFileSync(join(repoRoot, 'media', 'dsh-live', 'dsh-live.css'), 'utf8');
+  const used = [
+    '--dsw-alias-label-secondary',
+    '--dsw-alias-border-l2',
+    '--dsw-alias-state-warn-primary',
+    '--dsw-alias-label-tertiary', // C22d：浮层的口径说明行用它（比读数轻一档，但**看得见**）
+  ];
+  for (const t of used) {
+    ok(tokens.includes(t + ':'), `dsh-live.css 里没有定义 ${t} —— 会静默退到 VS Code 兜底色`);
+  }
+  // 明暗两套都要有：只在一套里定义，另一套主题下就退色
+  for (const t of used) {
+    const hits = tokens.split(t + ':').length - 1;
+    ok(hits >= 2, `${t} 只定义了 ${hits} 次 —— 明暗两套主题里少了一套（那套下会退到兜底色）`);
+  }
+});
+
+check('C22d 结构守卫：说明那几行的色阶必须**夹在**行标签与 dimmed 之间（暗色下不再看不见）', () => {
+  // 由来：用户 2026-09-24 在**暗色主题**下看浮层，原话「这句话…有点暗，可以稍微亮一点」。
+  // 原来用的是 `--dsw-alias-label-dimmed` —— 它在 dsh-live.css 的令牌梯里是最淡那一档
+  //（亮色 = bluish-200 `rgb(225,229,238)`、暗色 = bluish-750 `rgb(67,69,74)`），而浮层底色是
+  // VS Code 的 dropdown-listBackground（暗色 ≈ `rgb(43,43,48)`）⇒ 暗色下对比度 ≈1.5:1。
+  // dimmed 是给"几乎不用看见的装饰"的，不是给"安静的文字"的。
+  //
+  // ⚠️ 这里卡的是**梯子上的位置**，不是令牌名也不是色值（C21b 的教训：卡字面量等于把当时那个值
+  //    写成了正确，下一个人只会照着字面量改回去）：
+  //      ① 必须**弱于**行标签（保住「数字 > 标签 > 说明」的层级，说明不能比读数还响）；
+  //      ② 必须**强于** dimmed（否则又回到"看不见"）。
+  //    梯子顺序抄自 dsh-live.css 那两套别名块（明暗一致：primary > secondary > tertiary > caption > dimmed）。
+  const css = readFileSync(join(repoRoot, 'media', 'chat.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  const LADDER = ['primary', 'secondary', 'tertiary', 'caption', 'dimmed']; // 越靠前越显眼
+  const tier = (sel) => {
+    // 允许 `label-primary-bluish` 这类同族名：取最长匹配前缀
+    const m = new RegExp('\\.' + sel + '\\s*\\{([^}]*)\\}').exec(css);
+    if (!m) return null;
+    const c = /color\s*:\s*var\(\s*--dsw-alias-label-([a-z-]+)\s*,/.exec(m[1]);
+    if (!c) return null;
+    const name = LADDER.find((t) => c[1] === t || c[1].startsWith(t + '-'));
+    return name ? { name, i: LADDER.indexOf(name), block: m[1] } : { name: c[1], i: -1, block: m[1] };
+  };
+  const note = tier('ctx-note');
+  const label = tier('ctx-row-label');
+  ok(label, 'chat.css 里找不到 `.ctx-row-label` 的 color（或它不再走带兜底的 `--dsw-alias-label-*`）');
+  ok(note, 'chat.css 里找不到 `.ctx-note` 的 color（或它不再走带兜底的 `--dsw-alias-label-*`）');
+  if (!note || !label) return;
+  ok(
+    label.i >= 0 && note.i >= 0,
+    `说明/标签用了梯子之外的令牌（说明 = ${note.name}、标签 = ${label.name}）—— ` +
+      '梯子外的不保证明暗两套都给得出来，暗色下很可能就退成看不见'
+  );
+  ok(
+    note.i > label.i,
+    `说明那档（${note.name}）不比行标签那档（${label.name}）弱 —— 层级反了：` +
+      '说明是不需要先读的东西，不能和读数一样响'
+  );
+  ok(
+    note.i < LADDER.indexOf('dimmed'),
+    `说明那档是 ${note.name}，已经落到 dimmed 那一侧了 —— dimmed 是"几乎不用看见的装饰"那一档` +
+      '（暗色下 ≈1.5:1，就是 C22d 用户报的那条"有点暗"）'
+  );
+  // 兜底链不能丢：media/dsh-live 产物缺失时 chat.html 那条 <link> 是空的，那时全靠第二个参数。
+  ok(
+    /color\s*:\s*var\(\s*--dsw-alias-label-[a-z-]+\s*,\s*var\(/.test(note.block),
+    '说明行的 color 没有兜底（`var(令牌, var(--vscode-…))` 这样一路退下去）—— ' +
+      'dsh-live 产物缺失时说明会变成不可见'
+  );
 });
 
 // ---------- D4 · 转写折叠（纯界面，不碰存储） ----------
@@ -610,7 +1295,7 @@ check('C9 运行条：payload 字段名与渲染函数对得上', () => {
   send({ type: 'mode-set', mode: 'harness' });
   send({ type: 'runs', readout: C9_READOUT });
   eq(
-    $('runs-summary').textContent,
+    statusRun().textContent,
     '本轮已完成 · 10 工具 · 11.2s · 1 错误 · 1 失败 · 1 结果未知',
     '运行条文案与 payload 脱节了'
   );
@@ -2020,6 +2705,137 @@ check('C17 CSS 守卫：图片 chip 那两枚小标走的是 dsh-live.css 里真
   );
   // 同 C16 那条：chip 上是 [hidden] 管的显隐，一条 display 就能把它整条废掉
   ok(!/display:/.test(scope), '.chip-dim 里写了 display');
+});
+
+// ---------- C23 · 余额读数（配置条「API」钮右边那枚） ----------
+//
+// 判据分两半，与这条功能的实际风险对齐：
+//   · **四档文案逐字**：正文与明细都由扩展侧算好（`src/deepseekApi.ts`），webview 一个字不拼 ——
+//     所以这里能断言"载荷里写什么，钮上就是什么"，包括那个 `余额：` 前缀；
+//   · **外形与旁边三个钮的关系**：它是文字钮（外观全从 `.link-button` 来）、不挂状态点、
+//     busy 时不禁用。这三条都是"刻意的差异"，不留守卫就会被下一个人顺手统一掉。
+
+check('C23 四档读数逐字上屏：正文照抄（含「余额：」前缀）、title 照抄、stale 落到类上', () => {
+  const btn = $('live-balance-btn');
+  ok(btn, '影子/HTML 里没有 #live-balance-btn');
+  send({ type: 'live-balance', text: '余额：¥28.70', title: 'CNY：总额 ¥28.70 · 赠送 ¥8.70 · 充值 ¥20.00\n更新于 12:03', stale: false });
+  eq(btn.textContent, '余额：¥28.70', '有余额那一档的正文不对');
+  eq(btn.title, 'CNY：总额 ¥28.70 · 赠送 ¥8.70 · 充值 ¥20.00\n更新于 12:03', 'title 没逐字照抄（webview 不许自己拼明细）');
+  eq(btn.classList.contains('stale'), false, '成功档被标成了陈旧');
+
+  send({ type: 'live-balance', text: '余额：…', title: '正在查询余额…', stale: false });
+  eq(btn.textContent, '余额：…', '在途档的正文不对');
+
+  send({ type: 'live-balance', text: '余额：—', title: '网络不可达 —— 点一下重试', stale: false });
+  eq(btn.textContent, '余额：—', '查不到那一档的正文不对');
+  eq(btn.title, '网络不可达 —— 点一下重试', '查不到那档的 title 不对');
+
+  send({ type: 'live-balance', text: '余额：—', title: '未配置 DEEPSEEK_API_KEY —— 点「API」配置后会自动查询余额', stale: false });
+  ok(/未配置 DEEPSEEK_API_KEY/.test(btn.title), '未配 key 那档没给出路');
+});
+
+check('C23 陈旧档：值照留、只压淡并标 stale（擦成「—」等于丢掉已知信息）', () => {
+  const btn = $('live-balance-btn');
+  send({
+    type: 'live-balance',
+    text: '余额：¥28.70',
+    title: 'CNY：总额 ¥28.70\n更新于 12:03\n最近一次查询失败：网络不可达',
+    stale: true,
+  });
+  eq(btn.textContent, '余额：¥28.70', '陈旧档把上次数值擦掉了');
+  eq(btn.classList.contains('stale'), true, '没标陈旧 —— 那用户会以为这是此刻的数');
+  send({ type: 'live-balance', text: '余额：¥30.00', title: '更新于 12:08', stale: false });
+  eq(btn.classList.contains('stale'), false, '刷新成功后陈旧标记没摘掉');
+});
+
+check('C23 点一下 ⇒ 恰好一条 refresh-balance（不叠发、不带参数）', () => {
+  posted.length = 0;
+  $('live-balance-btn').click();
+  eq(posted.length, 1, '点一下该只发一条消息');
+  eq(posted[0].type, 'refresh-balance', `发的不是 refresh-balance：${posted[0].type}`);
+  eq(Object.keys(posted[0]).length, 1, '这条消息不该带任何参数（金额、key 都不许从这里过）');
+  posted.length = 0;
+});
+
+check('C23 运行中（busy）余额钮**不禁用**、点了照发 —— 与旁边三个钮刻意的差异', () => {
+  send({ type: 'run-busy', busy: true });
+  eq($('live-api-btn').disabled, true, '前提不成立：忙碌时 API 钮没灰');
+  eq($('live-balance-btn').disabled, false, '忙时把只读的余额钮也禁用了 —— 它不重启子进程、不改配置');
+  posted.length = 0;
+  $('live-balance-btn').click();
+  eq(posted.length, 1, '忙时点余额钮没反应（那就是把它也禁用了）');
+  send({ type: 'run-busy', busy: false });
+  eq($('live-balance-btn').disabled, false, '跑完了余额钮还灰着');
+  posted.length = 0;
+});
+
+check('C23 模型菜单由 live-config.models 驱动：远端几个就画几行，末尾仍是「自定义模型…」', () => {
+  // 远端 id **刻意不叫 deepseek-***：webview 若自作主张按前缀过滤，这一条就红
+  const remote = ['m-remote-alpha', 'm-remote-beta', 'deepseek-chat', 'm-remote-gamma'];
+  send({
+    type: 'live-config',
+    model: 'm-remote-beta',
+    models: remote,
+    apiConfigured: true,
+    dshConfigured: true,
+    effort: null,
+    efforts: ['off'],
+    effortThinkingDisabled: false,
+  });
+  const rows = childWithClass($('live-model-menu'), 'lc-model-item');
+  eq(rows.length, remote.length + 1, `菜单行数不对（远端 ${remote.length} 条 + 自定义 1 条）`);
+  for (const id of remote) {
+    ok(rows.some((r) => hasText(r, id)), `菜单里没有远端模型 ${id}`);
+  }
+  ok(hasText($('live-model-menu'), '自定义模型…'), '末尾的「自定义模型…」不见了');
+  ok(/m-remote-beta/.test($('live-model-label').textContent), '触发钮没跟着当前模型走');
+});
+
+check('C23 结构守卫：余额钮是 `.link-button lc-balance` 文字钮、在 API 钮**之后**、不挂方块钮的类', () => {
+  const html = readFileSync(join(repoRoot, 'media', 'chat.html'), 'utf8');
+  const at = html.indexOf('id="live-balance-btn"');
+  ok(at > 0, 'chat.html 里没有 #live-balance-btn');
+  const tag = html.slice(html.lastIndexOf('<button', at), html.indexOf('>', at) + 1);
+  const cls = classOf(tag);
+  ok(cls.includes('link-button'), '没走 .link-button —— 那就成了配置条里第三套外观');
+  ok(cls.includes('lc-balance'), '缺自带类 `.lc-balance`');
+  for (const bad of ['tool-icon', 'lc-knob']) {
+    ok(!cls.includes(bad), `挂上了 ${bad} —— 那是方块图标钮的类，与「API / DSH」两颗不同款`);
+  }
+  ok(html.indexOf('id="live-api-btn"') < at, '余额钮没排在 API 钮之后（用户说的是「API 钮旁边」）');
+  // 静态初值只该是那一串「余额：—」；写别的（比如「正在加载」）会在新 webview + 老扩展时变成假话
+  ok(/>余额：—</.test(html.slice(at, at + 600)), 'HTML 里的静态初值不是「余额：—」');
+});
+
+check('C23 CSS 守卫：`.lc-model-menu` 有高度上限**且**能滚（只写上限定死内容，比没有上限更坏）', () => {
+  const css = readFileSync(join(repoRoot, 'media', 'chat.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  const block = css.slice(css.indexOf('.lc-model-menu {'));
+  const scope = block.slice(0, block.indexOf('}'));
+  const mh = /max-height\s*:\s*([^;]+);/.exec(scope);
+  ok(mh, '.lc-model-menu 没有 max-height —— 远端列表几十条会把整张卡片顶出去');
+  ok(mh[1].trim() !== 'none', 'max-height 写成了 none（等于没有上限）');
+  // 卡**关系**不卡数值（C21b 的教训）：上限得跟着视口走，不是某个写死的 px
+  ok(/vh/.test(mh[1]), `max-height 是写死的量（${mh[1].trim()}）—— 面板是用户拖出来的，矮面板下照样顶出去`);
+  ok(/overflow-y\s*:\s*auto/.test(scope), '只给了 max-height 没给 overflow-y —— 内容会被裁掉且滚不动');
+});
+
+check('C23 CSS 守卫：`.lc-balance` 不写回外观、不挂状态点、窄面板先省略', () => {
+  const css = readFileSync(join(repoRoot, 'media', 'chat.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  const at = css.indexOf('.lc-balance {');
+  ok(at > 0, 'chat.css 里没有 .lc-balance');
+  const scope = css.slice(at, css.indexOf('}', at));
+  for (const prop of ['width', 'height', 'background', 'border', 'cursor']) {
+    ok(!new RegExp(`(^|[\\s;{])${prop}\\s*:`).test(scope), `.lc-balance 里写回了 ${prop} —— 外观该全从 .link-button 来`);
+  }
+  ok(/text-overflow\s*:\s*ellipsis/.test(scope), '没有省略号兜底 —— 窄面板下它会横向把工具行顶出去');
+  ok(/flex\s*:\s*none/.test(scope), '没有 flex:none —— 配置条是 flex，会被压窄');
+  ok(!/\.lc-balance::before/.test(css), '.lc-balance 挂了 ::before 状态点（状态由文字自己说，两处一起喊就是白建）');
+  // stale 那条：默认落在 (0,1) 开区间（C21b 的教训 —— 卡区间不卡字面量）
+  const staleScope = css.slice(css.indexOf('.lc-balance.stale {'), css.indexOf('}', css.indexOf('.lc-balance.stale {')));
+  const op = /opacity\s*:\s*([\d.]+)\s*;/.exec(staleScope);
+  ok(op, '.lc-balance.stale 没有 opacity —— 陈旧与实时就分不出来了');
+  const n = Number(op[1]);
+  ok(n > 0 && n < 1, `stale 的默认透明度落在开区间外（${op[1]}）：0 = 看不见，1 = 与实时没差别`);
 });
 
 console.log('');
