@@ -2838,6 +2838,69 @@ check('C23 CSS 守卫：`.lc-balance` 不写回外观、不挂状态点、窄面
   ok(n > 0 && n < 1, `stale 的默认透明度落在开区间外（${op[1]}）：0 = 看不见，1 = 与实时没差别`);
 });
 
+// ---------- 上线前藏起「内嵌聊天」入口（2026-09-24） ----------
+//
+// 藏入口容易，藏错了**很难当场发现**：这条通路有两个必须**同时**成立的东西 ——
+// media/chat.html 里那条模式条被注释掉（用户点不到），以及扩展启动时不再认陈旧的 globalState
+// 值（否则此前选过内嵌聊天的人会启动即进 chat、而入口已经没了 ⇒ 再也切不回来）。
+// 只做前者，症状要满足"用户上次选过 chat"才出现 —— 恰好是开发机上最难复现的那一类。
+//
+// ⚠️ 本探针的 DOM 影子 `querySelectorAll` **恒返回 `[]`**，所以那两处入站 `mode-set chat` 的用例
+// 从来就没依赖过模式条；本次注释掉它对现有用例**不可能**有影响。跑一遍只为确认，不是判据。
+
+check('入口守卫：模式条是「注释掉」而不是「删掉」—— 剥掉注释后找不到，原文里必须还在', () => {
+  const raw = readFileSync(htmlPath, 'utf8');
+  // 剥 HTML 注释（探针里已有剥 CSS 注释的先例，见 C21 那条 —— 同一个手法，换一对定界符）
+  const live = raw.replace(/<!--[\s\S]*?-->/g, '');
+  for (const needle of ['id="mode-bar"', 'id="mode-chat"', 'data-mode="chat"']) {
+    ok(!live.includes(needle), `chat.html 剥掉注释后仍有 ${needle} —— 入口又露出来了`);
+    // 反向：整块删掉也会打红（那就不是"去掉注释即可恢复"了，两向都钉住才算守卫）
+    ok(
+      raw.includes(needle),
+      `chat.html 原文里已经没有 ${needle} —— 那是「删掉」不是「注释掉」，恢复就不再只是去掉注释`
+    );
+  }
+  // 恢复说明必须指向那个开关。卡的是"这句话在注释里"这个**关系**：它在 raw 里有、剥掉注释后就没了
+  // ⇒ 它是给开发者看的，不会被用户看见。
+  ok(
+    raw.includes('CHAT_MODE_EXPOSED'),
+    'chat.html 的注释里没写恢复要靠 CHAT_MODE_EXPOSED —— 下一个人只会去掉注释、然后撞上"按钮点了没反应"'
+  );
+  ok(
+    !live.includes('CHAT_MODE_EXPOSED'),
+    'CHAT_MODE_EXPOSED 落在 chat.html 的渲染内容里了 —— 那是恢复说明，不该出现在用户看得见的地方'
+  );
+});
+
+check('入口守卫：开关只闸「读」、不闸 _setMode（半恢复必须响亮地失败，不能静默无声）', () => {
+  const src = readFileSync(join(repoRoot, 'src', 'chatViewProvider.ts'), 'utf8');
+  const lines = src.split('\n');
+  const hits = lines.map((l, i) => [i + 1, l]).filter(([, l]) => l.includes('CHAT_MODE_EXPOSED'));
+  // 声明 1 处 + 使用 1 处。刻意**不卡 `= false` 这个字面值** —— 真机 F5 要靠反复翻它来验恢复
+  // 路径，卡字面量只会把合法的验证步骤判红（C21b 的教训：判据钉关系，不钉值）。
+  eq(
+    hits.length,
+    2,
+    `CHAT_MODE_EXPOSED 出现了 ${hits.length} 次（该是 声明 1 + 使用 1）：第 ${hits.map(([nn]) => nn).join('、')} 行`
+  );
+  const use = hits.find(([, l]) => !/^\s*const /.test(l));
+  ok(use, 'CHAT_MODE_EXPOSED 只有声明、没有使用者 —— 那个常量没接线');
+  ok(
+    use && /saved === 'chat'/.test(use[1]),
+    `唯一那处使用（第 ${use ? use[0] : '?'} 行）不在读 globalState 的那一行上 —— 它就没在闸启动模式`
+  );
+  // 不变式：`_setMode` 里一个字都不许出现。两个都闸 = 「去掉 HTML 注释但忘了翻常量」时按钮
+  // 点了没反应（静默无效），比报错更难查 —— 常量那段注释里的论证。
+  const setDef = lines.findIndex((l) => l.includes('private _setMode('));
+  ok(setDef >= 0, '找不到 _setMode 的定义');
+  const setEnd = lines.findIndex((l, i) => i > setDef && /^  (private|public|protected) /.test(l));
+  const body = lines.slice(setDef, setEnd > setDef ? setEnd : undefined).join('\n');
+  ok(
+    !body.includes('CHAT_MODE_EXPOSED'),
+    '_setMode 也被闸上了 —— 去掉 HTML 注释但忘了翻常量时，按钮会点了没反应（静默无效）'
+  );
+});
+
 console.log('');
 if (failures.length) {
   console.log(`✗ ${failures.length} 条未过（共 ${passed + failures.length} 条）：`);

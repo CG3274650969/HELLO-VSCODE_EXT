@@ -216,6 +216,21 @@ const IMAGE_TTL_MS = 7 * 24 * 3600 * 1000;
 const MODE_KEY = 'hello.chat.mode';
 
 /**
+ * 是否向外暴露「内嵌聊天」入口。上线前 false：`media/chat.html` 里那条模式条已整块注释掉，
+ * 这里同时挡住**陈旧的 globalState 值** —— 用户此前选过内嵌聊天的话，没有这道闸会启动即进
+ * chat、而入口已经藏了 ⇒ 再也切不回来。
+ *
+ * ⚠️ 只闸「读」、**不**闸 `_setMode`：两个都闸的话，「去掉 HTML 注释但忘了翻这个常量」这种半恢复
+ * 会表现为**按钮点了没反应**（静默无效）。只闸读是 fail-safe —— 常量还是 false 时，任何来源的
+ * `set-mode: chat` 都只写盘、下次启动照样回 harness；而且那个值**故意不被覆盖**，翻回 true 就
+ * 恢复用户上次的选择。
+ *
+ * 放开 = 这里改回 true **并且** 去掉 media/chat.html 里 #mode-bar 的注释（两件都要做）。
+ * 机器判据见 scripts/probe-webview-render.mjs 里的两向守卫（刻意不卡这个字面值 —— 真机 F5 要反复翻它）。
+ */
+const CHAT_MODE_EXPOSED = false;
+
+/**
  * C12：workspaceState 里记住**本项目**激活的 profile（名字 + 激活时的副本 + 当时的文件原文）。
  * 存副本而不是只存名字，是因为运行期必须读"激活时的那一份"（见 `_profileActive` 的注释）。
  */
@@ -719,7 +734,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const saved = this._globalState.get<Mode>(MODE_KEY);
     // 默认 = harness（主线）：只有用户上次明确选过「内嵌聊天」才回 chat；从未选过则进 harness。
     // harness 恒为 DSH 直播：懒 spawn，但视图每次就绪会预热连接（见 'ready' 处理）。
-    this._mode = saved === 'chat' ? 'chat' : 'harness';
+    // 上线前入口已藏 ⇒ 陈旧的 'chat' 值也进 harness。**只闸这里**（读 globalState 这一处）、
+    // `_setMode` 一个字不动 —— 两条理由都在上面那个常量的注释里（半恢复必须响亮地失败）。
+    // 这里刻意不写常量名：它只该在声明与这一行各出现一次，probe-webview-render 有守卫钉着。
+    this._mode = CHAT_MODE_EXPOSED && saved === 'chat' ? 'chat' : 'harness';
 
     // 两套存储：chat 用老文件（兼容既有历史），harness 用独立文件
     this._stores = {
