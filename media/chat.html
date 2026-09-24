@@ -15,19 +15,31 @@
   <title>AlohaDSH</title>
 </head>
 <body>
-  <!-- 行1（恒显示）：顶部 tab 条 —— 左侧内嵌聊天/Harness（模式胶囊）；右侧 harness 专属的
-       连接状态点（仅 harness 模式可见，applyMode 切 hidden）。 -->
+  <!-- 行1（恒显示）：顶栏 —— 本版只剩品牌标记 + 右侧 harness 专属的连接状态点（仅 harness 模式
+       可见，applyMode 切 hidden）。左侧那条模式胶囊见下方注释块（本版未开放入口）。 -->
   <div id="top-row" class="top-row">
     <!-- 品牌标记：沿用活动栏那个单色 media/icon.svg（不另存一份彩色小图）。URI 由宿主替换
          %%ICON_URI%%（同 %%CSS_URI%% 的机制）；尺寸与深色主题反相见 chat.css 的 .brand-mark。 -->
     <img class="brand-mark" src="%%ICON_URI%%" alt="">
 
+    <!-- ⚠️ **上线前藏起「内嵌聊天」入口（2026-09-24）**：整条模式条注释掉 —— 只留一个 Harness
+         tab 没有意义。内嵌聊天是自带假回复的流式沙盒（README 与手册同款措辞：未完成），留着只
+         为打磨流式/渲染管线；代码、存储、chat 模式的渲染**一个字节没动**（media/chat.js 的
+         requestMode / applyMode / 两套草稿与待发附件、SessionStore 的 chat 存储都原样在），只是
+         没有入口了。探针 probe-webview-render 有一条两向守卫钉着这段（剥掉注释后必须找不到，
+         原文里必须还在）。
+         恢复 = 去掉这段注释 **并且** 把 src/chatViewProvider.ts 的 CHAT_MODE_EXPOSED 改回 true。
+         **两件都要做**：只去掉注释的话按钮点了不会切模式（那边刻意只闸「读」、不闸 set-mode，
+         半恢复会表现为静默无效 —— 比报错更难查）。那个开关同时挡着陈旧的 globalState 值：存过
+         'chat' 的话，没有它就会启动即进 chat、而入口已藏 ⇒ 再也出不来。 -->
+    <!--
     <div id="mode-bar" class="mode-bar" role="tablist" aria-label="工作模式">
       <button type="button" id="mode-harness" class="mode-tab active" data-mode="harness"
               role="tab" aria-selected="true">Harness</button>
       <button type="button" id="mode-chat" class="mode-tab" data-mode="chat"
               role="tab" aria-selected="false">内嵌聊天</button>
     </div>
+    -->
 
     <!-- Harness 连接状态点（harness 恒为 DSH 直播，无「模拟」开关）：仅 harness 模式可见
          （JS applyMode 里切 hidden）。状态文字/颜色由扩展 backend-status 回传。 -->
