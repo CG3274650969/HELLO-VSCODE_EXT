@@ -827,46 +827,64 @@ body.vscode-high-contrast .brand-mark {
   gap: 4px;
 }
 
-/* ---------- C3a 用量读数条（本轮/本会话 token + 上下文占用） ---------- */
-/* 同 review-bar：挂在 composer 内、输入卡正上方；react-live 只藏 #messages，故两态都可见。
-   纯读数不可点，故比 review-bar 更薄（无按钮列、上下留白各减 1px），仍是同一张软卡片配方。 */
-.usage-bar {
+/* ---------- C21 本轮读数**行**（C3a 用量 + C9 运行，合并；读数不画卡） ---------- */
+/* 一条行，承载原来两张卡的信息：C22 起这里**只剩右半** —— 本轮运行摘要 + 最右的「运行记录 ›」
+   入口（左半那段用量/上下文搬去了配置条的 `.ctx-ring`，见下面）。同 review-bar 挂在 composer 内、
+   输入卡正上方；react-live 只藏 #messages，故两态都可见。
+   ⚠️ **没有 border、没有 background** —— 这是 C21 那次改动的全部要点：composer 里只有"要你动手"的
+   条（审批 / 审阅 / 继续）才配有一张软卡（1px 边框 + 圆角 + 底色）。四张同款卡并排会让读数与
+   动作一样重。**别再给它加回边框或底色**。
+   C22 起它也不再有任何会变色的状态（C21 那个 `.near` 随上下文那半一起搬到了环上）——
+   一个只剩运行读数的行，再拿上下文的事去染它就说不过去了。 */
+.status-row {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 2px 10px;
-  border: 1px solid var(--dsw-alias-border-l2, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.25)));
-  border-radius: 10px;
-  background: var(--dsw-alias-bg-layer-1, var(--vscode-editor-inactiveSelectionBackground, rgba(128, 128, 128, 0.12)));
+  padding: 2px 8px;
   font-size: 11px;
   line-height: 1.6;
+  color: var(--dsw-alias-label-dimmed, var(--vscode-descriptionForeground, #999));
 }
-.usage-summary {
-  flex: 1 1 auto;
+/* 省略号截断（有 title 兜底），数字等宽。 */
+.status-run {
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
   /* 数字位数会随流式刷新跳（2.8K → 11.8K），等宽数字让整行不左右抖。
      不给整行挂 code 字体：行里混着中文标签，会 fallback 到系统等宽中文字体，反而更丑。 */
   font-variant-numeric: tabular-nums;
 }
 
-/* C10：上下文接近 DSH 的压缩阈值。**只换配色、不动尺寸** —— 条的高度一变，
-   composer 整块会跳，而这条会在流式刷新里反复进出这个状态（阈值附近来回摆动时）。
-   配色沿用别处的警示色 triad，别自创。 */
-.usage-bar.near {
-  border-color: var(--dsw-alias-state-warning-primary, var(--vscode-editorWarning-foreground, #d29922));
-  background: color-mix(
-    in srgb,
-    var(--dsw-alias-state-warning-primary, var(--vscode-editorWarning-foreground, #d29922)) 10%,
-    transparent
-  );
+/* 「运行记录 ›」入口：**半淡常显**（C21b 改的口径）。C21 第一版是"不悬停就完全看不见"
+   （`opacity: 0`），真机一跑就露馅：**入口找不着 —— 一个要悬停才存在的按钮等于没有按钮**
+   （用户 2026-09-24 反馈「和背景融为一体了」）。现在默认 0.55：看得见，但明显比读数轻。
+   三件事必须一起成立：
+   ① 用 `opacity` 而不是 `display:none`/`visibility:hidden` —— opacity 不把元素摘出流，按钮宽度
+      **恒占位**，所以鼠标移入移出时左边的字不会重排（用 display 换显隐会让整行抖一下）；
+   ② 半淡**不影响可聚焦**，而且 `.status-row:focus-within` 会在它被 Tab 到时推到满 ——
+      所有状态都得看得见（可访问性判据，不是好意）；
+   ③ ⚠️ **别把默认值改回 0，也别改成 1**：0 就是 C21 那个"找不着的入口"，1 则让它和运行读数
+      一样重（那 hover 那条规则也没意义了）。探针守卫卡的是 `0 < 默认 < 1` 这个区间。
+   触屏没有 hover（focus 也不可靠），`@media (hover: none)` 里恒满。 */
+.status-open {
+  flex: none;
+  opacity: 0.55;
+  transition: opacity 0.12s ease;
 }
-.usage-bar.near .usage-summary {
-  color: var(--dsw-alias-state-warning-primary, var(--vscode-editorWarning-foreground, #d29922));
+.status-row:hover .status-open,
+.status-row:focus-within .status-open {
+  opacity: 1;
 }
+@media (hover: none) {
+  .status-open {
+    opacity: 1;
+  }
+}
+
+/* 上下文占用环的样式在下面「配置条」那一段（`.lc-knob.on::after` 之后）—— 它必须排在
+   `.tool-icon` **之后**才能压住 hover 那条同权重的规则（那时指针压上去会盖掉警告色）。 */
 
 /* 通用附件 chip：待发送可移除 / 气泡里只读 */
 .chip {
@@ -1210,6 +1228,143 @@ body.live-busy #send-btn {
   height: 6px;
   border-radius: 50%;
   background: var(--dsw-alias-state-business-primary, var(--vscode-focusBorder, #3794ff));
+}
+
+/* ---------- C22/C22b 上下文占用环：配置条上的第三个方块钮 ---------- */
+/* 位置：`#live-config-bar` 里、模型钮与推理档位钮**之间**（chat.html 里就钉在那儿）。
+   为什么是"环"而不是"条"：占用率是**一个有上限的比例**，环天然表达"还剩多少"，
+   而下限 0% 与上限 100% 在首尾相连的环上也各是一个画得出来的端点。
+
+   📌 **外观一个字都不在这里**：HTML 上挂的是 `class="tool-icon lc-knob ctx-ring"`，
+   26×26 / 圆角 / hover 亮底 / 光标 / 默认灰字全从 `.tool-icon` 来，与附件钮、推理钮、profile 钮
+   **同一份定义**（同一套外观来源，四处不会各自漂移）。这里只留环**自己**的东西：
+   · `flex: none` —— 工具行是 flex，不加会被压窄；
+   · 弧与底圈的描边；
+   · `.near` / `.stale` 两个**状态**色与透明度；
+   · `:focus-visible`。
+   ⚠️ **别在这里写回 `width` / `height` / `color` / `background` / `border`** —— 那是 C22 第一版
+   "自绘一套"的老路，写回一处就等于又长出一套外观（探针有守卫）。
+
+   ⚠️⚠️ **这一整块必须待在 `.tool-icon` 之后**（源码顺序）：`.ctx-ring.near:hover`（0,3,0）与
+   `.tool-icon:hover:not(:disabled)`（0,3,0）**权重打平**，靠顺序决胜 —— 排在前面就会被 hover
+   盖掉，指针一压上去警告色就没了（而那正是最该看见它的时候）。
+
+   换色只改 `color`：弧是 `stroke: currentColor`，一路吃到环上。 */
+.ctx-ring {
+  flex: none;
+}
+.ctx-ring svg {
+  display: block; /* 行内 svg 底下会多一条基线缝，26px 的盒子里会把环顶偏 */
+}
+.ctx-ring-track {
+  fill: none;
+  stroke: var(--dsw-alias-border-l2, var(--vscode-panel-border, rgba(128, 128, 128, 0.3)));
+  stroke-width: 2;
+}
+/* 弧：`stroke-dasharray` 等于整圆周长 ⇒ 一整段 dash 正好铺满一圈，于是 `stroke-dashoffset`
+   就是"把这段 dash 往回推多少"：推得越多、露出来的越少。chat.js 写的是 `LEN * (1 - ratio)`，
+   占用 0% ⇒ 推满一整圈（一点不露），占用 100% ⇒ 不推（满环）。
+
+   ⚠️⚠️ 这条规则里**绝不许**出现 `stroke-dashoffset` —— chat.js 是用 setAttribute 写的**表现属性**，
+   而表现属性在 CSS 里优先级最低，这里写一个值就会把 JS 写的那个整个盖掉，弧从此永远卡在
+   同一个长度上（**而且不报错**）。探针有一条守卫专门钉这件事。
+   `transition` 只负责在属性变化时补一段动画，它**不设置值**，所以留着是安全的。 */
+.ctx-ring-arc {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-dasharray: 40.84; /* = 2πr（r=6.5）；chat.js 的 CTX_RING_LEN 必须与它相等（有守卫） */
+  transition: stroke-dashoffset 0.2s ease;
+}
+/* C10：上下文接近 DSH 的压缩阈值。**只换配色、不动尺寸** —— 环的尺寸一变，配置条整行会跟着挪，
+   而这个状态会在流式刷新里反复进出（阈值附近来回摆动时）。
+   ⚠️ 令牌是 `--dsw-alias-state-**warn**-primary`，**不是 `-warning-`** —— dsh-live.css 里没有
+   `-warning-` 那个名字，写错了不会报错、只会静默退到兜底色（C21 在读数行上就是这么错的，
+   C22 才发现；别处 `.approval-scope` 早有一条注释记着这个坑）。
+
+   C21 的原话是「全 composer 只有这一处会变色」—— **C22b 起要收窄成"唯一会因为「状态」变色"**：
+   挂了 `.tool-icon` 之后三个钮 hover 都会亮底/亮字，那是**动作反馈**（指针在哪），不是状态。
+   它喊得出来，正因为**没有第二个地方会因为"发生了什么"而变色**。
+
+   ⚠️ **`:hover` 那一条不能省**：`.ctx-ring.near`（0,2,0）斗不过
+   `.tool-icon:hover:not(:disabled)`（0,3,0）—— 少了它，指针一压上去警告色就换成普通亮字了。 */
+.ctx-ring.near,
+.ctx-ring.near:hover {
+  color: var(--dsw-alias-state-warn-primary, var(--vscode-editorWarning-foreground, #d29922));
+}
+/* C10b：这份占用不是本轮的实时值，而是上次跑完时留下的样本（旧会话重开 / 该轮还没产出新样本）。
+   变淡说的是「这个数有点旧」，悬浮信息与浮层里那一行「上次」说的是**为什么** —— 两个表现同属
+   一条判据，所以别只留一个：只变淡看不出缘由，只在文案里说又没人悬停。 */
+.ctx-ring.stale {
+  opacity: 0.45;
+}
+/* 键盘可达是判据不是好意（C21 `.status-open` 同一条）：环可聚焦，聚焦时得看得见焦点在哪。
+   ⚠️ C22b 之前环是圆的、所以焦点环也描成圆的（`border-radius: 50%`）；现在它是 `.tool-icon`
+   那样的 7px 圆角方块，焦点环得跟着方 —— 否则两种形状会在同一个控件上打架。
+   ⚠️ C22b 之后**纯键盘用户不再吃亏**：原生 `title` 仍然只在悬停时弹、聚焦不弹，但 Tab 到环
+   按回车/空格就能开那个只读浮层，那串多行说明就在里面（C22 记的已知局限由这一条修掉）。
+   同理，推理 / profile 两个钮共用这一条（它们此前只有浏览器默认焦点环）。 */
+.ctx-ring:focus-visible,
+.lc-knob:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder, #3794ff);
+  outline-offset: 1px;
+}
+
+/* 只读读数浮层（C22b；**排版在 C22c 重做过**）：外壳与三个菜单**逐字同款**（.lc-model-menu），
+   行复用 .lc-model-item —— "统一样式"要的正是这个。但**行不能照抄**：菜单项是"一行的短名字"，
+   读数是"一个标签 + 一句数字"。照抄的后果（C22c 用户原话："排版改一下，太丑了"）是值折行、
+   行行高矮不齐。四条改动各对应一处具体的难看：
+
+   · **宽度**：`76.9K / 1.0M · ⚠ 接近压缩阈值` 放不进 230px ⇒ 值一动就折行；
+   · **基线对齐**：值折成第二行时，标签不该浮在两行中间（.lc-model-item 是 center 对齐）；
+   · **标签定宽右对齐**（3em = 三个汉字）⇒ 值列左边缘对齐，读起来是一张表而不是三段散文；
+   · **值独占一列**（`flex: 1 1 auto` + `min-width: 0`）⇒ 折行折在值那一列里，不折到标签底下。
+
+   它**不可点**，所以还要去掉两件"假装能点"的东西：手形光标，以及 hover 亮底。 */
+.lc-model-menu.ctx-readout {
+  /* ⚠️ 两处都得带上 `.lc-model-menu`：那一条排在本文件**后面**，同权重靠源码顺序决胜 ——
+     只写 `.ctx-readout` 会被它的 150/230px 盖掉（C22b 的 `.near:hover` 是同一条坑）。
+     `100vw` 是 webview 面板宽度：侧栏拖得很窄时别让浮层顶出面板。 */
+  min-width: min(260px, calc(100vw - 24px));
+  max-width: min(340px, calc(100vw - 24px));
+}
+.ctx-readout .lc-model-item {
+  align-items: baseline; /* 见上：值的第二行起归自己那一列，标签钉在第一行的基线上 */
+  gap: 10px;
+  padding: 3px 10px 4px; /* 比菜单项紧一档：这里是一行挨一行地读，不是一份可点的清单；
+                            左右与下面的 .ctx-note 同一条内缩（数字块与说明块共一条左边缘） */
+  cursor: default;
+  white-space: normal; /* 菜单项是 nowrap（一行的短名字），读数是句子，得能折 */
+}
+.ctx-readout .lc-model-item:hover {
+  background: none;
+}
+.ctx-row-label {
+  flex: none;
+  min-width: 3em; /* 三个汉字「上下文」的宽 —— 值列因此对齐；短标签自己往右靠 */
+  text-align: right;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+}
+.ctx-row-body {
+  flex: 1 1 auto;
+  min-width: 0; /* 少了它 flex 项不肯缩到内容宽度以下：值会把行顶宽、也折不动 */
+  font-variant-numeric: tabular-nums; /* 数字位数会随流式刷新跳，等宽数字让浮层不左右抖 */
+}
+/* 口径说明那几行：比读数轻一档，且允许折行（它们本来就是整句）。
+   第一条前面拉一条分隔线 —— 不拉的话整块读起来是一团同质的灰字。
+   `+` 正好只命中紧跟在读数行后面那一条（`已压缩 N 次` 那种无标签行也是一条读数行）。 */
+.ctx-note {
+  padding: 2px 10px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--dsw-alias-label-dimmed, var(--vscode-descriptionForeground, #999));
+  white-space: normal;
+}
+.ctx-readout .lc-model-item + .ctx-note {
+  margin-top: 3px;
+  padding-top: 6px;
+  border-top: 1px solid var(--dsw-alias-border-l1, var(--vscode-dropdown-border, rgba(128, 128, 128, 0.25)));
 }
 /* C12：profile 钉住模型时，箭头槽位换小锁（.lc-model.pinned 由 chat.js 切）。
    默认 display:none ⇒ 没钉住时它一个像素都不占，三个钮的排布与加锁前完全一致。 */
@@ -1706,27 +1861,8 @@ body.react-live #empty-hint {
 }
 
 /* ---------- C9 运行检查器（本轮帧时间线：工具序列 / 轮·步·工具耗时） ---------- */
-/* 条：同 retry-bar 的体例（composer 内、两画面可见、右侧带按钮）。 */
-.runs-bar {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 6px 3px 10px;
-  border: 1px solid var(--dsw-alias-border-l2, var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.25)));
-  border-radius: 10px;
-  background: var(--dsw-alias-bg-layer-1, var(--vscode-editor-inactiveSelectionBackground, rgba(128, 128, 128, 0.12)));
-  font-size: 11px;
-}
-.runs-summary {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
-  /* 耗时逐帧刷新（12.4s → 12.5s），等宽数字让整行不左右抖（同 usage-summary） */
-  font-variant-numeric: tabular-nums;
-}
+/* 条本身（`.runs-bar` / `.runs-summary`）在 C21 里已并入 `.status-row` 的右半（见上），这里只剩浮层。
+   耗时逐帧刷新（12.4s → 12.5s），等宽数字那件事现在挂在 `.status-run` 上。 */
 /* 浮层底部的说明行（左对齐，与 .rp-actions 的右对齐按钮列区分开） */
 .runs-note {
   flex: 1 1 auto;

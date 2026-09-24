@@ -120,16 +120,33 @@
   var retryBar = document.getElementById('retry-bar');
   var retryBtn = document.getElementById('retry-btn');
 
-  // C3a 用量读数：扩展把整条 UsageReadout 算好下发，这里只格式化 + 填充。null = 无数据，整条隐藏。
-  var usageBar = document.getElementById('usage-bar');
-  var usageSummary = document.getElementById('usage-summary');
-  var usageState = null;
+  // C21 本轮读数**行**（原 C3a 用量条 + C9 运行条合并成一个节点）：C22 起这里**只剩右半** runs，
+  // 最右是「运行记录 ›」；左半那串用量/上下文搬去了配置条里的 `#ctx-ring`（见下面那块）。
+  // **这一行的 `hidden` 只有一个写入者**（renderStatusRow）—— 一旦拆成两个函数各写一次，
+  // 迟早出顺序 bug（C10b 那一型）。
+  var statusRow = document.getElementById('status-row');
+  var statusRun = document.getElementById('status-run');
+  var usageState = null; // UsageReadout；null = 无数据（内嵌聊天 / 刚切过来）
 
-  // C9 运行检查器：条（composer 内）+ 浮层（body 直系）。扩展下发摘要 + （面板开着时的）详情。
-  // 与 usage 的差别：harness 下**没跑过也显示**（「本轮尚无」），因为条是这个功能的入口；
-  // 内嵌聊天则 runsState 为 null → 整条隐藏（没有 DSH 帧，永远不会有内容）。
-  var runsBar = document.getElementById('runs-bar');
-  var runsSummary = document.getElementById('runs-summary');
+  // C22/C22b 上下文占用环：配置条里、模型钮与推理钮**之间**的第三个方块钮。数据源仍是 usageState，
+  // 弧长 = 占用比例；悬停出原来那一整串文字（一个字没丢），**点它开一个只读浮层**把同一份读数
+  // 分行列出来（C22b；键盘/读屏用户由此拿到那串说明，原生 title 聚焦是不弹的）。
+  // ⚠️ **它是按钮，但不是"要你动手"那一类**：浮层只读、没有可选项，所以它**不随 busy 禁用**
+  // （看读数什么时候都该能看，运行中正是最想看的时候），开跑时也不收起 —— 这两条与旁边三个
+  // "改配置"的钮**刻意不同**，别顺手对齐。
+  // ⚠️ 外观全从 `.tool-icon` 来（与推理/profile 钮同一份定义）—— 别在 chat.css 里给它写
+  // width/height/color/background/border，那等于又长出一套外观（探针有守卫）。
+  var ctxRing = document.getElementById('ctx-ring');
+  var ctxRingArc = document.getElementById('ctx-ring-arc');
+  var ctxRingWrap = document.getElementById('ctx-ring-wrap');
+  var ctxRingMenu = document.getElementById('ctx-ring-menu');
+  // 整圆周长 = 2πr（r = 6.5）。**必须与 chat.css 里 `.ctx-ring-arc` 的 stroke-dasharray 相等** ——
+  // 两处只改一处，环的画法就整体错位（探针有一条守卫专门钉这对常量）。
+  var CTX_RING_LEN = 40.84;
+
+  // C9 运行检查器：入口在读数行的右端，浮层是 body 直系。扩展下发摘要 + （面板开着时的）详情。
+  // 与 usage 的差别：harness 下**没跑过也显示**（右半写「本轮尚无」），因为浮层的入口不能等
+  // 第一轮跑完才出现；内嵌聊天则 runsState 为 null（没有 DSH 帧，永远不会有内容）。
   var runsViewBtn = document.getElementById('runs-view');
   var runsPanel = document.getElementById('runs-panel');
   var runsPanelSub = document.getElementById('runs-panel-sub');
@@ -746,11 +763,15 @@
       closeModelMenu(); // 切走 harness 时收起模型菜单
       closeEffortMenu();
       closeProfileMenu();
+      closeCtxMenu(); // C22b：整条配置条都藏了，读数浮层不能留在原地
     }
     liveConfigBar.hidden = !show;
   }
 
-  /** 运行在途（sending/runBusy）→ 模型 / 档位 / profile / API / DSH 配置一律禁改。 */
+  /**
+   * 运行在途（sending/runBusy）→ 模型 / 档位 / profile / API / DSH 配置一律禁改。
+   * ⚠️ **C22b 那枚读数环刻意不在此列**：它是只读的，忙时正是最该看见它的时候。
+   */
   function refreshLiveConfigEnabled() {
     var busy = sending || runBusy;
     liveModelBtn.disabled = busy;
@@ -760,6 +781,8 @@
       closeModelMenu(); // 开始运行了就把打开的菜单收起
       closeEffortMenu();
       closeProfileMenu();
+      // ⚠️ 刻意**不**收 ctxRingMenu：那三个菜单是"改配置"，跑起来就不该再改；读数浮层开着
+      // 看你自己的数字正是运行中的用法（C22b）。这里少一句是有意的，别当成漏了。
     }
     liveModelInput.disabled = busy;
     liveApiBtn.disabled = busy;
@@ -1180,15 +1203,14 @@
 
     refreshLiveConfigVisibility(); // 配置条仅 harness 常驻
     renderPending();
-    // C3a：先清读数。紧随其后的 snapshot 会带该模式的 usage 重新点亮（顺序有保证：
-    // mode-set 后必跟 snapshot）；没带就说明该模式无数据（内嵌聊天）→ 保持隐藏。
+    // C21/C22 两处读数一起清（配置条上的环 + 读数行）。紧随其后的 snapshot 会带该模式的
+    // usage / runs 重新点亮（顺序有保证：mode-set 后必跟 snapshot）；都没带就说明该模式无数据
+    // （内嵌聊天）→ 环与行都保持隐藏。
     usageState = null;
-    renderUsageBar();
-    // C9：运行读数同理。切到内嵌聊天时扩展不会带 runs → 整条隐藏（没有 DSH 帧，永远不会有内容）。
     runsState = null;
     runsDetails = null;
     closeRunsPanel();
-    renderRunsBar();
+    renderReadouts();
     // C6：检索态属于「上一条模式的历史」，必须整片清掉。不清的话 chat 模式搜出的命中会挂在
     // harness 面板上不动（切模式后紧跟的 snapshot 会 renderHistory()，而它按 historyQuery 分叉）。
     // searchSeq **不**归零（见变量声明处）。
@@ -1287,76 +1309,258 @@
   }
 
   /**
-   * 整条重绘读数条。usageState 为 null（内嵌聊天 / 旧会话 / 该轮无样本）时整条隐藏。
+   * 画配置条上那枚**上下文占用环**（C22；原来画读数行左半的 paintUsage）。
+   *
+   * **文案一个字都没丢**：C21 那行字整段搬进 `title`（第一行还是那串单行文案，后面还是那几段
+   * 口径说明），只是从"占一行"变成"悬停才出"。另外补一句短话给读屏（`aria-label`）。
+   *
+   * ⚠️ **C22b 起，`title` 与浮层是同一个数组派生的两处**：`rows`（{label, body}）+ `notes`。
+   * 单行文案 = `rows` 按 ` · ` 拼起来；浮层 = 同一份 `rows` 分行 + 同一份 `notes`。
+   * **不许另起一套拼装** —— 那必然漂移（今天改一个数、明天忘一处），探针有一条专抓这件事。
+   *
+   * ⚠️ **C22c 起这枚环没有 `hidden` 了**（C22 那条"一段都拼不出来就整个藏掉"被用户推翻）：
+   * 一条用量都没有时**照样显示**，只是弧为空、读作 0 —— 新建对话正是这个样子，而"一个控件在
+   * 新建对话里凭空消失、发了第一句话才冒出来"本身就是个疑点。空态由**一行读数**说清楚
+   * （「本轮尚无用量」+ 一句"数从第一次请求开始记"），**不写数字 0**：`usageState` 为空既可能是
+   * "刚新建"（那真的是 0），也可能是"这个会话我们拼不出读数"（那是**未知**），写成 `↑0 ↓0`
+   * 会把后一种说成前一种。所以——**环读作 0，话说成"尚无"**。
+   * 既然没有"回头再藏"这条路，C22b 那条"藏之前先关浮层"也就不再需要了；浮层如今唯一的
+   * 收敛点是 `refreshLiveConfigVisibility`（切走 harness 时整条配置条藏起来，见那里的调用）。
+   *
+   * ⚠️ **没有 context 段时环仍然显示、只是不画弧**：因为「已压缩 N 次」是 C10 特意留在条上的
+   * 持久提醒（压缩说明会随转写滚走，条上这段才常在），把整环藏掉会把它一起带走。
+   * 代价是一个空环既可能是 0%、也可能是"不知道" —— 浮层与悬浮信息里**根本没有「上下文」那一行**，
+   * 读屏听到的是「暂无数据」（`aria-label`），两处都分辨得出来。
+   *
    * 文案形如：本轮 ↑11.8K ↓948 · 缓存 97% · 累计 ↑58.2K ↓4.1K · 上下文 2.8K / 1M
    * ↑ = 计费输入（未命中 + 缓存读），↓ = 输出（已含 reasoning，勿另加）。
    * 上下文用绝对值打底：1M 窗口下百分比长期是 0.x%，主显百分比等于常驻「0%」。
    */
-  function renderUsageBar() {
-    var u = usageState;
-    if (!u) {
-      usageBar.hidden = true;
-      usageSummary.textContent = '';
-      usageSummary.title = '';
-      return;
-    }
-    var parts = [];
+  function paintContextRing() {
+    var u = usageState || {}; // 空态（新建对话 / 拼不出读数）也走同一条路，见函数头那条 C22c
+    var freshCtx = u.context;
+    var freshNear = !!(freshCtx && freshCtx.state === 'near');
+    // ⚠️ 两个状态类必须在**任何一条分支之前**无条件重算 —— 藏在返回路径后面的 add/remove
+    // 一定会漏。漏法是这样的：读数是 near，然后来一条拼不出任何一段的样本 ⇒ `.near` 还留在
+    // 身上，下一份读数亮起来就带着一个没人注意到的旧警示色（C10b 就是这么漏的，探针有专走
+    // 这条路的一条）。C22c 之后早退没了，但这条规矩照旧：**先重算，再谈画什么**。
+    if (freshNear) ctxRing.classList.add('near');
+    else ctxRing.classList.remove('near');
+    if (freshCtx && freshCtx.stale) ctxRing.classList.add('stale');
+    else ctxRing.classList.remove('stale');
+    // rows / notes 是这一份读数的**唯一真相**：`title` 与浮层都从它们派生（见函数头）——
+    // 别再往下写第二套拼装，那必然与这两处漂移。
+    var rows = [];
+    var notes = [];
     var t = u.turn;
     if (t && (t.inputTokens || t.cacheReadTokens || t.outputTokens)) {
       var billedIn = t.inputTokens + t.cacheReadTokens;
-      var seg = '本轮 ↑' + fmtTokens(billedIn) + ' ↓' + fmtTokens(t.outputTokens);
+      var seg = '↑' + fmtTokens(billedIn) + ' ↓' + fmtTokens(t.outputTokens);
       var hit = fmtPercent(t.cacheReadTokens, billedIn);
       if (hit !== null) seg += ' · 缓存 ' + hit + '%';
-      parts.push(seg);
+      rows.push({ label: '本轮', body: seg });
     }
     var s = u.session;
     if (s && (s.inputTokens || s.cacheReadTokens || s.outputTokens)) {
-      parts.push(
-        '累计 ↑' + fmtTokens(s.inputTokens + s.cacheReadTokens) + ' ↓' + fmtTokens(s.outputTokens)
-      );
+      rows.push({
+        label: '累计',
+        body: '↑' + fmtTokens(s.inputTokens + s.cacheReadTokens) + ' ↓' + fmtTokens(s.outputTokens),
+      });
     }
-    var ctx = u.context;
-    var near = !!(ctx && ctx.state === 'near');
-    if (ctx && ctx.contextWindow > 0) {
-      var seg2 = '上下文 ' + fmtTokens(ctx.usedTokens) + ' / ' + fmtTokens(ctx.contextWindow);
-      var pct = fmtPercent(ctx.usedTokens, ctx.contextWindow);
-      if (pct !== null && pct >= 1) seg2 += '（' + pct + '%）';
+    var ctx = freshCtx;
+    var near = freshNear;
+    // 「能不能画弧」与「有没有 context 段」是同一件事：窗口非正就不画（fmtPercent 同一条口径）。
+    var drawable = !!(ctx && ctx.contextWindow > 0);
+    // drawable 已经保证分母为正 ⇒ fmtPercent 必不返回 null（它只对 whole<=0 返回 null），不用兜。
+    var pct = drawable ? fmtPercent(ctx.usedTokens, ctx.contextWindow) : null;
+    if (drawable) {
+      var seg2 = fmtTokens(ctx.usedTokens) + ' / ' + fmtTokens(ctx.contextWindow);
+      if (pct >= 1) seg2 += '（' + pct + '%）';
       // C10：这两个后缀**并列**，不是 else if —— 「上次」说的是这份读数有多旧，
       // 「接近压缩阈值」说的是它的量级，两者可以同时成立（旧会话 + 已接近上限）。
       if (ctx.stale) seg2 += ' · 上次';
       if (near) seg2 += ' · ⚠ 接近压缩阈值';
-      parts.push(seg2);
+      rows.push({ label: '上下文', body: seg2 });
     }
-    if (u.compacted > 0) parts.push('已压缩 ' + u.compacted + ' 次');
-    if (!parts.length) {
-      usageBar.hidden = true;
-      usageSummary.textContent = '';
-      usageSummary.title = '';
-      usageBar.classList.remove('near');
-      return;
+    // 这一行没有 label：文案本身就是「已压缩 3 次」，拆成「压缩 / 3 次」会改掉 `title` 的字面
+    // （探针有一条逐字断言）。ctxRowText 对空 label 就是原样返回 body。
+    if (u.compacted > 0) rows.push({ label: '', body: '已压缩 ' + u.compacted + ' 次' });
+    // 空态（C22c）：环照常在，所以这里**不是**"藏起来"，而是**明说没有**。这一行也走 rows，
+    // 于是 `title` 第一行、浮层那一行、读屏那一句仍然是同一个来源，没有第二套拼装。
+    if (rows.length) {
+      // title 给全量（不再有省略号截断的问题，但多行全量本来就比一行清楚）+ 口径说明。
+      notes.push('↑ 计费输入（未命中 + 缓存读）· ↓ 输出（含 reasoning）· 缓存 = 缓存读占输入比');
+    } else {
+      rows.push({ label: '', body: '本轮尚无用量' });
+      notes.push('第一次请求跑完就有数了 —— 本轮 / 累计 / 占用都从那时起记。');
     }
-    var line = parts.join(' · ');
-    // title 给全量（含被 ellipsis 截掉的中段）+ 口径说明：读数条窄，侧栏一窄就截。
-    var title =
-      line + '\n↑ 计费输入（未命中 + 缓存读）· ↓ 输出（含 reasoning）· 缓存 = 缓存读占输入比';
+    // stale / near 都以"有 context 段"为前提 ⇒ 空态下必然是 false，不必再包一层。
     if (ctx && ctx.stale) {
-      title += '\n「上次」= 这份占用不是本轮的实时值，而是上一次跑完时留下的样本。';
+      notes.push('「上次」= 这份占用不是本轮的实时值，而是上一次跑完时留下的样本。');
     }
     if (near) {
       // 口径必须诚实：我们的分子与 DSH 的判据不是同一个数（详见 src/protocol.ts 的 UsageReadout）。
       // 所以这里只说「接近」，**不说**「距离压缩线还有 X」。
-      title +=
-        '\n⚠ 上下文已接近 DSH 的压缩阈值：再往上，DSH 可能把一段旧事件折叠成摘要' +
-        '（有损、不可撤销；真发生时转写里会留一条说明）。\n' +
-        '注意：这里的占用率按 provider 上报的输入算，DSH 的压缩判据是它自己的估算，两者不是同一个数。';
+      notes.push(
+        '⚠ 上下文已接近 DSH 的压缩阈值：再往上，DSH 可能把一段旧事件折叠成摘要' +
+          '（有损、不可撤销；真发生时转写里会留一条说明）。\n' +
+          '注意：这里的占用率按 provider 上报的输入算，DSH 的压缩判据是它自己的估算，两者不是同一个数。'
+      );
     }
-    usageSummary.title = title;
-    usageSummary.textContent = line;
-    // 用 add/remove 而不是 classList.toggle(cls, force) —— 后者在 DOM 影子里要额外支持 force 参数，
-    // 而这行代码没有任何理由依赖那个细节。
-    if (near) usageBar.classList.add('near');
-    else usageBar.classList.remove('near');
-    usageBar.hidden = false;
+    var title = [rows.map(ctxRowText).join(' · ')].concat(notes).join('\n');
+    ctxRing.title = title;
+    // 浮层每帧整份重建（不管开没开）—— 理由见 paintCtxReadout 的注释。
+    paintCtxReadout(rows, notes);
+    // 弧长 = 占用比例。两端都要夹：usedTokens 可能超过 contextWindow（分母是 DSH 的估算、
+    // 分子是 provider 实测的），不夹的话 offset 变负数，弧会反着绕出去一整圈。
+    // `!(ratio > 0)` 一并吃掉 NaN / 负数（字段缺失时不该往 DOM 里写一个 "NaN"）。
+    var ratio = drawable ? ctx.usedTokens / ctx.contextWindow : 0;
+    if (!(ratio > 0)) ratio = 0;
+    if (ratio > 1) ratio = 1;
+    // 两位小数够了（0.01px 的偏移没人看得见），也免得 "10.210000000000001" 那种串进 DOM。
+    var offset = Math.round(CTX_RING_LEN * (1 - ratio) * 100) / 100;
+    ctxRingArc.setAttribute('stroke-dashoffset', String(offset));
+    // 弧长为 0（占用 0%，或压根没有 context 段）时把弧**整个收起来**：
+    // `stroke-linecap: round` 在零长弧上会留下一个圆头，那在 0% 处看起来像已经用了 5%
+    // —— 一个 5% 的谎比不画更糟。
+    ctxRingArc.hidden = !(ratio > 0);
+    // aria-label 是**短话**，不是 title 那段多行说明：读屏会把它一次念完，
+    // 念十行口径说明等于把整条工具栏变成噪音。给键盘/读屏用户的**是同一份判据**，只是更短。
+    var aria = drawable
+      ? '上下文占用 ' +
+        pct +
+        '%（' + fmtTokens(ctx.usedTokens) + ' / ' + fmtTokens(ctx.contextWindow) + '）'
+      : '上下文占用：暂无数据';
+    if (ctx && ctx.stale) aria += '，这是上次的读数';
+    if (near) aria += '，接近压缩阈值';
+    ctxRing.setAttribute('aria-label', aria);
+  }
+
+  /**
+   * 一行读数的单行文案。**`title` 的第一行与浮层的逐行都由这一个函数拼**（C22b）——
+   * 空 label 就是原样返回 body（「已压缩 N 次」那一行没有 label）。
+   */
+  function ctxRowText(r) {
+    return r.label ? r.label + ' ' + r.body : r.body;
+  }
+
+  /**
+   * 把读数画进浮层（C22b）：`rows` 每行一条 `.lc-model-item`（左 label、右 body），
+   * 再把 `notes` 逐行铺成 `.ctx-note`。
+   *
+   * ⚠️ **参数就是 `paintContextRing` 里那两份数组本身**，不是另拼的一份 —— 这是"一个数组派生两处"
+   * 的落实点（探针拿 `title` 第一行按 ` · ` 切开、逐段与浮层行对拍，另拼一处立刻被抓）。
+   *
+   * ⚠️ **一条 note 里的 `\n` 要拆成多行**（「接近阈值」那条本来就是两段）：拆开之后浮层的
+   * 文本行与 `title` 去掉第一行之后的那些行**逐一对应**。
+   *
+   * ⚠️ **每帧都整份重建，不管浮层开没开**：数字在流式过程中一直在涨，而"开着才画"会多出一条
+   * 只在特定状态下才跑的路 —— 那正是 C10b 漏掉分母的形状。代价是每帧十来个 textContent，
+   * 与整个转写重建比可忽略（已如实记进 backlog）。
+   */
+  function paintCtxReadout(rows, notes) {
+    ctxRingMenu.textContent = ''; // 清空旧内容（webview 里只用 textContent / createElement，绝不 innerHTML）
+    rows.forEach(function (r) {
+      var row = document.createElement('div');
+      row.className = 'lc-model-item ctx-row';
+      if (r.label) {
+        var lab = document.createElement('span');
+        lab.className = 'ctx-row-label';
+        lab.textContent = r.label;
+        row.appendChild(lab);
+      }
+      var body = document.createElement('span');
+      body.className = 'ctx-row-body';
+      body.textContent = r.body;
+      row.appendChild(body);
+      ctxRingMenu.appendChild(row);
+    });
+    notes.forEach(function (n) {
+      n.split('\n').forEach(function (ln) {
+        var el = document.createElement('div');
+        el.className = 'ctx-note';
+        el.textContent = ln;
+        ctxRingMenu.appendChild(el);
+      });
+    });
+  }
+
+  /**
+   * 点环：开/关只读浮层（C22b）。内容由 `paintContextRing` 每帧画好，这里只翻 `.open`。
+   *
+   * ⚠️ **与旁边三个钮刻意不同的第一处：这里没有 `if (ctxRing.disabled) return`。**
+   * 改模型 / 档位 / profile 都会重启或改配置，所以忙时禁点（`refreshLiveConfigEnabled`）；
+   * **看读数什么时候都该能看**，运行中恰恰是最想看它的时候。环也就不进那份禁用名单，
+   * 开跑时那条"收起所有菜单"也不收它（探针有一条守着这件事）。
+   */
+  function toggleCtxMenu() {
+    if (ctxRingMenu.classList.contains('open')) {
+      closeCtxMenu();
+      return;
+    }
+    // 同一排浮层只留一个开着的：开它时把另外三个收掉（与它们互相之间的做法一致）
+    closeModelMenu();
+    closeEffortMenu();
+    closeProfileMenu();
+    ctxRingMenu.classList.add('open');
+    ctxRing.classList.add('open');
+  }
+
+  function closeCtxMenu() {
+    ctxRingMenu.classList.remove('open');
+    ctxRing.classList.remove('open');
+  }
+
+  /**
+   * 画读数**行**上的运行摘要（C9）：写 statusRun 的文案与 title，返回「有没有内容」。
+   * 与配置条上那枚环的关键差别：**harness 下没跑过也算有内容**（写「本轮尚无」）—— 行尾那个入口是
+   * 运行浮层唯一的路，藏起来等于没人找得到。空读数只说「本轮尚无」：入口自己就叫「运行记录」，
+   * 这里再说一遍是重复（老版这一句是「运行记录 · 本轮尚无」，因为那时右端按钮写的是「查看」）。
+   * ⚠️ 它**不碰 `hidden`** —— 行的显隐只有一个写入者（renderStatusRow）。
+   */
+  function paintRuns() {
+    var st = runsState;
+    statusRun.textContent = '';
+    statusRun.title = '';
+    if (!st) return false;
+    var runs = st.runs || [];
+    var cur = runs.length ? runs[0] : null;
+    // 留着历史的轮次时，「本轮」会被读成「我屏幕上那条对话」；它其实只是**最新**那一轮
+    var line = cur ? runLine(cur, runs.length > 1 ? '最新一轮' : '本轮') : '本轮尚无';
+    statusRun.textContent = line;
+    // title 给全量 + 口径：侧栏一窄，行尾就被 ellipsis 吃掉
+    statusRun.title =
+      line +
+      (runs.length > 1 ? '\n最近 ' + runs.length + ' 轮' : '') +
+      '\n只在内存里，重载窗口即清空 · 点「运行记录」看完整时间线';
+    return true;
+  }
+
+  /**
+   * 重绘读数**行**（C22 起它只有右半：运行摘要 + 右端「运行记录 ›」；上下文那半在环上）。
+   *
+   * **它是这一行 `hidden` 的唯一写入者** —— paintRuns 只管文案，不碰显隐：一行只有一个可见性，
+   * 两个写入者迟早互相盖（C10b 那一型的形状）。
+   * 判据：右半有内容就显示。**没跑过也算有内容** —— harness 下运行读数从没跑过也下发
+   * （`{runs: []}` ⇒ 写「本轮尚无」），因为运行浮层的入口不能等第一轮跑完才出现；
+   * 内嵌聊天 runsState 为 null（`_runsReadout` 返回 undefined）⇒ 隐藏。
+   */
+  function renderStatusRow() {
+    statusRow.hidden = !paintRuns();
+  }
+
+  /**
+   * 重绘 composer 上的**两处读数**：配置条里的上下文环 + 那一行运行读数。
+   *
+   * 为什么要有这个入口：`usage` 消息只驱动环、`runs` 消息只驱动行，这没错；但**快照与切模式**
+   * 必须让两处按新会话的数据**一起**重放（漏一处就会带着上个会话的数字留在屏上）。
+   * 把"一起重绘"收成一个名字，免得将来又多一个调用点、只写了其中一个。
+   * ⚠️ 这里只是调用顺序的集合，不是第三个写入者 —— 别再往这个函数里直接写 `hidden`。
+   * （C22c 起环连 `hidden` 都没有了；那一行读数仍是 `renderStatusRow` 一个人写。）
+   */
+  function renderReadouts() {
+    paintContextRing();
+    renderStatusRow();
   }
 
   // ---------- C9 运行检查器 ----------
@@ -1446,33 +1650,6 @@
       if (c.toolUnknown > 0) line += ' · ' + c.toolUnknown + ' 结果未知';
     }
     return line;
-  }
-
-  /**
-   * 整条重绘运行条。runsState 为 null（内嵌聊天 / 切模式前）时整条隐藏。
-   *
-   * 与 usage-bar 的关键差别：**harness 下没跑过也显示**（「本轮尚无」）—— 条是这个功能的入口，
-   * 藏起来等于没人找得到。
-   */
-  function renderRunsBar() {
-    var st = runsState;
-    if (!st) {
-      runsBar.hidden = true;
-      runsSummary.textContent = '';
-      runsSummary.title = '';
-      return;
-    }
-    var runs = st.runs || [];
-    var cur = runs.length ? runs[0] : null;
-    // 留着历史的轮次时，「本轮」会被读成「我屏幕上那条对话」；它其实只是**最新**那一轮
-    var line = cur ? runLine(cur, runs.length > 1 ? '最新一轮' : '本轮') : '运行记录 · 本轮尚无';
-    runsSummary.textContent = line;
-    // title 给全量 + 口径：侧栏一窄，行尾就被 ellipsis 吃掉
-    runsSummary.title =
-      line +
-      (runs.length > 1 ? '\n最近 ' + runs.length + ' 轮' : '') +
-      '\n只在内存里，重载窗口即清空 · 点「查看」看完整时间线';
-    runsBar.hidden = false;
   }
 
   function openRunsPanel() {
@@ -2987,11 +3164,16 @@
     liveProfileBtn.addEventListener('click', function () {
       toggleProfileMenu();
     });
+    // C22b 上下文占用环：同款触发钮 + **只读**浮层（内容由 paintContextRing 每帧画好）
+    ctxRing.addEventListener('click', function () {
+      toggleCtxMenu();
+    });
     document.addEventListener('click', function (e) {
-      // 三个菜单各自判断"点在外面"：一个处理函数里连判三次，比注册三条互不知情的监听器稳
+      // 四个菜单各自判断"点在外面"：一个处理函数里连判四次，比注册四条互不知情的监听器稳
       if (liveModelMenu.classList.contains('open') && !liveModelWrap.contains(e.target)) closeModelMenu();
       if (liveEffortMenu.classList.contains('open') && !liveEffortWrap.contains(e.target)) closeEffortMenu();
       if (liveProfileMenu.classList.contains('open') && !liveProfileWrap.contains(e.target)) closeProfileMenu();
+      if (ctxRingMenu.classList.contains('open') && !ctxRingWrap.contains(e.target)) closeCtxMenu();
     });
     liveModelInput.addEventListener('keydown', function (e) {
       if (e.key === 'Enter') {
@@ -3214,6 +3396,10 @@
         closeEffortMenu();
         return;
       }
+      if (ctxRingMenu.classList.contains('open')) { // C22b 读数浮层：与另外三个菜单同一层，紧随其后
+        closeCtxMenu();
+        return;
+      }
       if (reviewPanelOpen) {
         closeReviewPanel();
         return;
@@ -3277,16 +3463,14 @@
         // 用户看到的是「删一条，搜索结果就没了」。
         requestSearch(true);
         renderHistory();
-        // C3a：读数随快照整帧重放（切会话/切模式/重开窗口）。没带就是真没有 → 藏起来，
-        // 免得带着上个会话的数字留在条上。
+        // C21/C22 两处读数随快照整帧重放（切会话/切模式/重开窗口）。没带就是真没有 → 那一处清空，
+        // 都空则环与行都隐藏，免得带着上个会话的数字留在屏上。
+        // ⚠️ 两个字段名**不一样**：快照带 `runs`，流式 `runs` 消息带 `readout`（见下面那个 case）。
         usageState = data.usage || null;
-        renderUsageBar();
-        // C9：运行读数随快照整帧重放。**并收起浮层** —— 面板内容是会话级的，
-        // 跨会话残留一份别人的时间线就是谎报（切回来时再点开即可，记录还在环里）。
         runsState = data.runs || null;
         runsDetails = null;
-        closeRunsPanel();
-        renderRunsBar();
+        closeRunsPanel(); // 面板内容是会话级的，跨会话残留一份别人的时间线就是谎报
+        renderReadouts();
         // react-live：把最新整幅消息中继给真 ChatView 作回放前缀（重建/切会话/清空/删除）。
         // 扩展不再直发 dsh-replay——快照可能早于 React 挂载，统一由此处按较晚者补发。
         lastSnapshotMessages = data.messages;
@@ -3294,17 +3478,18 @@
         break;
 
       case 'usage':
-        // C3a：每个 usage 样本一条 + 轮尾定稿一条，整条重绘（数据由扩展算好，这里只格式化）。
+        // C3a/C22：每个 usage 样本一条 + 轮尾定稿一条，重绘那枚环（数据由扩展算好，这里只格式化）。
         usageState = data.usage || null;
-        renderUsageBar();
+        paintContextRing();
         break;
 
       case 'runs':
         // C9：每条**被记录的**帧一条（chunk 帧一条都不发，这是全部的体积故事）。
         // `details` 只在浮层开着时才有 —— 没带就别拿新的把旧的冲掉，否则每收一帧详情就空一次。
+        // ⚠️ 这条消息的字段名是 `readout`（快照那条是 `runs`），别顺手统一。
         runsState = data.readout || null;
         if (data.details) runsDetails = data.details;
-        renderRunsBar();
+        renderStatusRow();
         if (runsPanelOpen) renderRunsPanel();
         break;
 
