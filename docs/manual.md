@@ -1,6 +1,6 @@
 # AlohaDSH manual
 
-Full documentation for **AlohaDSH**. The landing page is [README.md](../README.md) (English) · [README.zh-CN.md](../README.zh-CN.md) (简体中文).
+Full documentation for **AlohaDSH**. The landing page is [README.md](../README.md) (简体中文) · [README.en.md](../README.en.md) (English).
 
 ---
 
@@ -488,8 +488,8 @@ clock time that number was fetched).
   `stale` on the ring above.
 - **It is not disabled while a run is in flight either** (same reasoning as the ring): a running turn
   is exactly when you want to look at it.
-- **Close the panel, or switch to embedded chat, and the 5-minute timer stops.** With no key
-  configured, **not a single request is sent.**
+- **Close the panel and the 5-minute timer stops.** With no key configured, **not a single request is
+  sent.**
 
 ### Where the model menu gets its options
 
@@ -564,6 +564,10 @@ You do **not** need the bundle to use Harness.
 ---
 
 ## 内嵌聊天 (Embedded chat)
+
+> **Not exposed in this release.** The mode button at the top is hidden and the panel stays in
+> Harness; this section describes the pathway **itself** (the code, storage and rendering are all
+> kept, so opening it up again is just restoring the entry point).
 
 A small unfinished mode kept as a sandbox for the streaming/render pipeline (typewriter bubbles,
 cursor, stop button, attachments, per-mode drafts/history). Its replies are **built-in canned text** —
