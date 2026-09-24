@@ -342,6 +342,15 @@ export type ExtToWebview =
       /** C12：有工作区（才有 profile 文件可谈）；没有时整个菜单置灰 */
       profileAvailable: boolean;
     }
+  /** C23：配置条上那枚「余额：¥28.70」读数。
+   *
+   *  **文案（`text`，含 `余额：` 前缀）与明细（`title`，多行）都在扩展侧拼好** ——
+   *  同 C15 的分工线：判据（金额解析、币种符号、失败种类、陈旧）在 `src/deepseekApi.ts` 里，
+   *  webview 只负责 `textContent` 与 `title`，一个字都不自己拼。
+   *
+   *  ⚠️ 这里进出的只有金额、时刻、人话；**API key 与接口正文一概不进这条消息**
+   *  （正文要进也只以 `sanitize()` 过的形式出现在 title 里）。 */
+  | { type: 'live-balance'; text: string; title: string; stale: boolean }
   /** 2.1：本轮 DSH 改动审阅（一轮 done 后推送整份；新一轮开始时清空/隐藏） */
   | { type: 'review-set'; changes: ReviewChange[] }
   /** 2.1：清空并隐藏审阅条与面板（新一轮开始 / 模式切换 / 全部处理完） */
@@ -480,4 +489,7 @@ export type WebviewToExt =
    *  不是漏了。 */
   | { type: 'compare-open' }
   /** C15：换某一侧的会话。`side` 只有两侧（`'a'` 左 / `'b'` 右）—— 不做第三栏。 */
-  | { type: 'compare-pick'; side: 'a' | 'b'; sessionId: string };
+  | { type: 'compare-pick'; side: 'a' | 'b'; sessionId: string }
+  /** C23：点「余额」⇒ 立刻重查一次（余额 + 模型列表）。**扩展侧有在途闸**，
+   *  连点不会叠发；它**不**参与 busy 判定（只读读数，见 `chat.js` 里那句注释）。 */
+  | { type: 'refresh-balance' };

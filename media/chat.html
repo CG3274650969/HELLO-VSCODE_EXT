@@ -296,6 +296,13 @@
                   title="引导式配置 DSH 运行路径（node / 入口 / 工作目录 / tsconfig / config，保存到用户设置）">配置 DSH</button>
           <button id="live-api-btn" class="link-button lc-api" type="button"
                   title="配置 DEEPSEEK_API_KEY（保存到 VS Code SecretStorage，回退读取 ~/.dsh/.credentials.yaml）">API</button>
+          <!-- C23 余额读数：只读，点一下刷新；**不挂状态点** —— 状态由文字自己说（¥28.70 / … / —），
+               再点一个红绿点就是同一件事喊两次（C22b 的判据）。静态那行字只在"新 webview + 老扩展"
+               时会真的露面，所以 title 写的是**永远为真**的一句话，不写"正在加载"这种会过期的文案。
+               ⚠️ 整串字（含「余额：」前缀）由扩展下发后**平铺写进 textContent**，不塞子元素 ——
+               影子 DOM 的 textContent 不含子节点，塞了会让探针的逐字断言与真机不是一回事。 -->
+          <button id="live-balance-btn" class="link-button lc-balance" type="button"
+                  title="查询 DeepSeek 账户余额（点一下刷新；连接时与新建对话时各查一次，之后每 5 分钟一次）">余额：—</button>
         </div>
         <span class="toolbar-actions">
           <span id="composer-hint" class="composer-hint" aria-hidden="true">Enter 发送 · ⇧ 换行</span>

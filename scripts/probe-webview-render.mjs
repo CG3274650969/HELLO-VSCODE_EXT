@@ -2707,6 +2707,137 @@ check('C17 CSS 守卫：图片 chip 那两枚小标走的是 dsh-live.css 里真
   ok(!/display:/.test(scope), '.chip-dim 里写了 display');
 });
 
+// ---------- C23 · 余额读数（配置条「API」钮右边那枚） ----------
+//
+// 判据分两半，与这条功能的实际风险对齐：
+//   · **四档文案逐字**：正文与明细都由扩展侧算好（`src/deepseekApi.ts`），webview 一个字不拼 ——
+//     所以这里能断言"载荷里写什么，钮上就是什么"，包括那个 `余额：` 前缀；
+//   · **外形与旁边三个钮的关系**：它是文字钮（外观全从 `.link-button` 来）、不挂状态点、
+//     busy 时不禁用。这三条都是"刻意的差异"，不留守卫就会被下一个人顺手统一掉。
+
+check('C23 四档读数逐字上屏：正文照抄（含「余额：」前缀）、title 照抄、stale 落到类上', () => {
+  const btn = $('live-balance-btn');
+  ok(btn, '影子/HTML 里没有 #live-balance-btn');
+  send({ type: 'live-balance', text: '余额：¥28.70', title: 'CNY：总额 ¥28.70 · 赠送 ¥8.70 · 充值 ¥20.00\n更新于 12:03', stale: false });
+  eq(btn.textContent, '余额：¥28.70', '有余额那一档的正文不对');
+  eq(btn.title, 'CNY：总额 ¥28.70 · 赠送 ¥8.70 · 充值 ¥20.00\n更新于 12:03', 'title 没逐字照抄（webview 不许自己拼明细）');
+  eq(btn.classList.contains('stale'), false, '成功档被标成了陈旧');
+
+  send({ type: 'live-balance', text: '余额：…', title: '正在查询余额…', stale: false });
+  eq(btn.textContent, '余额：…', '在途档的正文不对');
+
+  send({ type: 'live-balance', text: '余额：—', title: '网络不可达 —— 点一下重试', stale: false });
+  eq(btn.textContent, '余额：—', '查不到那一档的正文不对');
+  eq(btn.title, '网络不可达 —— 点一下重试', '查不到那档的 title 不对');
+
+  send({ type: 'live-balance', text: '余额：—', title: '未配置 DEEPSEEK_API_KEY —— 点「API」配置后会自动查询余额', stale: false });
+  ok(/未配置 DEEPSEEK_API_KEY/.test(btn.title), '未配 key 那档没给出路');
+});
+
+check('C23 陈旧档：值照留、只压淡并标 stale（擦成「—」等于丢掉已知信息）', () => {
+  const btn = $('live-balance-btn');
+  send({
+    type: 'live-balance',
+    text: '余额：¥28.70',
+    title: 'CNY：总额 ¥28.70\n更新于 12:03\n最近一次查询失败：网络不可达',
+    stale: true,
+  });
+  eq(btn.textContent, '余额：¥28.70', '陈旧档把上次数值擦掉了');
+  eq(btn.classList.contains('stale'), true, '没标陈旧 —— 那用户会以为这是此刻的数');
+  send({ type: 'live-balance', text: '余额：¥30.00', title: '更新于 12:08', stale: false });
+  eq(btn.classList.contains('stale'), false, '刷新成功后陈旧标记没摘掉');
+});
+
+check('C23 点一下 ⇒ 恰好一条 refresh-balance（不叠发、不带参数）', () => {
+  posted.length = 0;
+  $('live-balance-btn').click();
+  eq(posted.length, 1, '点一下该只发一条消息');
+  eq(posted[0].type, 'refresh-balance', `发的不是 refresh-balance：${posted[0].type}`);
+  eq(Object.keys(posted[0]).length, 1, '这条消息不该带任何参数（金额、key 都不许从这里过）');
+  posted.length = 0;
+});
+
+check('C23 运行中（busy）余额钮**不禁用**、点了照发 —— 与旁边三个钮刻意的差异', () => {
+  send({ type: 'run-busy', busy: true });
+  eq($('live-api-btn').disabled, true, '前提不成立：忙碌时 API 钮没灰');
+  eq($('live-balance-btn').disabled, false, '忙时把只读的余额钮也禁用了 —— 它不重启子进程、不改配置');
+  posted.length = 0;
+  $('live-balance-btn').click();
+  eq(posted.length, 1, '忙时点余额钮没反应（那就是把它也禁用了）');
+  send({ type: 'run-busy', busy: false });
+  eq($('live-balance-btn').disabled, false, '跑完了余额钮还灰着');
+  posted.length = 0;
+});
+
+check('C23 模型菜单由 live-config.models 驱动：远端几个就画几行，末尾仍是「自定义模型…」', () => {
+  // 远端 id **刻意不叫 deepseek-***：webview 若自作主张按前缀过滤，这一条就红
+  const remote = ['m-remote-alpha', 'm-remote-beta', 'deepseek-chat', 'm-remote-gamma'];
+  send({
+    type: 'live-config',
+    model: 'm-remote-beta',
+    models: remote,
+    apiConfigured: true,
+    dshConfigured: true,
+    effort: null,
+    efforts: ['off'],
+    effortThinkingDisabled: false,
+  });
+  const rows = childWithClass($('live-model-menu'), 'lc-model-item');
+  eq(rows.length, remote.length + 1, `菜单行数不对（远端 ${remote.length} 条 + 自定义 1 条）`);
+  for (const id of remote) {
+    ok(rows.some((r) => hasText(r, id)), `菜单里没有远端模型 ${id}`);
+  }
+  ok(hasText($('live-model-menu'), '自定义模型…'), '末尾的「自定义模型…」不见了');
+  ok(/m-remote-beta/.test($('live-model-label').textContent), '触发钮没跟着当前模型走');
+});
+
+check('C23 结构守卫：余额钮是 `.link-button lc-balance` 文字钮、在 API 钮**之后**、不挂方块钮的类', () => {
+  const html = readFileSync(join(repoRoot, 'media', 'chat.html'), 'utf8');
+  const at = html.indexOf('id="live-balance-btn"');
+  ok(at > 0, 'chat.html 里没有 #live-balance-btn');
+  const tag = html.slice(html.lastIndexOf('<button', at), html.indexOf('>', at) + 1);
+  const cls = classOf(tag);
+  ok(cls.includes('link-button'), '没走 .link-button —— 那就成了配置条里第三套外观');
+  ok(cls.includes('lc-balance'), '缺自带类 `.lc-balance`');
+  for (const bad of ['tool-icon', 'lc-knob']) {
+    ok(!cls.includes(bad), `挂上了 ${bad} —— 那是方块图标钮的类，与「API / DSH」两颗不同款`);
+  }
+  ok(html.indexOf('id="live-api-btn"') < at, '余额钮没排在 API 钮之后（用户说的是「API 钮旁边」）');
+  // 静态初值只该是那一串「余额：—」；写别的（比如「正在加载」）会在新 webview + 老扩展时变成假话
+  ok(/>余额：—</.test(html.slice(at, at + 600)), 'HTML 里的静态初值不是「余额：—」');
+});
+
+check('C23 CSS 守卫：`.lc-model-menu` 有高度上限**且**能滚（只写上限定死内容，比没有上限更坏）', () => {
+  const css = readFileSync(join(repoRoot, 'media', 'chat.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  const block = css.slice(css.indexOf('.lc-model-menu {'));
+  const scope = block.slice(0, block.indexOf('}'));
+  const mh = /max-height\s*:\s*([^;]+);/.exec(scope);
+  ok(mh, '.lc-model-menu 没有 max-height —— 远端列表几十条会把整张卡片顶出去');
+  ok(mh[1].trim() !== 'none', 'max-height 写成了 none（等于没有上限）');
+  // 卡**关系**不卡数值（C21b 的教训）：上限得跟着视口走，不是某个写死的 px
+  ok(/vh/.test(mh[1]), `max-height 是写死的量（${mh[1].trim()}）—— 面板是用户拖出来的，矮面板下照样顶出去`);
+  ok(/overflow-y\s*:\s*auto/.test(scope), '只给了 max-height 没给 overflow-y —— 内容会被裁掉且滚不动');
+});
+
+check('C23 CSS 守卫：`.lc-balance` 不写回外观、不挂状态点、窄面板先省略', () => {
+  const css = readFileSync(join(repoRoot, 'media', 'chat.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  const at = css.indexOf('.lc-balance {');
+  ok(at > 0, 'chat.css 里没有 .lc-balance');
+  const scope = css.slice(at, css.indexOf('}', at));
+  for (const prop of ['width', 'height', 'background', 'border', 'cursor']) {
+    ok(!new RegExp(`(^|[\\s;{])${prop}\\s*:`).test(scope), `.lc-balance 里写回了 ${prop} —— 外观该全从 .link-button 来`);
+  }
+  ok(/text-overflow\s*:\s*ellipsis/.test(scope), '没有省略号兜底 —— 窄面板下它会横向把工具行顶出去');
+  ok(/flex\s*:\s*none/.test(scope), '没有 flex:none —— 配置条是 flex，会被压窄');
+  ok(!/\.lc-balance::before/.test(css), '.lc-balance 挂了 ::before 状态点（状态由文字自己说，两处一起喊就是白建）');
+  // stale 那条：默认落在 (0,1) 开区间（C21b 的教训 —— 卡区间不卡字面量）
+  const staleScope = css.slice(css.indexOf('.lc-balance.stale {'), css.indexOf('}', css.indexOf('.lc-balance.stale {')));
+  const op = /opacity\s*:\s*([\d.]+)\s*;/.exec(staleScope);
+  ok(op, '.lc-balance.stale 没有 opacity —— 陈旧与实时就分不出来了');
+  const n = Number(op[1]);
+  ok(n > 0 && n < 1, `stale 的默认透明度落在开区间外（${op[1]}）：0 = 看不见，1 = 与实时没差别`);
+});
+
 console.log('');
 if (failures.length) {
   console.log(`✗ ${failures.length} 条未过（共 ${passed + failures.length} 条）：`);

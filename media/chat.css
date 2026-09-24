@@ -1405,6 +1405,17 @@ body.live-busy #send-btn {
   border-radius: 10px;
   background: var(--vscode-dropdown-listBackground, var(--dsw-alias-bg-overlay, var(--dsw-alias-bg-layer-2, #2b2b2b)));
   box-shadow: var(--dsw-shadow-lv2, 0 8px 24px rgba(0, 0, 0, 0.4));
+  /* C23：高度上限 + 内部滚动。
+     由来：模型列表从「写死的三条预设」改成**远端 `/models` 驱动**之后，条数不再由我们决定 ——
+     二三十条的账号完全正常，而这条浮层此前没有任何高度约束，会向上把整张卡片顶出去。
+     上限跟着**视口**走（`45vh`），不写死 px：面板高度是用户拖出来的，写死某个 px 在矮面板里
+     照样顶出去、在高的里又白白浪费。⚠️ `overflow-y` 必须跟着一起写 —— 只给 max-height
+     等于把内容裁掉且滚不动，比没有上限更坏。
+     这一条是四个浮层（模型 / 档位 / profile / 上下文读数）共用的壳，一起获得滚动；
+     读数浮层的宽度覆盖在下面 `.lc-model-menu.ctx-readout` 里，不受这里影响。 */
+  max-height: min(45vh, 320px);
+  overflow-y: auto;
+  overscroll-behavior: contain; /* 滚到头就停，别连锁滚下面的消息区 */
 }
 .lc-model-menu.open {
   display: flex;
@@ -1520,6 +1531,34 @@ body.live-busy #send-btn {
 .lc-dsh:hover,
 .lc-api:hover {
   color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
+}
+
+/* C23 余额读数。与「API / DSH」同款文字钮（外观全从 .link-button 来，这里只留它独有的四件）：
+   · 不挂 `::before` 状态点 —— 旁边那两颗点说的是「配没配」，而余额的状态由**文字自己说**
+     （`¥28.70` / `…` / `—`）。两处一起喊同一件事就是白建（C22b 的判据）。
+   · `flex: none` + `max-width` + 省略号：`.live-config-bar` 是不换行的 inline-flex，
+     余额串（`余额：¥28.70` 约 90px）是这条上第 7 个控件；极窄面板下让它先省略，
+     而不是把整条工具行顶出卡片。同 `.lc-model` 的老做法。 */
+.lc-balance {
+  flex: none;
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-secondary, var(--vscode-descriptionForeground, #999));
+  padding: 2px 8px;
+}
+.lc-balance:hover {
+  color: var(--dsw-alias-label-primary, var(--vscode-foreground, #ddd));
+}
+/* 陈旧：这个数不是此刻的（上次成功取到的），最近一次查询失败了。
+   **值留着、只把它压淡一点** —— 擦成「—」是丢掉已知信息（同 C22 那枚环对 stale 的处理），
+   而「最近一次为什么没成」写在 title 里。悬停时推满：人要读它的时候就该读得清。 */
+.lc-balance.stale {
+  opacity: 0.65;
+}
+.lc-balance.stale:hover {
+  opacity: 1;
 }
 
 /* ---------- 居中灰色说明行（role:'note'，如「已开启全新 DSH 会话…」） ---------- */

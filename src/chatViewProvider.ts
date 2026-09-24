@@ -159,6 +159,24 @@ import {
 } from './dshRuntime';
 // C8：轮次状态判据（纯模块，零 vscode 依赖，scripts/probe-turn-state.mjs 直接加载编译产物自检）
 import { needsContinue, TurnStatus } from './turnState';
+import {
+  BALANCE_PATH,
+  describeError,
+  fetchJson,
+  mergeModelList,
+  MODELS_PATH,
+  parseBalance,
+  parseModels,
+  REFRESH_INTERVAL_MS,
+  usageFailed,
+  usageFromBalance,
+  usageLoading,
+  usageNoKey,
+  type ErrorKind,
+  type FetchResult,
+  type ParsedBalance,
+  type UsageView,
+} from './deepseekApi';
 import { readCompactionEvent } from './compactionNotice';
 // C9：运行时间线累积器 + 配对/成败判据（纯模块，零 vscode 依赖，
 // scripts/probe-run-inspector.mjs 直接加载编译产物自检）。后两个导出是**唯一的一份实现** ——
@@ -495,6 +513,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** media/dsh-live 构建产物是否齐全（决定 webview 能否进入真 DSH 组件画面） */
   private _hasDshBundle = false;
 
+  // ---------- C23 余额读数 + 远端模型列表 ----------
+  // ⚠️ 命名上一律带 `balance`：本文件里 `usage` 已经被 C3a 的**本轮 token 读数**占了
+  //（`_turnUsage` / `_usageReadout` / `_postUsage`），两者说的不是一回事。
+
+  /** 最近一次**成功**的余额（连同取数时刻）。失败时不清它 —— 那是"上次已知值"，
+   *  擦掉等于把已知信息丢掉（`stale` 才说明它不是此刻的）。 */
+  private _balance?: { balance: ParsedBalance; at: number };
+  /** 最近一次成功取回的模型 id 列表。空 = 没取到 ⇒ 菜单退回 `PRESET_MODELS`。 */
+  private _models: string[] = [];
+  /** 5 分钟轮询的表。**只该有一个**：每次装表前先 `_stopBalancePolling()`。 */
+  private _balanceTimer?: NodeJS.Timeout;
+  /** 上一发请求还在路上。既防叠发，也是"点一下"连点时的静默吸收器。 */
+  private _balanceInFlight = false;
+  /** 最近一条**发出去过**的读数：同内容不重发；面板重建时按它立刻重放。 */
+  private _balanceView?: UsageView;
+
   // ---------- 2.1 改动审阅（每轮 DSH 结束后对工作区根 Keep/Revert）状态 ----------
 
   /** 本轮是否正常走完（idle → done）。interrupted/error/abort 恒 false → 收尾清掉审阅 */
@@ -808,6 +842,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (this._view === webviewView) {
           this._view = undefined;
         }
+        this._stopBalancePolling(); // C23 闸③（与 dispose() 同一目的，两条路都要堵）
         this._disposeViewListeners();
       })
     );
@@ -827,6 +862,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._setActive(this._store.create());
     this._postSnapshot();
     this._sendHistory();
+    // C23：新建对话时取一次（用户拍板的第二条）。顺带把表重新起上 —— 幂等，且它内部
+    // 先停旧表，所以"每次新建都重置 5 分钟节拍"是有意的（刚建的对话最该拿到新数）。
+    this._startBalancePolling();
   }
 
   dispose(): void {
@@ -839,6 +877,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._dropReview(false); // 清掉本轮审阅内存（视图已销毁，不必再发 clear）
     this._runs.reset(); // C9：运行时间线是纯内存的，随视图一起还回去
     this._runsPanelOpen = false;
+    this._stopBalancePolling(); // C23 闸③：窗口没了就别再每 5 分钟发一次请求
     this._disposeViewListeners();
     for (const d of this._globalDisposables) d.dispose();
     this._globalDisposables.length = 0;
@@ -873,6 +912,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         // 尝试解析一次 API key（有则缓存），让配置条的 API 灯如实点亮
         void this._refreshApiKeyStatus();
+        // C23：面板每次重建 ⇒ 先把当前读数**重放**一遍（webview 侧那枚钮回到静态「余额：—」，
+        // 不重放就要等下一次取数才恢复），再装表（= 立刻取一次 + 5 分钟一轮）。
+        // `force` 是必需的：`_postBalance` 平时按内容去重，而这里要的正是"同样的内容再发一次"。
+        if (this._balanceView) this._postBalance(this._balanceView, true);
+        this._startBalancePolling();
         // C8c：转写加载异常要让人看见。挂这儿而不是构造函数 —— 那时面板还没开，弹窗没人看。
         this._checkStorageHealth();
         break;
@@ -891,6 +935,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case 'configure-key':
         void this._promptAndStoreApiKey();
+        break;
+      case 'refresh-balance':
+        // C23：点一下刷新（用户拍板的第一条）。先补一次 key 解析 —— 冷启动后第一次点，
+        // 缓存可能还是"未解析"，不补的话这一下会被闸①当成"没配 key"直接吞掉。
+        void this._refreshApiKeyStatus().then(() => this._refreshBalance(true));
         break;
       case 'configure-dsh':
         void this._configureDsh();
@@ -996,6 +1045,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._postSnapshot();
     this._sendHistory();
     this._postBackendStatus();
+    // C23：轮询开关 = 「harness 在不在」。切走就停表（读数钮本来也一起藏了，没有理由继续
+    // 每 5 分钟出一次站）；切回来必须**显式**重起 —— 下面 `_connectLive()` 在已 online 时
+    // 会提前 return，只靠连接那条路是起不来的。
+    if (this._mode === 'harness') {
+      this._startBalancePolling();
+    } else {
+      this._stopBalancePolling();
+    }
     // 切进 harness（恒为 DSH 直播）→ 预热到"在线"（spawn+initialize），状态点即时可见
     if (this._mode === 'harness' && !this._liveRunning) {
       void this._connectLive();
@@ -1622,6 +1679,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._apiKeyCache = undefined; // 清缓存 → 下次从文件回退解析
         this._restartLiveProcess();
         void this._refreshApiKeyStatus(); // 立刻从文件读回，点亮 API 灯
+        // C23：清 key 后余额钮要**立刻**翻档（翻「未配置」，或翻回文件里那把 key 的数）。
+        // `_refreshApiKeyStatus()` 管的是 API 那盏灯，读数它不管 —— 两件事各走各的。
+        void this._refreshBalance(true);
         return;
       }
     }
@@ -1642,6 +1702,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     this._apiKeyCache = key; // 立即生效：进下一个子进程 env
     this._restartLiveProcess();
+    void this._refreshBalance(true); // C23：配好 key 之后**立刻**取一次（用户拍板的第二条）
   }
 
   /** 杀掉当前 DSH 子进程并按最新模型/key/路径重连（变更后调用；仅 harness 生效）。 */
@@ -1922,6 +1983,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     } catch {
       /* key 解析失败不阻断握手：让子进程侧（llm-deepseek）报更具体的错 */
     }
+    // C23：「连接时取一次」。挂在这儿而不是 `_connectLive()`：后者在已 online 时会提前 return，
+    // 也不放在本方法末尾 —— 下面 `_getRuntime()` 抛错会提前 return，而"DSH 没配好"与
+    // "余额是多少"是两件不相干的事（key 配了就该显示）。
+    void this._refreshBalance(true);
     // C13：**启动** shell 诊断但**不 await** 它 —— 它是「读数 + 告警」，不该拖连接。但必须赶在
     // 审批之前**启动**：`_setupApproval` 的首猜就是它的结论（两者共享同一次 probe）。
     // 不 await 的理由是延迟：await 会让激活变成「诊断 + 审批」两段**之和**（冷启动最坏
@@ -4104,7 +4169,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** 把配置条状态广播给 webview：当前模型 + 可选预设 + API key / DSH 路径是否已配 + C11 档位。 */
   private _postLiveConfig(): void {
     const model = this._dshModel();
-    const models = PRESET_MODELS.includes(model) ? PRESET_MODELS : [model, ...PRESET_MODELS];
+    // C23：可选模型改由**远端 `/models`** 驱动（`_models` 是最近一次成功取回的列表），
+    // 取不到就退回内置预设 —— 一条规则（`mergeModelList`）覆盖"远端/预设/当前模型置顶"三种情形。
+    // 这个方法**保持同步**：远端列表是落在 `_models` 字段上的，到了再补发一条广播即可。
+    const models = mergeModelList(this._models, model, PRESET_MODELS);
     this._post({
       type: 'live-config',
       model,
@@ -4140,6 +4208,125 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         /* 解析失败就按"未配置"显示 */
       }
       this._postLiveConfig();
+    }
+  }
+
+  // ---------- C23 余额读数 + 远端模型列表 ----------
+  //
+  // 这是**本仓唯一会自己往外发请求的地方**（在此之前 `src/` 里连 fetch 都没有）。
+  // 所以三条闸都收在这一个方法里，而不是散在调用点 —— 任何一条被绕过都等于
+  // 「后台静默发请求」，而那是用户看不见的成本：
+  //   ① 没 key ⇒ 一个请求都不发（不只是"发了也没用"，是**不发**）；
+  //   ② 上一发还在路上 ⇒ 直接返回（连点「余额」不会叠成五发）；
+  //   ③ 面板销毁 / 切走 harness ⇒ `_stopUsagePolling()` 停表。
+  // 判据（金额怎么解析、失败说什么人话）全在 `src/deepseekApi.ts` 里，本方法只做编排。
+
+  /**
+   * 取一次余额 + 模型列表。
+   *
+   * `force` 只影响**在途读数**要不要显示（首次取数时按钮上写「余额：…」）——
+   * 已经有值时不显示它，否则每 5 分钟按钮都要闪一下。
+   */
+  private async _refreshBalance(force = false): Promise<void> {
+    // 余额只长在配置条上，而配置条只有 harness 模式有 ⇒ chat 模式一律不联网
+    if (this._mode !== 'harness') return;
+    let key: string | undefined;
+    try {
+      key = await this._resolveApiKey();
+    } catch {
+      key = undefined;
+    }
+    if (!key) {
+      // 闸 ①。没有 key：读数说明未配置，模型菜单退回预设。
+      // 远端列表**必须**一起清掉 —— 留着上一次的列表等于给用户看"这张 key 能用的模型"，
+      // 而那张 key 已经不在了（错的是别人）。
+      this._models = [];
+      this._balance = undefined;
+      this._postBalance(usageNoKey());
+      this._postLiveConfig();
+      return;
+    }
+    if (this._balanceInFlight) return; // 闸 ②
+    this._balanceInFlight = true;
+    if (force && !this._balanceView) this._postBalance(usageLoading());
+    try {
+      const [balanceRes, modelsRes] = await Promise.all([
+        fetchJson(BALANCE_PATH, { key }),
+        fetchJson(MODELS_PATH, { key }),
+      ]);
+      this._applyBalance(balanceRes);
+      this._applyModels(modelsRes);
+    } finally {
+      this._balanceInFlight = false;
+    }
+  }
+
+  /** 余额那一半：成功就记住（连同时刻），失败就**保留旧值**并在 title 里说明。 */
+  private _applyBalance(res: FetchResult): void {
+    if (res.ok) {
+      const parsed = parseBalance(res.json);
+      if (parsed.ok) {
+        this._balance = { balance: parsed.value, at: Date.now() };
+        this._postBalance(usageFromBalance(parsed.value, { at: this._balance.at }));
+        return;
+      }
+      this._postBalance(this._staleOrFailed(parsed.kind));
+      return;
+    }
+    this._postBalance(this._staleOrFailed(res.kind, res.status));
+  }
+
+  /**
+   * 失败档：有过好值 ⇒ 值留着、`stale` 置真、title 里写清"这是上次的、最近一次为什么没成"
+   * （同 C22 那枚环对「上次」的处理）；从来没有过 ⇒ 只有一句人话，点一下可重试。
+   */
+  private _staleOrFailed(kind: ErrorKind, status?: number): UsageView {
+    const last = this._balance;
+    if (!last) return usageFailed(kind, status);
+    return usageFromBalance(last.balance, {
+      at: last.at,
+      note: `最近一次查询失败：${describeError(kind, status)}`,
+    });
+  }
+
+  /** 模型那一半：成功且变了 ⇒ 重播配置条（菜单跟着换）。失败**不清**已有的好列表。 */
+  private _applyModels(res: FetchResult): void {
+    if (!res.ok) return;
+    const parsed = parseModels(res.json);
+    if (!parsed.ok || parsed.value.length === 0) return;
+    if (parsed.value.join('\n') === this._models.join('\n')) return;
+    this._models = parsed.value;
+    this._postLiveConfig();
+  }
+
+  /** 发读数。**同内容不重发**（每 5 分钟一次的轮询不该让 webview 反复写同样的字）；
+   *  `force` 用来在面板重建后按 `_balanceView` 重放一次当前读数。 */
+  private _postBalance(view: UsageView, force = false): void {
+    const prev = this._balanceView;
+    if (!force && prev && prev.text === view.text && prev.title === view.title && prev.stale === view.stale) {
+      return;
+    }
+    this._balanceView = view;
+    this._post({ type: 'live-balance', text: view.text, title: view.title, stale: view.stale });
+  }
+
+  /**
+   * 装表：**先立刻取一次**，再按 `REFRESH_INTERVAL_MS` 轮询（用户拍板的时机）。
+   * 内部先停旧表 —— 面板每次重建都会走到 `ready`，不先停就会越堆越多，
+   * 同 `resolveWebviewView` 开头那句「先清掉旧监听」。
+   */
+  private _startBalancePolling(): void {
+    if (this._mode !== 'harness') return;
+    this._stopBalancePolling();
+    void this._refreshBalance(true);
+    this._balanceTimer = setInterval(() => void this._refreshBalance(false), REFRESH_INTERVAL_MS);
+  }
+
+  /** 闸 ③：停表。可重入、幂等（没装表时是空操作）。 */
+  private _stopBalancePolling(): void {
+    if (this._balanceTimer) {
+      clearInterval(this._balanceTimer);
+      this._balanceTimer = undefined;
     }
   }
 

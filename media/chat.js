@@ -69,6 +69,7 @@
   var liveProfileWrap = document.getElementById('live-profile-wrap');
   var liveApiBtn = document.getElementById('live-api-btn');
   var liveDshBtn = document.getElementById('live-dsh-btn');
+  var liveBalanceBtn = document.getElementById('live-balance-btn'); // C23 余额读数（只读，点一下刷新）
   var liveModels = []; // 扩展下发的可选模型
   var liveModel = ''; // 当前生效模型（扩展为真相）
   var liveModelList = []; // 菜单展示用的模型列表（预设 + 当前模型兜底）
@@ -787,6 +788,9 @@
     liveModelInput.disabled = busy;
     liveApiBtn.disabled = busy;
     liveDshBtn.disabled = busy;
+    // ⚠️ C23 那枚余额钮**刻意也不在此列**，理由与上面那枚环逐字同源：它是只读读数，
+    // 跑一轮的时候正是最该看见余额的时候（它不重启子进程、不改任何配置）。
+    // 少一句是有意的，别顺手补上。
   }
 
   /** 把扩展下发的 live-config 画到配置条（模型下拉/自定义 + API 灯）。 */
@@ -836,6 +840,27 @@
     refreshLiveConfigVisibility();
     refreshLiveConfigEnabled();
     toggleEmptyHint(); // dshConfigured 一变 → harness 空态引导文案跟着切
+  }
+
+  /**
+   * C23：余额读数画到那枚钮上。
+   *
+   * **一个字都不在这儿拼**：`text` 里已经含「余额：」前缀、`title` 是多行明细（币种/总额/
+   * 赠送/充值/取数时刻/失败原因），全部由扩展侧 `src/deepseekApi.ts` 算好 —— 同 C15 的分工线。
+   * 前端再拼一遍就等于有了两套币种符号规则，早晚漂移。
+   *
+   * ⚠️ 整串字**平铺**写进 `textContent`，不塞子 `<span>`：影子 DOM 的 `textContent` 不含子节点
+   *（真 DOM 含），塞了会让探针的逐字断言与真机不是一回事。
+   */
+  function renderBalance(d) {
+    if (!liveBalanceBtn) return;
+    var text = d && typeof d.text === 'string' && d.text ? d.text : '余额：—';
+    var title = d && typeof d.title === 'string' && d.title ? d.title : '';
+    liveBalanceBtn.textContent = text;
+    if (title) liveBalanceBtn.title = title;
+    // stale = 这个数不是此刻的（上次成功取到的）。与 C22 那枚环同一个词、同一个意思：
+    // **值留着、话说明白**，而不是把已知的数擦掉。
+    liveBalanceBtn.classList.toggle('stale', !!(d && d.stale));
   }
 
   // ---------- 自定义模型菜单（取代原生 <select>，CC/DSH 同款 DOM 浮层） ----------
@@ -3197,6 +3222,13 @@
       if (sending || runBusy) return;
       post({ type: 'configure-dsh' });
     });
+    // C23：点一下刷新。**没有 `if (sending || runBusy) return;`** —— 与上面两枚不同的地方正是
+    // 这里：只读读数在跑动中也要能点（同那枚环）。扩展侧有在途闸，连点不会叠发。
+    if (liveBalanceBtn) {
+      liveBalanceBtn.addEventListener('click', function () {
+        post({ type: 'refresh-balance' });
+      });
+    }
 
     sendBtn.addEventListener('click', send);
     stopBtn.addEventListener('click', function () {
@@ -3666,6 +3698,11 @@
       case 'live-config':
         // 底部配置条：模型下拉(含自定义) + API/DSH 状态
         renderLiveConfig(data);
+        break;
+
+      case 'live-balance':
+        // C23：那枚余额读数的正文与明细都在扩展侧算好了，这里只写文字
+        renderBalance(data);
         break;
 
       case 'note-message':
